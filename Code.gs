@@ -24,7 +24,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.4';
+const BACKEND_VERSION = '2026-08-05.5';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -125,8 +125,8 @@ function getState(){
   const log = logRows.map(r=>({
     orderNo: r.orderNo, orderDate: cellToText(r.orderDate), waybill: r.waybill,
     items: safeParse(r.itemsJson, []), staffId: r.staffId, staffName: r.staffName,
-    time: cellToText(r.time, true), hadIssue: !!r.hadIssue, hadManualEdit: !!r.hadManualEdit,
-    importedExternal: !!r.importedExternal, store: r.store, shipMethod: r.shipMethod, note: r.note
+    time: cellToText(r.time, true), hadIssue: textToBool(r.hadIssue), hadManualEdit: textToBool(r.hadManualEdit),
+    importedExternal: textToBool(r.importedExternal), store: r.store, shipMethod: r.shipMethod, note: r.note
   })).reverse(); // 最新的在前面
   const staffRows = readRows(SHEET_STAFF, STAFF_HEADER);
   const staff = staffRows.map(r=>({id:r.id, name:r.name}));
@@ -146,6 +146,10 @@ function cellToText(v, withTime){
   }
   return v;
 }
+
+// 出貨紀錄表的是非欄位存成中文「是／否」方便直接看試算表，讀回來時轉回真正的布林值給前端用
+function boolToText(b){ return b ? '是' : '否'; }
+function textToBool(v){ return v === '是' || v === true; }
 
 // ---------------- 訂單同步（合併，已出貨的不覆蓋） ----------------
 function mergeOrders(incoming){
@@ -222,8 +226,8 @@ function appendLogRow(entry){
   logSh.getRange(targetRow, 7).setNumberFormat('@');
   logSh.getRange(targetRow, 1, 1, LOG_HEADER.length).setValues([[
     entry.orderNo, String(entry.orderDate||''), entry.waybill||'', JSON.stringify(entry.items||[]),
-    entry.staffId||'', entry.staffName||'', String(entry.time||''), !!entry.hadIssue, !!entry.hadManualEdit,
-    !!entry.importedExternal, entry.store||'', entry.shipMethod||'', entry.note||''
+    entry.staffId||'', entry.staffName||'', String(entry.time||''), boolToText(entry.hadIssue), boolToText(entry.hadManualEdit),
+    boolToText(entry.importedExternal), entry.store||'', entry.shipMethod||'', entry.note||''
   ]]);
 }
 
