@@ -1,0 +1,1178 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>文山出貨確認系統</title>
+<style>
+  :root{
+    --bg:#0d1013; --panel:#161b20; --panel2:#1e252c; --panel3:#262f38; --border:#2d3742;
+    --text:#eef2f6; --muted:#8b98a5; --muted2:#5f6b78;
+    --accent:#34a870; --accent-dim:#1d3f31; --blue:#4a8ef0; --blue-dim:#1c2e4a;
+    --danger:#ef4b52; --danger-dim:#3d1f21; --warn:#e0a72f; --warn-dim:#3a2f16;
+    --radius:14px; --radius-sm:9px;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:"Microsoft JhengHei","Noto Sans TC",-apple-system,sans-serif;-webkit-tap-highlight-color:transparent;}
+  #app{display:flex;flex-direction:column;height:100vh;height:100dvh;}
+
+  /* ---- top bar ---- */
+  header{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--border);}
+  header .title{font-size:16px;font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  header .staff-chip{display:flex;align-items:center;gap:6px;background:var(--panel3);border:1px solid var(--border);border-radius:999px;padding:6px 12px;font-size:13px;color:var(--muted);white-space:nowrap;}
+  header .staff-chip b{color:var(--text);}
+  header .badge{background:var(--blue-dim);color:var(--blue);border-radius:999px;padding:4px 10px;font-size:12px;font-weight:700;white-space:nowrap;}
+
+  /* ---- main content ---- */
+  main{flex:1 1 auto;overflow-y:auto;padding:16px;padding-bottom:90px;max-width:900px;width:100%;margin:0 auto;}
+  .view{display:none;}
+  .view.active{display:block;animation:fade .12s ease-out;}
+  @keyframes fade{from{opacity:0;}to{opacity:1;}}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:14px;}
+  .card h2{margin:0 0 4px;font-size:15px;color:var(--text);font-weight:700;}
+  .card .hint{margin:0 0 14px;color:var(--muted);font-size:13px;line-height:1.5;}
+  .card + .card{margin-top:14px;}
+
+  h1,h2,h3{font-family:inherit;}
+  .section-label{color:var(--muted2);font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin:22px 0 8px;padding:0 2px;}
+  .section-label:first-child{margin-top:0;}
+
+  /* ---- form controls ---- */
+  input[type=text],select,textarea{
+    background:var(--panel3);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);
+    padding:11px 13px;font-size:15px;font-family:inherit;width:100%;
+  }
+  input[type=text]:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue);}
+  textarea{min-height:120px;font-family:ui-monospace,Consolas,monospace;font-size:13px;resize:vertical;}
+  label.field{display:block;margin-bottom:12px;}
+  label.field span{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;}
+
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+  .row.between{justify-content:space-between;}
+  .stack{display:flex;flex-direction:column;gap:10px;}
+
+  button{font-family:inherit;cursor:pointer;border:none;}
+  .btn{background:var(--blue);color:#fff;border-radius:var(--radius-sm);padding:12px 18px;font-size:14px;font-weight:600;}
+  .btn:active{transform:scale(.98);}
+  .btn.gray{background:var(--panel3);color:var(--text);border:1px solid var(--border);}
+  .btn.green{background:var(--accent);color:#fff;}
+  .btn.danger{background:var(--danger);color:#fff;}
+  .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--border);}
+  .btn.sm{padding:7px 12px;font-size:12px;border-radius:8px;}
+  .btn.block{width:100%;}
+  .btn[disabled]{opacity:.4;pointer-events:none;}
+
+  /* ---- big scan inputs ---- */
+  .scan-input{width:100%;font-size:26px;padding:20px;text-align:center;letter-spacing:.5px;border-radius:var(--radius);
+    background:var(--panel3);border:2px solid var(--border);color:var(--text);}
+  .scan-input:focus{border-color:var(--blue);outline:none;}
+  .scan-input::placeholder{color:var(--muted2);font-size:18px;}
+
+  /* ---- status pill ---- */
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:999px;font-size:13px;font-weight:600;}
+  .pill.wait{background:var(--panel3);color:var(--muted);}
+  .pill.scan{background:var(--blue-dim);color:var(--blue);}
+  .pill.done{background:var(--accent-dim);color:var(--accent);}
+  .pill::before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor;}
+
+  /* ---- tables ---- */
+  .tbl-wrap{overflow-x:auto;border-radius:var(--radius-sm);border:1px solid var(--border);}
+  table{width:100%;border-collapse:collapse;font-size:13px;min-width:480px;}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);}
+  th{color:var(--muted);font-weight:600;background:var(--panel2);font-size:12px;text-transform:uppercase;letter-spacing:.03em;}
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr:hover{background:var(--panel2);}
+  tr.ok td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
+  tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn);}
+  tr.over td:first-child{box-shadow:inset 3px 0 0 var(--danger);}
+  .empty-row{padding:26px;text-align:center;color:var(--muted2);font-size:13px;}
+
+  .tag{display:inline-block;font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;background:var(--panel3);color:var(--muted);border:1px solid var(--border);}
+  .tag.danger{background:var(--danger-dim);color:var(--danger);border-color:transparent;}
+  .tag.warn{background:var(--warn-dim);color:var(--warn);border-color:transparent;}
+  .tag.ok{background:var(--accent-dim);color:var(--accent);border-color:transparent;}
+  .tag.blue{background:var(--blue-dim);color:var(--blue);border-color:transparent;}
+
+  .msg{font-size:13px;color:var(--muted);margin-top:10px;line-height:1.6;}
+  .msg.err{color:var(--danger);}
+  .msg.ok{color:var(--accent);}
+
+  /* ---- dashboard stat tiles ---- */
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;}
+  .stat-tile{background:var(--panel2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;}
+  .stat-tile .num{font-size:28px;font-weight:800;line-height:1.1;}
+  .stat-tile .lbl{font-size:12px;color:var(--muted);margin-top:4px;}
+
+  /* ---- progress ---- */
+  .progress-num{font-size:40px;font-weight:800;}
+  .progress-num span{color:var(--muted2);font-size:24px;}
+
+  /* ---- flash overlay ---- */
+  .flash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;
+    z-index:999;pointer-events:none;opacity:0;transition:opacity .08s;text-align:center;padding:20px;}
+  .flash.show{opacity:1;}
+  .flash.err{background:rgba(239,75,82,.95);}
+  .flash.ok{background:rgba(52,168,112,.95);}
+  .flash .big{font-size:56px;color:#fff;font-weight:800;}
+  .flash .sub{font-size:20px;color:#fff;max-width:600px;}
+
+  /* ---- bottom nav ---- */
+  nav.tabbar{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--panel);border-top:1px solid var(--border);
+    padding-bottom:env(safe-area-inset-bottom);z-index:10;}
+  nav.tabbar button{flex:1;background:none;color:var(--muted);padding:10px 4px 8px;font-size:11px;display:flex;flex-direction:column;align-items:center;gap:4px;}
+  nav.tabbar button .ic{width:22px;height:22px;display:flex;align-items:center;justify-content:center;}
+  nav.tabbar button.active{color:var(--blue);}
+  nav.tabbar button svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;}
+
+  ul.plain{list-style:none;margin:0;padding:0;}
+  ul.plain li{display:flex;justify-content:space-between;align-items:center;padding:11px 2px;border-bottom:1px solid var(--border);}
+  ul.plain li:last-child{border-bottom:none;}
+
+  ::-webkit-scrollbar{width:8px;height:8px;}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <header>
+    <div class="title">文山出貨確認系統</div>
+    <span class="tag" id="connStatus">單機模式</span>
+    <div class="badge" id="pendingBadge">0 張待出貨</div>
+    <div class="staff-chip">包貨：<b id="headerStaffName">未選擇</b></div>
+  </header>
+
+  <main>
+
+    <!-- ============ 首頁 ============ -->
+    <section id="view-home" class="view active">
+      <div class="section-label">今日概況</div>
+      <div class="stat-grid">
+        <div class="stat-tile"><div class="num" id="statPending">0</div><div class="lbl">待出貨訂單</div></div>
+        <div class="stat-tile"><div class="num" id="statShippedToday">0</div><div class="lbl">今日已出貨</div></div>
+        <div class="stat-tile"><div class="num" id="statIssue">0</div><div class="lbl">曾觸發警示</div></div>
+        <div class="stat-tile"><div class="num" id="statLastSync">-</div><div class="lbl">最後同步</div></div>
+      </div>
+
+      <div class="section-label">快速操作</div>
+      <div class="card">
+        <div class="stack">
+          <button class="btn block" data-goto="scan">開始掃描出貨</button>
+          <button class="btn gray block" id="homeBtnSync">從雲端同步訂單</button>
+          <button class="btn gray block" data-goto="orders">訂單資料管理</button>
+        </div>
+      </div>
+
+      <div class="section-label">目前包貨人員</div>
+      <div class="card">
+        <select id="homeStaffSelect"></select>
+        <p class="hint" style="margin-top:10px;margin-bottom:0;">選定後會一路沿用，直到你換人為止。</p>
+      </div>
+    </section>
+
+    <!-- ============ 掃描出貨 ============ -->
+    <section id="view-scan" class="view">
+      <div class="card" style="text-align:center;">
+        <div class="row" style="justify-content:center;margin-bottom:16px;">
+          <span class="pill wait" id="pill">等待掃描訂單號</span>
+        </div>
+
+        <div id="stage-order">
+          <input id="inputOrder" class="scan-input" type="text" placeholder="請掃描訂單號" autocomplete="off">
+          <p class="hint" style="margin-top:14px;">用掃描機（鍵盤模擬模式）對準訂單條碼掃描，或用鍵盤輸入後按 Enter。</p>
+        </div>
+
+        <div id="stage-items" style="display:none;text-align:left;">
+          <div class="row between">
+            <div style="font-size:13px;color:var(--muted);">
+              訂單號 <b style="color:var(--text);" id="curOrderNo"></b>
+              日期 <b style="color:var(--text);" id="curDate"></b>
+              賣場 <b style="color:var(--text);" id="curStore"></b>
+            </div>
+            <div class="progress-num"><span id="progressDone">0</span><span>/<span id="progressTotal">0</span></span></div>
+          </div>
+
+          <div class="tbl-wrap" style="margin-top:14px;">
+            <table id="itemTable">
+              <thead><tr><th>貨號</th><th>品名</th><th>應出</th><th>已掃</th><th>狀態</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <div style="margin-top:14px;">
+            <input id="inputBarcode" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <button class="btn gray sm" id="btnAbort">取消此單／重新掃訂單號</button>
+          </div>
+
+          <div id="completeBox" style="display:none;margin-top:18px;padding:18px;background:var(--panel2);border-radius:var(--radius-sm);border:1px solid var(--accent-dim);">
+            <h2 style="color:var(--accent);">商品核對完成</h2>
+            <p class="hint">包貨人員：<b style="color:var(--text);" id="completeStaffName"></b> — 請掃描運單編號以完成出貨紀錄</p>
+            <input id="inputFinalWaybill" class="scan-input" type="text" placeholder="請掃描運單編號" autocomplete="off">
+            <div class="row" style="margin-top:12px;">
+              <button class="btn green" id="btnConfirm">完成出貨</button>
+            </div>
+            <p id="finalMsg" class="msg"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 訂單資料 ============ -->
+    <section id="view-orders" class="view">
+      <div class="section-label">從雲端同步</div>
+      <div class="card">
+        <h2>同步訂單資料</h2>
+        <p class="hint">從設定頁指定的訂單試算表抓取所有訂單，只會留下本倉負責出貨的訂單，已出貨的不會被覆蓋。</p>
+        <button class="btn block" id="btnSync">從雲端同步訂單</button>
+        <p id="syncMsg" class="msg"></p>
+      </div>
+
+      <div class="section-label">匯入已出貨紀錄</div>
+      <div class="card">
+        <h2>指定出貨 Excel 匯入</h2>
+        <p class="hint">貼上某一天出貨試算表的連結，讀取「掃描」記錄表（訂單號＋物流編號），把已有物流編號的訂單標記為已出貨，避免重複處理。</p>
+        <div class="row">
+          <input id="inputShipmentSheetUrl" type="text" placeholder="貼上出貨試算表連結或ID" style="flex:1;">
+          <button class="btn" id="btnImportShipmentSheet">匯入</button>
+        </div>
+        <p id="shipmentSheetMsg" class="msg"></p>
+      </div>
+
+      <div class="section-label">手動匯入（備用）</div>
+      <div class="card">
+        <h2>CSV 貼上</h2>
+        <p class="hint">格式：訂單號,貨號,品名,數量（每行一筆；運單編號在包貨完成時另外掃描登記，不在此匯入）</p>
+        <textarea id="csvInput" placeholder="ORD1001,SKU-A01,兒童學習褲(M),2&#10;ORD1001,SKU-B02,露營燈,1"></textarea>
+        <div class="row" style="margin-top:10px;">
+          <button class="btn" id="btnImport">匯入</button>
+          <button class="btn gray" id="btnLoadSample">載入範例</button>
+          <button class="btn gray" id="btnClearOrders">清空待出貨清單</button>
+        </div>
+        <p id="importMsg" class="msg"></p>
+      </div>
+
+      <div class="section-label">待出貨清單</div>
+      <div class="card">
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>訂單號</th><th>日期</th><th>賣場</th><th>品項數</th><th>總數量</th></tr></thead>
+            <tbody id="pendingTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 出貨紀錄 ============ -->
+    <section id="view-log" class="view">
+      <div class="card">
+        <div class="row between">
+          <h2 style="margin:0;">出貨紀錄</h2>
+          <button class="btn gray sm" id="btnExportCsv">匯出 CSV</button>
+        </div>
+        <div class="tbl-wrap" style="margin-top:12px;">
+          <table>
+            <thead><tr><th>訂單號</th><th>日期</th><th>運單編號</th><th>包貨人員</th><th>完成時間</th><th>警示</th><th>手動修改</th><th>來源</th></tr></thead>
+            <tbody id="logTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 設定 ============ -->
+    <section id="view-settings" class="view">
+      <div class="section-label">多人同步（選用）</div>
+      <div class="card">
+        <h2>共用後端 Web App</h2>
+        <p class="hint">部署 <code>Code.gs</code>（跟這個網頁放在同一個資料夾）成 Google Apps Script 網頁應用程式後，把網址貼在這裡，待出貨清單／出貨紀錄／人員名單就會變成大家共用，而不是各自看各自手機/平板的資料。留空＝維持單機模式（資料只存在這台裝置）。</p>
+        <label class="field">
+          <span>後端 Web App 網址</span>
+          <input id="settingBackendUrl" type="text" placeholder="https://script.google.com/macros/s/.../exec">
+        </label>
+        <div class="row">
+          <button class="btn" id="btnSaveSettings">儲存設定</button>
+          <button class="btn gray" id="btnTestBackend">測試連線</button>
+        </div>
+        <p id="settingsMsg" class="msg"></p>
+      </div>
+
+      <div class="section-label">資料來源</div>
+      <div class="card">
+        <h2>訂單試算表</h2>
+        <label class="field">
+          <span>Google 試算表連結或ID</span>
+          <input id="settingSheetUrl" type="text" placeholder="https://docs.google.com/spreadsheets/d/...">
+        </label>
+        <label class="field">
+          <span>本倉負責的「訂單狀態」標籤（留空＝不篩選，全部匯入）</span>
+          <input id="settingHandledStatus" type="text" placeholder="例如：文山">
+        </label>
+      </div>
+
+      <div class="section-label">包貨/出貨人員</div>
+      <div class="card">
+        <h2>人員名單</h2>
+        <div class="row">
+          <input id="staffId" type="text" placeholder="工號" style="flex:1;">
+          <input id="staffName" type="text" placeholder="姓名" style="flex:1;">
+          <button class="btn" id="btnAddStaff">新增</button>
+        </div>
+        <ul class="plain" id="staffUl" style="margin-top:14px;"></ul>
+      </div>
+
+      <div class="section-label">資料</div>
+      <div class="card">
+        <p class="hint">所有資料都存在這台裝置的瀏覽器裡（localStorage），換裝置或清瀏覽器資料會遺失，請定期用「出貨紀錄」頁的匯出 CSV 備份。</p>
+        <button class="btn danger" id="btnResetAll">清除本機所有資料</button>
+      </div>
+    </section>
+
+  </main>
+
+  <nav class="tabbar">
+    <button data-goto="home" class="active">
+      <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7"/><path d="M5 10v9a1 1 0 001 1h4v-6h4v6h4a1 1 0 001-1v-9"/></svg></span>
+      首頁
+    </button>
+    <button data-goto="scan">
+      <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 7V4h3M21 7V4h-3M3 17v3h3M21 17v3h-3M4 12h16"/></svg></span>
+      掃描出貨
+    </button>
+    <button data-goto="orders">
+      <span class="ic"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></svg></span>
+      訂單資料
+    </button>
+    <button data-goto="log">
+      <span class="ic"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h5"/><path d="M9 4v3M15 4v3"/></svg></span>
+      出貨紀錄
+    </button>
+    <button data-goto="settings">
+      <span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.6V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1-1.6 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.6-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.6-1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3H9a1.7 1.7 0 001-1.6V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.6 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9V9c.2.6.7 1 1.4 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg></span>
+      設定
+    </button>
+  </nav>
+
+</div>
+
+<div id="flash" class="flash">
+  <div class="big" id="flashBig"></div>
+  <div class="sub" id="flashSub"></div>
+</div>
+
+<script>
+// ============================================================
+// 儲存 keys 與基礎工具
+// ============================================================
+const LS = {
+  orders: 'ssz_orders', log: 'ssz_log', staff: 'ssz_staff',
+  currentStaff: 'ssz_current_staff', settings: 'ssz_settings'
+};
+function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
+function saveJSON(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
+
+let orders = loadJSON(LS.orders, {});
+let log = loadJSON(LS.log, []);
+let staff = loadJSON(LS.staff, [{id:'S01',name:'王小明'},{id:'S02',name:'陳小華'}]);
+saveJSON(LS.staff, staff);
+let currentStaffId = localStorage.getItem(LS.currentStaff) || '';
+let settings = loadJSON(LS.settings, {
+  sheetUrl: 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=0',
+  handledStatus: '文山',
+  lastSyncAt: '',
+  backendUrl: ''
+});
+saveJSON(LS.settings, settings);
+
+// ============================================================
+// 共用後端（Google Apps Script Web App）：有設定就走多人共用資料，
+// 沒設定就退回單機 localStorage 模式，兩種模式都能正常運作。
+// ============================================================
+function hasBackend(){ return !!(settings.backendUrl && settings.backendUrl.trim()); }
+
+async function apiGet(){
+  const res = await fetch(settings.backendUrl, {method:'GET'});
+  if(!res.ok) throw new Error('HTTP '+res.status);
+  const data = await res.json();
+  if(data && data.ok===false) throw new Error(data.error||'後端回應失敗');
+  return data;
+}
+async function apiPost(action, payload){
+  const res = await fetch(settings.backendUrl, {
+    method:'POST',
+    headers:{'Content-Type':'text/plain;charset=utf-8'}, // 避免觸發CORS preflight，Apps Script用text/plain收再自行JSON.parse
+    body: JSON.stringify(Object.assign({action}, payload||{}))
+  });
+  if(!res.ok) throw new Error('HTTP '+res.status);
+  const data = await res.json();
+  // ok:false 分兩種：帶 error＝後端真的出錯（要丟例外）；帶 reason＝正常的業務判斷結果（如「已被別人認領」），交給呼叫端自己判斷 result.ok/result.reason，不當例外處理
+  if(data && data.ok===false && data.error) throw new Error(data.error);
+  return data;
+}
+
+function setConnStatus(kind, text){
+  const el = document.getElementById('connStatus');
+  if(!el) return;
+  el.className = 'tag' + (kind==='ok' ? ' ok' : kind==='err' ? ' danger' : '');
+  el.textContent = text;
+}
+
+// 從後端拉最新狀態覆蓋本機快取（本機 localStorage 當離線備援，不當作真相來源）
+// Apps Script若把「2026/8/5」這種字串誤存成試算表的日期型別儲存格，讀回來會變成
+// UTC的ISO時間字串（如「2026-08-04T16:00:00.000Z」）——這裡按台北時區轉回可讀日期，
+// 當作後端還沒套用防呆修正、或舊資料還沒被重新同步覆蓋時的安全網
+function normalizeDateField(v){
+  if(!v) return v;
+  const s = String(v);
+  if(!/^\d{4}-\d{2}-\d{2}T/.test(s)) return v;
+  const d = new Date(s);
+  if(isNaN(d.getTime())) return v;
+  const parts = new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Taipei', year:'numeric', month:'numeric', day:'numeric'}).formatToParts(d);
+  const get = t => parts.find(p=>p.type===t).value;
+  return `${get('year')}/${get('month')}/${get('day')}`;
+}
+
+async function refreshFromBackend(silent){
+  if(!hasBackend()) { setConnStatus('', '單機模式'); return; }
+  try{
+    const data = await apiGet();
+    orders = data.orders || {};
+    Object.values(orders).forEach(o=>{ o.date = normalizeDateField(o.date); });
+    log = data.log || [];
+    log.forEach(l=>{ l.orderDate = normalizeDateField(l.orderDate); });
+    if(data.staff && data.staff.length) staff = data.staff;
+    saveJSON(LS.orders, orders);
+    saveJSON(LS.log, log);
+    saveJSON(LS.staff, staff);
+    setConnStatus('ok', '已連線（多人同步）');
+    return true;
+  }catch(err){
+    setConnStatus('err', '連線失敗，使用本機快取');
+    if(!silent) throw err;
+    return false;
+  }
+}
+
+// ============================================================
+// 導覽
+// ============================================================
+async function gotoView(name){
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.getElementById('view-'+name).classList.add('active');
+  document.querySelectorAll('nav.tabbar button').forEach(b=>b.classList.toggle('active', b.dataset.goto===name));
+  if(name==='home') renderHome();
+  if(name==='orders') renderPending();
+  if(name==='log') renderLog();
+  if(name==='settings') renderSettings();
+  if(name==='scan') setTimeout(()=>inputOrder && inputOrder.focus(), 30);
+  if((name==='home' || name==='orders' || name==='log') && hasBackend() && !current){
+    const ok = await refreshFromBackend(true);
+    if(ok){ renderPending(); renderLog(); renderHome(); }
+  }
+}
+document.querySelectorAll('[data-goto]').forEach(el=>{
+  el.addEventListener('click', ()=> gotoView(el.dataset.goto));
+});
+
+// ============================================================
+// 音效與警示畫面
+// ============================================================
+let actx = null;
+function beep(freq, dur, type){
+  try{
+    if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type||'square'; o.frequency.value = freq;
+    o.connect(g); g.connect(actx.destination);
+    g.gain.setValueAtTime(0.25, actx.currentTime);
+    o.start(); o.stop(actx.currentTime + dur/1000);
+  }catch(e){}
+}
+function errorBeep(){ beep(220,180,'sawtooth'); setTimeout(()=>beep(180,220,'sawtooth'),190); }
+function okBeep(){ beep(880,90,'sine'); setTimeout(()=>beep(1200,120,'sine'),100); }
+function doneBeep(){ beep(660,120,'sine'); setTimeout(()=>beep(880,120,'sine'),130); setTimeout(()=>beep(1100,200,'sine'),260); }
+
+function flash(kind, big, sub, ms){
+  const el = document.getElementById('flash');
+  el.className = 'flash show ' + kind;
+  document.getElementById('flashBig').textContent = big;
+  document.getElementById('flashSub').textContent = sub||'';
+  clearTimeout(flash._t);
+  flash._t = setTimeout(()=>{ el.className='flash'; }, ms||900);
+}
+
+// ============================================================
+// CSV 解析工具
+// ============================================================
+// RFC4180風格：處理雙引號包欄位、欄位內逗號、""轉義（試算表規格欄常見「白色,45cm」這種內嵌逗號）
+function parseCsvRFC4180(text){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i=0; i<text.length; i++){
+    const c = text[i];
+    if(inQuotes){
+      if(c === '"'){ if(text[i+1] === '"'){ field += '"'; i++; } else inQuotes = false; }
+      else field += c;
+    } else {
+      if(c === '"') inQuotes = true;
+      else if(c === ','){ row.push(field); field=''; }
+      else if(c === '\r'){ /* skip */ }
+      else if(c === '\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else field += c;
+    }
+  }
+  if(field.length>0 || row.length>0){ row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(f=>f.trim()!==''));
+}
+// 手動CSV貼上：簡易格式，無逗號跳脫
+function parseSimpleCsv(text){
+  const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  const result = {};
+  for(const line of lines){
+    const parts = line.split(',').map(s=>s.trim());
+    if(parts.length<4) continue;
+    const [orderNo, sku, name, qtyStr] = parts;
+    if(orderNo==='訂單號') continue;
+    const qty = parseInt(qtyStr,10);
+    if(!orderNo || isNaN(qty)) continue;
+    if(!result[orderNo]) result[orderNo] = {orderNo, store:'', date:'', items:[], status:'pending'};
+    result[orderNo].items.push({sku, name, qty, scanned:0});
+  }
+  return result;
+}
+// 日期欄有時是Excel序列數字（如46234），有時已是格式化字串（如「2026/8/5」），兩種都要能讀
+function excelSerialToDateStr(serial){
+  const n = parseFloat(serial);
+  if(isNaN(n)) return '';
+  const ms = Math.round((n - 25569) * 86400 * 1000);
+  const d = new Date(ms);
+  if(isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('zh-TW', {year:'numeric', month:'2-digit', day:'2-digit'});
+}
+function parseOrderDate(raw){
+  const s = (raw||'').trim();
+  if(!s) return '';
+  if(/^\d+(\.\d+)?$/.test(s)) return excelSerialToDateStr(s);
+  return s.split(' ')[0];
+}
+function extractSheetId(input){
+  const s = (input||'').trim();
+  const m = s.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if(m) return m[1];
+  if(/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s;
+  return null;
+}
+function toExportCsvUrl(input){
+  const s = (input||'').trim();
+  if(/^https?:\/\/.*export\?format=csv/.test(s)) return s;
+  const id = extractSheetId(s);
+  if(!id) return null;
+  return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=0`;
+}
+
+// ============================================================
+// 訂單合併（同步/匯入共用）：已出貨的訂單不會被覆蓋
+// ============================================================
+async function mergeOrders(parsed){
+  if(hasBackend()){
+    const result = await apiPost('mergeOrders', {orders: parsed});
+    await refreshFromBackend(true); // 拉回權威資料，確保跟其他人看到的一致
+    return result;
+  }
+  let added=0, updated=0, skippedShipped=0;
+  Object.values(parsed).forEach(o=>{
+    const existing = orders[o.orderNo];
+    if(existing && existing.status==='shipped'){ skippedShipped++; return; }
+    if(existing) updated++; else added++;
+    orders[o.orderNo] = o;
+  });
+  saveJSON(LS.orders, orders);
+  return {added, updated, skippedShipped};
+}
+
+// ============================================================
+// 雲端同步訂單
+// ============================================================
+document.getElementById('btnSync').addEventListener('click', ()=>syncOrders());
+document.getElementById('homeBtnSync').addEventListener('click', ()=>{ gotoView('orders'); syncOrders(); });
+
+async function syncOrders(){
+  const msg = document.getElementById('syncMsg');
+  msg.className='msg'; msg.textContent = '同步中…';
+  try{
+    const url = toExportCsvUrl(settings.sheetUrl);
+    if(!url) throw new Error('設定頁的試算表連結看起來無效，請到設定頁確認');
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    const table = parseCsvRFC4180(text);
+    const header = table[0];
+    const idx = name => header.indexOf(name);
+    const iOrder = idx('訂單'), iSku = idx('品號'), iName = idx('品名'), iSpec = idx('規格'),
+          iQty = idx('數量'), iStore = idx('賣場'), iDate = idx('日期'), iStatus = idx('訂單狀態');
+    if(iOrder<0 || iSku<0 || iQty<0) throw new Error('試算表欄位格式不符（找不到訂單/品號/數量欄）');
+
+    const parsed = {};
+    let skippedRows = 0, skippedOtherWarehouse = 0;
+    for(const row of table.slice(1)){
+      const orderNo = (row[iOrder]||'').trim();
+      const sku = (row[iSku]||'').trim();
+      const qty = parseInt(row[iQty], 10);
+      if(!orderNo || !sku || isNaN(qty)){ skippedRows++; continue; }
+      if(iStatus>=0 && settings.handledStatus){
+        const status = (row[iStatus]||'').trim();
+        if(status && status !== settings.handledStatus){ skippedOtherWarehouse++; continue; }
+      }
+      const spec = iSpec>=0 ? (row[iSpec]||'').trim() : '';
+      const baseName = iName>=0 ? (row[iName]||'').trim() : sku;
+      const name = spec ? `${baseName}（${spec}）` : baseName;
+      const store = iStore>=0 ? (row[iStore]||'').trim() : '';
+      const date = iDate>=0 ? parseOrderDate(row[iDate]) : '';
+      if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, items:[], status:'pending'};
+      const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
+      if(existingItem) existingItem.qty += qty;
+      else parsed[orderNo].items.push({sku, name, qty, scanned:0});
+    }
+    const n = Object.keys(parsed).length;
+    const {added, updated, skippedShipped} = await mergeOrders(parsed);
+    settings.lastSyncAt = new Date().toLocaleString('zh-TW');
+    saveJSON(LS.settings, settings);
+    const statusLabel = settings.handledStatus ? `「${settings.handledStatus}」` : '';
+    msg.className='msg ok';
+    msg.textContent = `同步完成：共讀到 ${n} 張${statusLabel}訂單（新增 ${added}／更新 ${updated}／已出貨略過 ${skippedShipped}）`
+      + `${skippedOtherWarehouse>0 ? `，${skippedOtherWarehouse} 列非本倉訂單已略過` : ''}`
+      + `${skippedRows>0 ? `，${skippedRows} 列資料欄位不全已略過` : ''}。`;
+    renderPending(); renderHome();
+  }catch(err){
+    msg.className='msg err';
+    msg.textContent = `同步失敗：${err.message}（請確認試算表分享設定為「知道連結的任何人」可檢視，且此裝置有網路連線）`;
+  }
+}
+
+// ============================================================
+// 指定出貨Excel匯入已出貨紀錄
+// ============================================================
+document.getElementById('btnImportShipmentSheet').addEventListener('click', async ()=>{
+  const msg = document.getElementById('shipmentSheetMsg');
+  const raw = document.getElementById('inputShipmentSheetUrl').value;
+  const sheetId = extractSheetId(raw);
+  if(!sheetId){ msg.className='msg err'; msg.textContent = '看不出這是有效的 Google 試算表連結或ID。'; return; }
+  msg.className='msg'; msg.textContent = '讀取中…';
+  try{
+    const res = await fetch(`https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv`);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    const table = parseCsvRFC4180(text);
+    const headerRowIdx = table.findIndex(row => (row[0]||'').trim() === '掃描');
+    if(headerRowIdx < 0) throw new Error('找不到「掃描」記錄表（這份檔案可能不是文山出貨格式）');
+    const header = table[headerRowIdx].map(h=>h.trim());
+    const idx = name => header.indexOf(name);
+    const iScanOrder = idx('掃描'), iScanTime = idx('掃描時間'), iStore = idx('賣場'),
+          iShipMethod = idx('運送方式'), iWaybill = idx('物流編號'), iNote = idx('備註');
+    if(iScanOrder<0 || iWaybill<0) throw new Error('掃描記錄表欄位不符（找不到掃描/物流編號欄）');
+
+    const candidateEntries = [];
+    let skippedNoWaybill=0;
+    for(const row of table.slice(headerRowIdx+1)){
+      const orderNo = (row[iScanOrder]||'').trim();
+      if(!orderNo) continue;
+      const waybill = (row[iWaybill]||'').trim();
+      if(!waybill){ skippedNoWaybill++; continue; }
+      candidateEntries.push({
+        orderNo, waybill,
+        staffId: '', staffName: '（外部匯入）',
+        time: (iScanTime>=0 ? (row[iScanTime]||'') : '') || new Date().toLocaleString('zh-TW'),
+        hadIssue: false, hadManualEdit: false, importedExternal: true,
+        store: iStore>=0 ? (row[iStore]||'').trim() : '',
+        shipMethod: iShipMethod>=0 ? (row[iShipMethod]||'').trim() : '',
+        note: iNote>=0 ? (row[iNote]||'').trim() : ''
+      });
+    }
+
+    let imported=0, skippedNotFound=0, skippedAlreadyShipped=0;
+    if(hasBackend()){
+      const entriesWithItems = candidateEntries.map(e=>{
+        const order = orders[e.orderNo];
+        return Object.assign({}, e, {orderDate: order ? (order.date||'') : '', items: order ? order.items.map(i=>({sku:i.sku,name:i.name,qty:i.qty,scanned:i.qty})) : []});
+      });
+      const result = await apiPost('importShippedBatch', {entries: entriesWithItems});
+      imported = result.imported; skippedNotFound = result.skippedNotFound; skippedAlreadyShipped = result.skippedAlreadyShipped;
+      await refreshFromBackend(true);
+    } else {
+      candidateEntries.forEach(e=>{
+        const order = orders[e.orderNo];
+        if(!order){ skippedNotFound++; return; }
+        if(order.status === 'shipped'){ skippedAlreadyShipped++; return; }
+        log.unshift(Object.assign({}, e, {orderDate: order.date||'', items: order.items.map(i=>({sku:i.sku,name:i.name,qty:i.qty,scanned:i.qty}))}));
+        order.status = 'shipped';
+        imported++;
+      });
+      saveJSON(LS.log, log);
+      saveJSON(LS.orders, orders);
+    }
+    msg.className='msg ok';
+    msg.textContent = `匯入完成：${imported} 筆已出貨紀錄（略過：找不到對應訂單 ${skippedNotFound}、尚無物流編號 ${skippedNoWaybill}、本系統已標記出貨 ${skippedAlreadyShipped}）。`;
+    renderPending(); renderLog(); renderHome();
+  }catch(err){
+    msg.className='msg err';
+    msg.textContent = `匯入失敗：${err.message}`;
+  }
+});
+
+// ============================================================
+// 手動CSV匯入
+// ============================================================
+document.getElementById('btnImport').addEventListener('click', async ()=>{
+  const parsed = parseSimpleCsv(document.getElementById('csvInput').value);
+  const n = Object.keys(parsed).length;
+  const msg = document.getElementById('importMsg');
+  try{
+    const {added, updated, skippedShipped} = await mergeOrders(parsed);
+    msg.className = n>0 ? 'msg ok' : 'msg err';
+    msg.textContent = n>0
+      ? `已匯入 ${n} 筆訂單資料（新增 ${added}／更新 ${updated}／已出貨略過 ${skippedShipped}）。`
+      : '沒有解析到有效資料，請檢查格式。';
+  }catch(err){
+    msg.className = 'msg err';
+    msg.textContent = `匯入失敗：${err.message}`;
+  }
+  renderPending(); renderHome();
+});
+document.getElementById('btnLoadSample').addEventListener('click', ()=>{
+  document.getElementById('csvInput').value =
+`ORD1001,SKU-A01,兒童學習褲(M),2
+ORD1001,SKU-B02,露營燈,1
+ORD1002,SKU-C03,收納袋,3
+ORD1003,SKU-D04,口罩掛繩,5
+ORD1003,SKU-A01,兒童學習褲(M),1`;
+});
+document.getElementById('btnClearOrders').addEventListener('click', ()=>{
+  if(!confirm('確定要清空所有待出貨訂單？（不影響已出貨紀錄）')) return;
+  orders = {};
+  saveJSON(LS.orders, orders);
+  renderPending(); renderHome();
+});
+
+function renderPending(){
+  const tbody = document.getElementById('pendingTable');
+  const pendingList = Object.values(orders).filter(o=>o.status==='pending');
+  if(!pendingList.length){ tbody.innerHTML = `<tr><td colspan="5" class="empty-row">目前沒有待出貨訂單</td></tr>`; return; }
+  tbody.innerHTML = pendingList.map(o=>{
+    const totalQty = o.items.reduce((s,i)=>s+i.qty,0);
+    return `<tr><td>${o.orderNo}</td><td>${o.date||'-'}</td><td>${o.store||'-'}</td><td>${o.items.length}</td><td>${totalQty}</td></tr>`;
+  }).join('');
+}
+
+// ============================================================
+// 掃描出貨流程
+// ============================================================
+let current = null;
+const inputOrder = document.getElementById('inputOrder');
+const inputBarcode = document.getElementById('inputBarcode');
+const inputFinalWaybill = document.getElementById('inputFinalWaybill');
+
+inputOrder.addEventListener('keydown', async e=>{
+  if(e.key !== 'Enter') return;
+  const code = inputOrder.value.trim();
+  inputOrder.value = '';
+  if(!code) return;
+  if(!currentStaffId || !staff.find(s=>s.id===currentStaffId)){
+    errorBeep();
+    flash('err','請先選擇包貨人員', '首頁或此頁上方「目前包貨人員」還沒選，選好才能開始掃描', 1600);
+    return;
+  }
+  let order = orders[code];
+  if(!order){
+    errorBeep();
+    flash('err','找不到此訂單', `「${code}」不在待出貨清單中，或已完成出貨`, 1300);
+    return;
+  }
+  if(order.status === 'shipped'){
+    errorBeep();
+    flash('err','此訂單已出貨', '請確認是否掃錯訂單', 1300);
+    return;
+  }
+
+  if(hasBackend()){
+    const staffObj = staff.find(s=>s.id===currentStaffId);
+    try{
+      const result = await apiPost('claimOrder', {orderNo: code, staffId: currentStaffId, staffName: staffObj?staffObj.name:''});
+      if(!result.ok){
+        errorBeep();
+        if(result.reason === 'claimed_by_other') flash('err','此訂單正在處理中', `已被「${result.claimedBy}」認領，請改處理其他訂單`, 1600);
+        else if(result.reason === 'already_shipped') flash('err','此訂單已出貨', '', 1200);
+        else flash('err','認領訂單失敗', result.reason||'', 1300);
+        await refreshFromBackend(true);
+        renderPending();
+        return;
+      }
+      order = Object.assign({}, order, result.order, {status:'scanning'});
+    }catch(err){
+      errorBeep();
+      flash('err','連線失敗', err.message, 1500);
+      return;
+    }
+  } else {
+    order.status = 'scanning';
+  }
+  orders[code] = order;
+  saveJSON(LS.orders, orders);
+
+  current = order;
+  current.items.forEach(i=>i.scanned=0);
+  current.hadIssue = false;
+  current.hadManualEdit = false;
+  document.getElementById('stage-order').style.display='none';
+  document.getElementById('stage-items').style.display='block';
+  document.getElementById('curOrderNo').textContent = current.orderNo;
+  document.getElementById('curDate').textContent = current.date || '-';
+  document.getElementById('curStore').textContent = current.store || '-';
+  document.getElementById('completeBox').style.display='none';
+  document.getElementById('finalMsg').textContent='';
+  setPill('scan', `訂單 ${current.orderNo} 掃描中`);
+  renderItemTable();
+  renderPending(); renderHome();
+  okBeep();
+  setTimeout(()=>inputBarcode.focus(), 50);
+});
+
+inputBarcode.addEventListener('keydown', e=>{
+  if(e.key !== 'Enter' || !current) return;
+  const code = inputBarcode.value.trim();
+  inputBarcode.value = '';
+  if(!code) return;
+  const item = current.items.find(i=>i.sku===code);
+  if(!item){
+    current.hadIssue = true;
+    errorBeep();
+    flash('err','商品不符', `條碼「${code}」不屬於此訂單，請確認拿錯商品`, 1200);
+    return;
+  }
+  if(item.scanned >= item.qty){
+    current.hadIssue = true;
+    errorBeep();
+    flash('err','數量超過', `「${item.name}」已達應出數量，請勿重複裝箱`, 1200);
+    return;
+  }
+  item.scanned++;
+  okBeep();
+  renderItemTable();
+  checkComplete();
+});
+
+function renderItemTable(){
+  const tbody = document.querySelector('#itemTable tbody');
+  tbody.innerHTML='';
+  let done=0, total=0;
+  current.items.forEach(i=>{
+    total += i.qty; done += Math.min(i.scanned,i.qty);
+    const tr = document.createElement('tr');
+    let cls='pending', label='<span class="tag warn">待掃描</span>';
+    if(i.scanned>i.qty){ cls='over'; label='<span class="tag danger">超量</span>'; }
+    else if(i.scanned===i.qty){ cls='ok'; label='<span class="tag ok">OK</span>'; }
+    tr.className=cls;
+    tr.innerHTML = `<td>${i.sku}</td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
+      `<td><button class="btn gray sm" onclick="adjustScanned('${i.sku.replace(/'/g,"\\'")}')">修改</button></td>`;
+    tbody.appendChild(tr);
+  });
+  document.getElementById('progressDone').textContent=done;
+  document.getElementById('progressTotal').textContent=total;
+}
+
+function checkComplete(silent){
+  const allDone = current.items.every(i=>i.scanned===i.qty);
+  if(allDone){
+    setPill('done', `訂單 ${current.orderNo} 商品核對完成，待掃運單編號`);
+    if(!silent){ doneBeep(); flash('ok','核對完成','所有品項數量正確，請掃描運單編號完成紀錄',900); }
+    document.getElementById('completeBox').style.display='block';
+    const staffObj = staff.find(s=>s.id===currentStaffId);
+    document.getElementById('completeStaffName').textContent = staffObj ? `${staffObj.id} - ${staffObj.name}` : '（未選擇）';
+    setTimeout(()=>inputFinalWaybill.focus(), 50);
+  } else {
+    setPill('scan', `訂單 ${current.orderNo} 掃描中`);
+    document.getElementById('completeBox').style.display='none';
+  }
+}
+
+function adjustScanned(sku){
+  if(!current) return;
+  const item = current.items.find(i=>i.sku===sku);
+  if(!item) return;
+  const input = prompt(`「${item.name}」目前已掃數量為 ${item.scanned}（應出 ${item.qty}），請輸入正確的已掃數量：`, item.scanned);
+  if(input === null) return;
+  const val = parseInt(input, 10);
+  if(isNaN(val) || val < 0){ alert('請輸入 0 以上的整數'); return; }
+  item.scanned = val;
+  current.hadManualEdit = true;
+  renderItemTable();
+  checkComplete(true);
+}
+
+function setPill(kind, text){
+  const pill = document.getElementById('pill');
+  pill.className = 'pill '+kind;
+  pill.textContent = text;
+}
+
+document.getElementById('btnAbort').addEventListener('click', async ()=>{
+  const orderNo = current ? current.orderNo : null;
+  if(orderNo){
+    if(orders[orderNo]) orders[orderNo].status = 'pending';
+    saveJSON(LS.orders, orders);
+    if(hasBackend()){
+      try{ await apiPost('releaseOrder', {orderNo}); }catch(err){ /* 網路失敗就算了，下次同步會校正 */ }
+    }
+  }
+  current = null;
+  document.getElementById('stage-items').style.display='none';
+  document.getElementById('stage-order').style.display='block';
+  document.getElementById('completeBox').style.display='none';
+  setPill('wait','等待掃描訂單號');
+  renderPending(); renderHome();
+  inputOrder.focus();
+});
+
+async function finalizeShipment(){
+  if(!current) return;
+  const waybill = inputFinalWaybill.value.trim();
+  const finalMsg = document.getElementById('finalMsg');
+  if(!waybill){
+    errorBeep();
+    finalMsg.className = 'msg err';
+    finalMsg.textContent = '請先掃描運單編號才能完成出貨。';
+    return;
+  }
+  const staffObj = staff.find(s=>s.id===currentStaffId);
+  const entry = {
+    orderNo: current.orderNo,
+    orderDate: current.date || '',
+    waybill: waybill,
+    items: current.items.map(i=>({sku:i.sku,name:i.name,qty:i.qty,scanned:i.scanned})),
+    staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
+    time: new Date().toLocaleString('zh-TW'),
+    hadIssue: !!current.hadIssue,
+    hadManualEdit: !!current.hadManualEdit
+  };
+
+  document.getElementById('btnConfirm').disabled = true;
+  try{
+    if(hasBackend()){
+      await apiPost('finalizeShipment', {entry});
+      await refreshFromBackend(true);
+    } else {
+      log.unshift(entry);
+      saveJSON(LS.log, log);
+      current.status = 'shipped';
+      saveJSON(LS.orders, orders);
+    }
+  }catch(err){
+    document.getElementById('btnConfirm').disabled = false;
+    errorBeep();
+    finalMsg.className = 'msg err';
+    finalMsg.textContent = `完成出貨失敗：${err.message}，請重試（掃描資料還在，不會遺失）。`;
+    return;
+  }
+  document.getElementById('btnConfirm').disabled = false;
+
+  current = null;
+  inputFinalWaybill.value = '';
+  document.getElementById('stage-items').style.display='none';
+  document.getElementById('stage-order').style.display='block';
+  document.getElementById('completeBox').style.display='none';
+  setPill('wait','等待掃描訂單號');
+  renderPending(); renderLog(); renderHome();
+  inputOrder.focus();
+}
+document.getElementById('btnConfirm').addEventListener('click', finalizeShipment);
+inputFinalWaybill.addEventListener('keydown', e=>{ if(e.key==='Enter') finalizeShipment(); });
+
+// ============================================================
+// 出貨紀錄
+// ============================================================
+function renderLog(){
+  const tbody = document.getElementById('logTable');
+  if(!log.length){ tbody.innerHTML = `<tr><td colspan="8" class="empty-row">目前沒有出貨紀錄</td></tr>`; return; }
+  tbody.innerHTML = log.map(l=>`<tr>
+    <td>${l.orderNo}</td><td>${l.orderDate||'-'}</td><td>${l.waybill}</td>
+    <td>${l.staffId?`${l.staffId} `:''}${l.staffName||''}</td><td>${l.time}</td>
+    <td>${l.hadIssue?'<span class="tag danger">有</span>':'<span class="tag">無</span>'}</td>
+    <td>${l.hadManualEdit?'<span class="tag warn">有</span>':'<span class="tag">無</span>'}</td>
+    <td>${l.importedExternal?'<span class="tag blue">外部匯入</span>':'<span class="tag">本系統掃描</span>'}</td>
+  </tr>`).join('');
+}
+document.getElementById('btnExportCsv').addEventListener('click', ()=>{
+  const rows = [['訂單號','訂單日期','運單編號','貨號','品名','應出數量','實際掃描數量','包貨人員工號','包貨人員姓名','完成時間','曾觸發警示','曾手動修改數量','來源']];
+  log.forEach(l=>{
+    l.items.forEach(i=>{
+      rows.push([l.orderNo, l.orderDate||'', l.waybill, i.sku, i.name, i.qty, i.scanned, l.staffId, l.staffName, l.time,
+        l.hadIssue?'是':'否', l.hadManualEdit?'是':'否', l.importedExternal?'外部匯入':'本系統掃描']);
+    });
+  });
+  const csv = rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(['\ufeff'+csv], {type:'text/csv;charset=utf-8;'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `出貨紀錄_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+});
+
+// ============================================================
+// 人員管理 + 目前包貨人員（首頁與掃描頁共用同一個持久選擇）
+// ============================================================
+function renderStaffSelects(){
+  const optionsHtml = staff.length
+    ? staff.map(s=>`<option value="${s.id}">${s.id} - ${s.name}</option>`).join('')
+    : '<option value="">（尚未建立人員，請先新增）</option>';
+  if(!staff.find(s=>s.id===currentStaffId)) currentStaffId = staff[0] ? staff[0].id : '';
+  ['homeStaffSelect'].forEach(id=>{
+    const sel = document.getElementById(id);
+    sel.innerHTML = optionsHtml;
+    sel.value = currentStaffId;
+  });
+  const staffObj = staff.find(s=>s.id===currentStaffId);
+  document.getElementById('headerStaffName').textContent = staffObj ? staffObj.name : '未選擇';
+}
+function setCurrentStaff(id){
+  currentStaffId = id;
+  localStorage.setItem(LS.currentStaff, currentStaffId);
+  renderStaffSelects();
+}
+document.getElementById('homeStaffSelect').addEventListener('change', e=>setCurrentStaff(e.target.value));
+
+function renderStaffList(){
+  const ul = document.getElementById('staffUl');
+  if(!staff.length){ ul.innerHTML = `<li style="color:var(--muted2);">尚未建立任何人員</li>`; return; }
+  ul.innerHTML = staff.map((s,idx)=>`<li>
+    <span>${s.id} — ${s.name}</span>
+    <button class="btn gray sm" onclick="removeStaff(${idx})">刪除</button>
+  </li>`).join('');
+}
+async function syncStaffToBackend(){
+  if(!hasBackend()) return;
+  try{ await apiPost('setStaffList', {staff}); }catch(err){ /* 下次連線會再同步 */ }
+}
+async function removeStaff(idx){
+  staff.splice(idx,1);
+  saveJSON(LS.staff, staff);
+  renderStaffList();
+  renderStaffSelects();
+  await syncStaffToBackend();
+}
+document.getElementById('btnAddStaff').addEventListener('click', async ()=>{
+  const id = document.getElementById('staffId').value.trim();
+  const name = document.getElementById('staffName').value.trim();
+  if(!id||!name){ alert('請輸入工號與姓名'); return; }
+  staff.push({id,name});
+  saveJSON(LS.staff, staff);
+  document.getElementById('staffId').value='';
+  document.getElementById('staffName').value='';
+  renderStaffList();
+  renderStaffSelects();
+  await syncStaffToBackend();
+});
+
+// ============================================================
+// 設定
+// ============================================================
+function renderSettings(){
+  document.getElementById('settingSheetUrl').value = settings.sheetUrl || '';
+  document.getElementById('settingHandledStatus').value = settings.handledStatus || '';
+  document.getElementById('settingBackendUrl').value = settings.backendUrl || '';
+  renderStaffList();
+}
+document.getElementById('btnSaveSettings').addEventListener('click', async ()=>{
+  settings.sheetUrl = document.getElementById('settingSheetUrl').value.trim();
+  settings.handledStatus = document.getElementById('settingHandledStatus').value.trim();
+  settings.backendUrl = document.getElementById('settingBackendUrl').value.trim();
+  saveJSON(LS.settings, settings);
+  const msg = document.getElementById('settingsMsg');
+  msg.className = 'msg ok';
+  msg.textContent = '設定已儲存。';
+  if(hasBackend()){
+    try{ await refreshFromBackend(); renderPending(); renderLog(); renderStaffList(); renderStaffSelects(); renderHome(); }
+    catch(err){ /* setConnStatus 已顯示錯誤，這裡不用再彈訊息 */ }
+  } else {
+    setConnStatus('', '單機模式');
+  }
+});
+document.getElementById('btnTestBackend').addEventListener('click', async ()=>{
+  const url = document.getElementById('settingBackendUrl').value.trim();
+  const msg = document.getElementById('settingsMsg');
+  if(!url){ msg.className='msg err'; msg.textContent='請先輸入後端網址。'; return; }
+  msg.className='msg'; msg.textContent='測試中…';
+  try{
+    const res = await fetch(url, {method:'GET'});
+    const data = await res.json();
+    if(data.ok===false) throw new Error(data.error||'後端回應失敗');
+    msg.className='msg ok';
+    msg.textContent = `連線成功（後端版本：${data.version||'（無版本資訊，可能是較舊的Code.gs）'}）：目前後端有 ${Object.keys(data.orders||{}).length} 張訂單、${(data.log||[]).length} 筆出貨紀錄、${(data.staff||[]).length} 位人員。`;
+  }catch(err){
+    msg.className='msg err';
+    msg.textContent = `連線失敗：${err.message}`;
+  }
+});
+document.getElementById('btnResetAll').addEventListener('click', ()=>{
+  if(!confirm('確定要清除本機所有資料（訂單、出貨紀錄、人員、設定）？此動作無法復原。')) return;
+  localStorage.clear();
+  location.reload();
+});
+
+// ============================================================
+// 首頁
+// ============================================================
+function renderHome(){
+  const pendingCount = Object.values(orders).filter(o=>o.status==='pending').length;
+  document.getElementById('pendingBadge').textContent = `${pendingCount} 張待出貨`;
+  document.getElementById('statPending').textContent = pendingCount;
+  document.getElementById('statShippedToday').textContent = countShippedToday();
+  document.getElementById('statIssue').textContent = log.filter(l=>l.hadIssue).length;
+  document.getElementById('statLastSync').textContent = settings.lastSyncAt ? settings.lastSyncAt.split(' ')[0] : '尚未同步';
+  renderStaffSelects();
+}
+function countShippedToday(){
+  const now = new Date();
+  return log.filter(l=>{
+    if(!l.time) return false;
+    // l.time 格式如 "2026/8/5 上午11:09:36"
+    const datePart = l.time.split(' ')[0];
+    const [y,m,d] = datePart.split('/').map(Number);
+    return y===now.getFullYear() && m===(now.getMonth()+1) && d===now.getDate();
+  }).length;
+}
+
+// ============================================================
+// 初始化
+// ============================================================
+renderHome();
+renderPending();
+renderLog();
+renderStaffList();
+renderStaffSelects();
+
+if(hasBackend()){
+  refreshFromBackend(true).then(ok=>{
+    if(ok){ renderPending(); renderLog(); renderHome(); renderStaffList(); renderStaffSelects(); }
+  });
+} else {
+  setConnStatus('', '單機模式');
+}
+
+// 有設定共用後端時，每20秒背景刷新一次，讓多人多裝置看得到彼此的最新狀態
+// （掃描中的訂單current不會被這個刷新動到，見 refreshFromBackend 只換orders/log/staff）
+setInterval(()=>{
+  if(!hasBackend()) return;
+  refreshFromBackend(true).then(ok=>{
+    if(!ok) return;
+    const activeView = document.querySelector('.view.active');
+    if(!activeView) return;
+    if(activeView.id==='view-home') renderHome();
+    if(activeView.id==='view-orders') renderPending();
+    if(activeView.id==='view-log') renderLog();
+    if(activeView.id==='view-home') renderHome();
+  });
+}, 20000);
+</script>
+</body>
+</html>
