@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.9';
+const BACKEND_VERSION = '2026-08-05.10';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -200,12 +200,34 @@ function mergeOrders(incoming){
   return {ok:true, added, updated, skippedShipped};
 }
 
+// 保險機制：萬一還有資料列沒跑過 migrateOrdersColumnShift() 就先被claim/release/finalize動到，
+// 這裡先就地把那一列的欄位位移修正好，再讓呼叫端繼續原本的邏輯，避免寫壞舊資料
+// （判斷方式跟 migrateOrdersColumnShift() 一樣：新版狀態欄一定是這三個值之一）。
+const VALID_ORDER_STATUS = {pending:1, scanning:1, shipped:1};
+function healOrderRowIfNeeded_(sh, row){
+  if(VALID_ORDER_STATUS[row.status]) return row;
+  const raw = sh.getRange(row._row, 1, 1, ORDERS_HEADER.length).getValues()[0];
+  const orderNo=raw[0], store=raw[1], date=raw[2], itemsJson=raw[3];
+  const oldStatus=raw[4], oldClaimedBy=raw[5], oldClaimedAt=raw[6], oldUpdatedAt=raw[7], oldShipMethod=raw[8], oldRoutingStatus=raw[9];
+  const items = safeParse(itemsJson, []);
+  const {skuSummary, nameSummary} = summarizeItems(items);
+  sh.getRange(row._row, colOf(ORDERS_HEADER,'date')).setNumberFormat('@');
+  sh.getRange(row._row, 1, 1, ORDERS_HEADER.length).setValues([[
+    orderNo, store, date, itemsJson, skuSummary, nameSummary,
+    oldStatus || 'pending', oldClaimedBy || '', oldClaimedAt || '', oldUpdatedAt || '', oldShipMethod || '', oldRoutingStatus || ''
+  ]]);
+  return {_row: row._row, orderNo, store, date, itemsJson, skuSummary, nameSummary,
+    status: oldStatus || 'pending', claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '',
+    updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || ''};
+}
+
 // ---------------- 認領訂單（避免兩人同時掃同一張） ----------------
 function claimOrder(orderNo, staffId, staffName){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
-  const row = rows.find(r=>r.orderNo===orderNo);
+  let row = rows.find(r=>r.orderNo===orderNo);
   if(!row) return {ok:false, reason:'not_found'};
+  row = healOrderRowIfNeeded_(sh, row);
   if(row.status === 'shipped') return {ok:false, reason:'already_shipped'};
   if(row.status === 'scanning' && row.claimedBy && row.claimedBy !== staffId){
     return {ok:false, reason:'claimed_by_other', claimedBy: row.claimedBy};
@@ -218,8 +240,9 @@ function claimOrder(orderNo, staffId, staffName){
 function releaseOrder(orderNo){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
-  const row = rows.find(r=>r.orderNo===orderNo);
+  let row = rows.find(r=>r.orderNo===orderNo);
   if(!row) return {ok:false, reason:'not_found'};
+  row = healOrderRowIfNeeded_(sh, row);
   if(row.status === 'shipped') return {ok:true}; // 已出貨就不用管了
   sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 3).setValues([['pending', '', '']]);
   return {ok:true};
@@ -230,8 +253,9 @@ function finalizeShipment(entry){
   if(!entry || !entry.orderNo) return {ok:false, error:'missing orderNo'};
   const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
-  const row = rows.find(r=>r.orderNo===entry.orderNo);
+  let row = rows.find(r=>r.orderNo===entry.orderNo);
   if(row){
+    row = healOrderRowIfNeeded_(ordersSh, row);
     const now = new Date().toISOString();
     ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['shipped', '', '', now]]);
   }
@@ -265,8 +289,9 @@ function importShippedBatch(entries){
   let imported=0, skippedNotFound=0, skippedAlreadyShipped=0;
   const now = new Date().toISOString();
   entries.forEach(entry=>{
-    const row = byOrderNo[entry.orderNo];
+    let row = byOrderNo[entry.orderNo];
     if(!row){ skippedNotFound++; return; }
+    row = healOrderRowIfNeeded_(ordersSh, row);
     if(row.status === 'shipped'){ skippedAlreadyShipped++; return; }
     ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['shipped', '', '', now]]);
     appendLogRow(entry);
@@ -336,6 +361,76 @@ function setupLogSheetColors(){
   ];
   sh.setConditionalFormatRules(rules);
   Logger.log('已設定出貨紀錄分頁的顏色規則');
+}
+
+// ---------------- 一次性緊急修復用：還原插入貨號/品名欄位造成的舊資料列位移 ----------------
+// 背景：ORDERS_HEADER／LOG_HEADER 中間插入 skuSummary/nameSummary 兩欄後，
+// getSheet() 只會強制對齊「標題列」，部署前既有的「資料列」欄位內容還留在舊的欄位位置，
+// 用新標題去讀就會整組錯位（例如舊的寄送方式被讀成claimedAt、舊的完成時間被讀成貨號…）。
+// 這兩個函式在 Apps Script 編輯器裡選取後按「執行」各跑一次即可（不用重新部署），
+// 會把還沒搬過的舊資料列平移回正確欄位，並補上貨號/品名兩欄。
+// 判斷「這列是否還沒搬過」的方式：
+//   訂單：新版「狀態」欄只會是 pending/scanning/shipped 三選一，不是的話代表還是舊版資料列。
+//   出貨紀錄：新版「核對結果」欄一定有值（完成/完成（人工修正數量）），是空的代表還是舊版資料列。
+// 已經是新版寫入的列會被自動略過，重複執行也不會壞資料，可以放心跑。
+function migrateOrdersColumnShift(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_ORDERS);
+  if(!sh) { Logger.log('找不到「訂單」分頁'); return; }
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2){ Logger.log('沒有資料列'); return; }
+  const numCols = Math.max(sh.getLastColumn(), ORDERS_HEADER.length);
+  const values = sh.getRange(2, 1, lastRow-1, numCols).getValues();
+  const VALID_STATUS = {pending:1, scanning:1, shipped:1};
+  const dateCol = colOf(ORDERS_HEADER,'date');
+  let migrated = 0;
+  values.forEach((row, i)=>{
+    if(VALID_STATUS[row[6]]) return; // 第7欄已經是合法狀態值，代表這列已經是新版，跳過
+    const orderNo=row[0], store=row[1], date=row[2], itemsJson=row[3];
+    const oldStatus=row[4], oldClaimedBy=row[5], oldClaimedAt=row[6], oldUpdatedAt=row[7], oldShipMethod=row[8], oldRoutingStatus=row[9];
+    const items = safeParse(itemsJson, []);
+    const {skuSummary, nameSummary} = summarizeItems(items);
+    const targetRow = i + 2;
+    sh.getRange(targetRow, dateCol).setNumberFormat('@');
+    sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([[
+      orderNo, store, date, itemsJson, skuSummary, nameSummary,
+      oldStatus || 'pending', oldClaimedBy || '', oldClaimedAt || '', oldUpdatedAt || '', oldShipMethod || '', oldRoutingStatus || ''
+    ]]);
+    migrated++;
+  });
+  Logger.log('訂單分頁：已還原 '+migrated+' 列舊資料的欄位位移');
+}
+
+function migrateLogColumnShift(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh) { Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2){ Logger.log('沒有資料列'); return; }
+  const numCols = Math.max(sh.getLastColumn(), LOG_HEADER.length);
+  const values = sh.getRange(2, 1, lastRow-1, numCols).getValues();
+  const orderDateCol = colOf(LOG_HEADER,'orderDate');
+  const timeCol = colOf(LOG_HEADER,'time');
+  let migrated = 0;
+  values.forEach((row, i)=>{
+    if(row[18]) return; // 第19欄(核對結果)已經有值，代表這列已經是新版，跳過
+    const orderNo=row[0], orderDate=row[1], waybill=row[2], itemsJson=row[3];
+    const oldStaffId=row[4], oldStaffName=row[5], oldTime=row[6], oldHadIssue=row[7],
+          oldHadManualEdit=row[8], oldImportedExternal=row[9], oldStore=row[10], oldShipMethod=row[11],
+          oldNote=row[12], oldRequiredCount=row[13], oldScannedCount=row[14], oldRoutingStatus=row[15],
+          oldCheckResult=row[16], oldDifferenceDetails=row[17];
+    const items = safeParse(itemsJson, []);
+    const {skuSummary, nameSummary} = summarizeItems(items);
+    const targetRow = i + 2;
+    sh.getRange(targetRow, orderDateCol).setNumberFormat('@');
+    sh.getRange(targetRow, timeCol).setNumberFormat('@');
+    sh.getRange(targetRow, 1, 1, LOG_HEADER.length).setValues([[
+      orderNo, orderDate, waybill, itemsJson, skuSummary, nameSummary,
+      oldStaffId, oldStaffName, oldTime, oldHadIssue, oldHadManualEdit, oldImportedExternal,
+      oldStore, oldShipMethod, oldNote, oldRequiredCount, oldScannedCount, oldRoutingStatus,
+      oldCheckResult, oldDifferenceDetails
+    ]]);
+    migrated++;
+  });
+  Logger.log('出貨紀錄分頁：已還原 '+migrated+' 列舊資料的欄位位移');
 }
 
 // ---------------- 一次性設定用：把「文山出貨V2」跟「國際碼」鏡像進這份後端試算表 ----------------
