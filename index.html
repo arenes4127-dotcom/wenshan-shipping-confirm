@@ -190,6 +190,7 @@
               訂單號 <b style="color:var(--text);" id="curOrderNo"></b>
               日期 <b style="color:var(--text);" id="curDate"></b>
               賣場 <b style="color:var(--text);" id="curStore"></b>
+              寄送方式 <b style="color:var(--text);" id="curShipMethod"></b>
             </div>
             <div class="progress-num"><span id="progressDone">0</span><span>/<span id="progressTotal">0</span></span></div>
           </div>
@@ -257,9 +258,10 @@
 
       <div class="section-label">待出貨清單</div>
       <div class="card">
+        <input id="pendingSearch" type="text" placeholder="搜尋訂單號／賣場／寄送方式" style="margin-bottom:12px;">
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>訂單號</th><th>日期</th><th>賣場</th><th>品項數</th><th>總數量</th></tr></thead>
+            <thead><tr><th>訂單號</th><th>日期</th><th>賣場</th><th>寄送方式</th><th>品項數</th><th>總數量</th></tr></thead>
             <tbody id="pendingTable"></tbody>
           </table>
         </div>
@@ -310,6 +312,20 @@
           <span>本倉負責的「訂單狀態」標籤（留空＝不篩選，全部匯入）</span>
           <input id="settingHandledStatus" type="text" placeholder="例如：文山">
         </label>
+      </div>
+
+      <div class="section-label">條碼對照表</div>
+      <div class="card">
+        <h2>條碼轉品號（國際碼）</h2>
+        <p class="hint">掃到的是外包裝條碼、不是訂單裡的品號時，會先查這份表轉換再比對，避免掃不到。</p>
+        <label class="field">
+          <span>Google 試算表連結或ID</span>
+          <input id="settingBarcodeUrl" type="text" placeholder="https://docs.google.com/spreadsheets/d/...">
+        </label>
+        <div class="row">
+          <button class="btn gray" id="btnLoadBarcodeMap">立即載入條碼對照表</button>
+          <span class="tag" id="barcodeMapStatus">尚未載入</span>
+        </div>
       </div>
 
       <div class="section-label">包貨/出貨人員</div>
@@ -378,13 +394,22 @@ let log = loadJSON(LS.log, []);
 let staff = loadJSON(LS.staff, [{id:'S01',name:'王小明'},{id:'S02',name:'陳小華'}]);
 saveJSON(LS.staff, staff);
 let currentStaffId = localStorage.getItem(LS.currentStaff) || '';
-let settings = loadJSON(LS.settings, {
+// 用 Object.assign 合併預設值：舊使用者localStorage裡已經存過的settings物件缺少新欄位時
+// （例如這次新加的 barcodeSheetUrl）會自動補上預設值，不會變成undefined要使用者自己發現去填。
+const DEFAULT_SETTINGS = {
   sheetUrl: 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=0',
   handledStatus: '文山',
   lastSyncAt: '',
-  backendUrl: ''
-});
+  backendUrl: '',
+  barcodeSheetUrl: 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=20260730',
+  barcodeMapLoadedAt: ''
+};
+let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(LS.settings, {}));
 saveJSON(LS.settings, settings);
+
+// 條碼對照表（國際碼）：條碼 → 品號。掃描商品時如果掃到的是外包裝條碼而不是內部品號，
+// 用這份表轉換過去再比對，跟「文山核對 工作區」原生系統的「轉換品號」欄位同樣邏輯。
+let barcodeMap = {};
 
 // ============================================================
 // 共用後端（Google Apps Script Web App）：有設定就走多人共用資料，
@@ -572,6 +597,34 @@ function toExportCsvUrl(input){
   return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=0`;
 }
 
+// 讀取條碼對照表（國際碼分頁：條碼,品號,條碼,品名,規格——只用第一個「條碼」欄）
+async function loadBarcodeMap(silent){
+  const url = toExportCsvUrl(settings.barcodeSheetUrl);
+  if(!url){ if(!silent) throw new Error('條碼對照表連結看起來無效'); return false; }
+  try{
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const text = await res.text();
+    const table = parseCsvRFC4180(text);
+    const header = table[0];
+    const iBarcode = header.indexOf('條碼'), iSku = header.indexOf('品號');
+    if(iBarcode<0 || iSku<0) throw new Error('找不到條碼/品號欄');
+    const map = {};
+    table.slice(1).forEach(row=>{
+      const bc = (row[iBarcode]||'').trim();
+      const sku = (row[iSku]||'').trim();
+      if(bc && sku) map[bc] = sku;
+    });
+    barcodeMap = map;
+    settings.barcodeMapLoadedAt = new Date().toLocaleString('zh-TW');
+    saveJSON(LS.settings, settings);
+    return true;
+  }catch(err){
+    if(!silent) throw err;
+    return false;
+  }
+}
+
 // ============================================================
 // 訂單合併（同步/匯入共用）：已出貨的訂單不會被覆蓋
 // ============================================================
@@ -611,7 +664,8 @@ async function syncOrders(){
     const header = table[0];
     const idx = name => header.indexOf(name);
     const iOrder = idx('訂單'), iSku = idx('品號'), iName = idx('品名'), iSpec = idx('規格'),
-          iQty = idx('數量'), iStore = idx('賣場'), iDate = idx('日期'), iStatus = idx('訂單狀態');
+          iQty = idx('數量'), iStore = idx('賣場'), iDate = idx('日期'), iStatus = idx('訂單狀態'),
+          iShipMethod = idx('寄送方式');
     if(iOrder<0 || iSku<0 || iQty<0) throw new Error('試算表欄位格式不符（找不到訂單/品號/數量欄）');
 
     const parsed = {};
@@ -630,7 +684,8 @@ async function syncOrders(){
       const name = spec ? `${baseName}（${spec}）` : baseName;
       const store = iStore>=0 ? (row[iStore]||'').trim() : '';
       const date = iDate>=0 ? parseOrderDate(row[iDate]) : '';
-      if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, items:[], status:'pending'};
+      const shipMethod = iShipMethod>=0 ? (row[iShipMethod]||'').trim() : '';
+      if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, items:[], status:'pending'};
       const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
       if(existingItem) existingItem.qty += qty;
       else parsed[orderNo].items.push({sku, name, qty, scanned:0});
@@ -757,13 +812,22 @@ document.getElementById('btnClearOrders').addEventListener('click', ()=>{
 
 function renderPending(){
   const tbody = document.getElementById('pendingTable');
-  const pendingList = Object.values(orders).filter(o=>o.status==='pending');
-  if(!pendingList.length){ tbody.innerHTML = `<tr><td colspan="5" class="empty-row">目前沒有待出貨訂單</td></tr>`; return; }
+  const q = (document.getElementById('pendingSearch').value||'').trim().toLowerCase();
+  let pendingList = Object.values(orders).filter(o=>o.status==='pending');
+  if(q){
+    pendingList = pendingList.filter(o=>
+      (o.orderNo||'').toLowerCase().includes(q) ||
+      (o.store||'').toLowerCase().includes(q) ||
+      (o.shipMethod||'').toLowerCase().includes(q)
+    );
+  }
+  if(!pendingList.length){ tbody.innerHTML = `<tr><td colspan="6" class="empty-row">${q?'沒有符合搜尋條件的訂單':'目前沒有待出貨訂單'}</td></tr>`; return; }
   tbody.innerHTML = pendingList.map(o=>{
     const totalQty = o.items.reduce((s,i)=>s+i.qty,0);
-    return `<tr><td>${o.orderNo}</td><td>${o.date||'-'}</td><td>${o.store||'-'}</td><td>${o.items.length}</td><td>${totalQty}</td></tr>`;
+    return `<tr><td>${o.orderNo}</td><td>${o.date||'-'}</td><td>${o.store||'-'}</td><td>${o.shipMethod||'-'}</td><td>${o.items.length}</td><td>${totalQty}</td></tr>`;
   }).join('');
 }
+document.getElementById('pendingSearch').addEventListener('input', renderPending);
 
 // ============================================================
 // 掃描出貨流程
@@ -829,6 +893,7 @@ inputOrder.addEventListener('keydown', async e=>{
   document.getElementById('curOrderNo').textContent = current.orderNo;
   document.getElementById('curDate').textContent = current.date || '-';
   document.getElementById('curStore').textContent = current.store || '-';
+  document.getElementById('curShipMethod').textContent = current.shipMethod || '-';
   document.getElementById('completeBox').style.display='none';
   document.getElementById('finalMsg').textContent='';
   setPill('scan', `訂單 ${current.orderNo} 掃描中`);
@@ -843,7 +908,11 @@ inputBarcode.addEventListener('keydown', e=>{
   const code = inputBarcode.value.trim();
   inputBarcode.value = '';
   if(!code) return;
-  const item = current.items.find(i=>i.sku===code);
+  // 先直接比對品號，比對不到再查條碼對照表轉換成品號後重試（掃到外包裝條碼時用）
+  let item = current.items.find(i=>i.sku===code);
+  if(!item && barcodeMap[code]){
+    item = current.items.find(i=>i.sku===barcodeMap[code]);
+  }
   if(!item){
     current.hadIssue = true;
     errorBeep();
@@ -1080,12 +1149,39 @@ function renderSettings(){
   document.getElementById('settingSheetUrl').value = settings.sheetUrl || '';
   document.getElementById('settingHandledStatus').value = settings.handledStatus || '';
   document.getElementById('settingBackendUrl').value = settings.backendUrl || '';
+  document.getElementById('settingBarcodeUrl').value = settings.barcodeSheetUrl || '';
+  renderBarcodeMapStatus();
   renderStaffList();
 }
+function renderBarcodeMapStatus(){
+  const el = document.getElementById('barcodeMapStatus');
+  const count = Object.keys(barcodeMap).length;
+  if(count>0){
+    el.className = 'tag ok';
+    el.textContent = `已載入 ${count} 筆（${settings.barcodeMapLoadedAt || ''}）`;
+  } else {
+    el.className = 'tag';
+    el.textContent = '尚未載入';
+  }
+}
+document.getElementById('btnLoadBarcodeMap').addEventListener('click', async ()=>{
+  settings.barcodeSheetUrl = document.getElementById('settingBarcodeUrl').value.trim();
+  saveJSON(LS.settings, settings);
+  const el = document.getElementById('barcodeMapStatus');
+  el.className = 'tag'; el.textContent = '載入中…';
+  try{
+    await loadBarcodeMap();
+    renderBarcodeMapStatus();
+  }catch(err){
+    el.className = 'tag danger';
+    el.textContent = `載入失敗：${err.message}`;
+  }
+});
 document.getElementById('btnSaveSettings').addEventListener('click', async ()=>{
   settings.sheetUrl = document.getElementById('settingSheetUrl').value.trim();
   settings.handledStatus = document.getElementById('settingHandledStatus').value.trim();
   settings.backendUrl = document.getElementById('settingBackendUrl').value.trim();
+  settings.barcodeSheetUrl = document.getElementById('settingBarcodeUrl').value.trim();
   saveJSON(LS.settings, settings);
   const msg = document.getElementById('settingsMsg');
   msg.className = 'msg ok';
@@ -1157,6 +1253,9 @@ if(hasBackend()){
   });
 } else {
   setConnStatus('', '單機模式');
+}
+if(settings.barcodeSheetUrl){
+  loadBarcodeMap(true).then(()=>renderBarcodeMapStatus());
 }
 
 // 有設定共用後端時，每20秒背景刷新一次，讓多人多裝置看得到彼此的最新狀態
