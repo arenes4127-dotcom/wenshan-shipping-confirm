@@ -396,15 +396,22 @@ saveJSON(LS.staff, staff);
 let currentStaffId = localStorage.getItem(LS.currentStaff) || '';
 // 用 Object.assign 合併預設值：舊使用者localStorage裡已經存過的settings物件缺少新欄位時
 // （例如這次新加的 barcodeSheetUrl）會自動補上預設值，不會變成undefined要使用者自己發現去填。
+// 訂單資料/條碼對照表現在改成走「文山出貨確認系統-後端」自己的鏡像分頁（IMPORTRANGE即時同步
+// 自「文山出貨V2」「國際碼」的真正源頭），不用每台裝置都直接連到「文山核對 工作區」。
 const DEFAULT_SETTINGS = {
-  sheetUrl: 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=0',
+  sheetUrl: 'https://docs.google.com/spreadsheets/d/1ogk_YvgJvFhjlnlF0QFiy1LaNMd89Qoe49slswk7Ubs/export?format=csv&gid=1561489401',
   handledStatus: '文山',
   lastSyncAt: '',
   backendUrl: '',
-  barcodeSheetUrl: 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=20260730',
+  barcodeSheetUrl: 'https://docs.google.com/spreadsheets/d/1ogk_YvgJvFhjlnlF0QFiy1LaNMd89Qoe49slswk7Ubs/export?format=csv&gid=53784796',
   barcodeMapLoadedAt: ''
 };
+// 舊版預設值：只自動升級「還在用系統原本內建預設值」的使用者，使用者自己手動改過的連結不動它
+const OLD_DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=0';
+const OLD_DEFAULT_BARCODE_URL = 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=20260730';
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(LS.settings, {}));
+if(settings.sheetUrl === OLD_DEFAULT_SHEET_URL) settings.sheetUrl = DEFAULT_SETTINGS.sheetUrl;
+if(settings.barcodeSheetUrl === OLD_DEFAULT_BARCODE_URL) settings.barcodeSheetUrl = DEFAULT_SETTINGS.barcodeSheetUrl;
 saveJSON(LS.settings, settings);
 
 // 條碼對照表（國際碼）：條碼 → 品號。掃描商品時如果掃到的是外包裝條碼而不是內部品號，
