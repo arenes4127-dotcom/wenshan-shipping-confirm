@@ -274,3 +274,37 @@ function deleteLegacyEmptySheets(){
   });
   Logger.log('已刪除分頁：' + deleted.join('、'));
 }
+
+// ---------------- 一次性設定用：出貨紀錄分頁的顏色標示 ----------------
+// 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（不用重新部署）。
+// 設定的是「條件式格式」，套一次之後，之後每一筆新的出貨紀錄會自動套用顏色，
+// 不用每次寫入資料時都重新設定一次。
+// 整列上色，依優先順序：曾觸發警示(是)＝紅色 > 曾手動修改數量(是，且無警示)＝黃色 >
+// 外部匯入(是，且無警示無手動修改)＝藍色。
+function setupLogSheetColors(){
+  const sh = getSheet(SHEET_LOG, LOG_HEADER);
+  const numCols = LOG_HEADER.length;
+  const numRows = 998; // 涵蓋第2列到第999列，之後新資料都會自動套用
+  const fullRange = sh.getRange(2, 1, numRows, numCols);
+
+  // hadIssue=第8欄=H, hadManualEdit=第9欄=I, importedExternal=第10欄=J
+  const rules = [
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$H2="是"')
+      .setBackground('#f4cccc')
+      .setRanges([fullRange])
+      .build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=AND($H2<>"是",$I2="是")')
+      .setBackground('#fff2cc')
+      .setRanges([fullRange])
+      .build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=AND($H2<>"是",$I2<>"是",$J2="是")')
+      .setBackground('#cfe2f3')
+      .setRanges([fullRange])
+      .build()
+  ];
+  sh.setConditionalFormatRules(rules);
+  Logger.log('已設定出貨紀錄分頁的顏色規則');
+}
