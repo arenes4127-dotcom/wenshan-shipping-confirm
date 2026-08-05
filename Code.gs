@@ -308,8 +308,10 @@ function setupLogSheetColors(){
 
 // ---------------- 一次性設定用：把「文山出貨V2」跟「國際碼」鏡像進這份後端試算表 ----------------
 // 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（不用重新部署）。
-// 用 IMPORTRANGE 從「文山核對 工作區」（1vCCJS...）即時鏡像過來，資料來源那邊只被「讀取」，
-// 不會寫入/修改任何東西，符合使用者「不可去動文山核對工作區」的交代。
+// 直接複製原本兩個分頁自己的 IMPORTRANGE 公式，指向「真正的」原始資料來源
+// （而不是再從「文山核對 工作區」轉一手——那兩個分頁本身也是IMPORTRANGE鏡像過去的，
+// 直接接到源頭比較不會有雙層IMPORTRANGE刷新不穩定的問題）。
+// 兩邊來源都只被「讀取」，不會寫入/修改任何東西，符合使用者「不可去動文山核對工作區」的交代。
 // 跑完之後：
 //   1. 打開這份後端試算表裡新出現的「文山出貨V2」「條碼轉品號」兩個分頁，
 //      如果 A1 儲存格顯示「#REF! 這個公式參照到未經授權的外部資料範圍」，
@@ -317,16 +319,21 @@ function setupLogSheetColors(){
 //   2. 授權完成後，資料會自動載入，之後來源那邊資料有變動，這兩個分頁也會自動跟著更新
 //      （IMPORTRANGE是活的連結，不是複製一次就結束）。
 function setupImportedMirrorSheets(){
-  const SOURCE_ID = '1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU';
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
+  // 文山出貨V2：跟「文山核對 工作區」裡那個分頁自己的公式一模一樣，直接接到同一個源頭
   let orderSh = ss.getSheetByName('文山出貨V2');
   if(!orderSh) orderSh = ss.insertSheet('文山出貨V2');
-  orderSh.getRange('A1').setFormula(`=IMPORTRANGE("${SOURCE_ID}", "文山出貨V2!A1:J")`);
+  orderSh.getRange('A1').setFormula(
+    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,31)'
+  );
 
+  // 條碼轉品號：「國際碼」分頁本身也是IMPORTRANGE鏡像，直接接到它指向的真正來源
   let barcodeSh = ss.getSheetByName('條碼轉品號');
   if(!barcodeSh) barcodeSh = ss.insertSheet('條碼轉品號');
-  barcodeSh.getRange('A1').setFormula(`=IMPORTRANGE("${SOURCE_ID}", "國際碼!A1:E")`);
+  barcodeSh.getRange('A1').setFormula(
+    '=IMPORTRANGE("1rVAAGPeTc3p4m0xpKLnByteYELW1imuhLPhJhTmbI_8","\'國際碼對照表\'!A:E")'
+  );
 
   Logger.log('已建立「文山出貨V2」「條碼轉品號」鏡像分頁，請打開這兩個分頁手動完成一次性授權（如果有跳出提示的話）。');
 }
