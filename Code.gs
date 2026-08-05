@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.10';
+const BACKEND_VERSION = '2026-08-05.11';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -197,7 +197,37 @@ function mergeOrders(incoming){
     ]]);
     if(existing) updated++; else added++;
   });
+  rebuildOrderDetailSheet_();
   return {ok:true, added, updated, skippedShipped};
+}
+
+// ---------------- 「訂單明細」分頁：一列一品項，方便直接在試算表裡肉眼看 ----------------
+// 每次 mergeOrders() 同步完都會重新整張重建（品項內容只會在同步時變動，
+// claim/release/finalize只改狀態不改品項，不需要每次都重建，效能上不用擔心）。
+// baseName/spec 是品名/規格拆開後的欄位（來源CSV本來就是分開的兩欄，只是之前組訂單時
+// 為了掃描畫面好認又把兩者黏成一欄「品名（規格）」存進name——name繼續保留給掃描畫面用，
+// 這裡另外用baseName/spec兩個原始欄位還原成使用者要的表格）。
+// 舊資料如果還沒有baseName/spec（這次改版之前同步存的），品名欄位退回用完整的name顯示，
+// 規格留空，不會噴錯。
+const SHEET_DETAIL = '訂單明細';
+const DETAIL_DISPLAY_HEADER = ['訂單', '品名', '規格', '品號', '數量'];
+function rebuildOrderDetailSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_DETAIL);
+  if(!sh) sh = ss.insertSheet(SHEET_DETAIL);
+  const orderRows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const out = [];
+  orderRows.forEach(r=>{
+    const items = safeParse(r.itemsJson, []);
+    items.forEach(it=>{
+      out.push([r.orderNo, it.baseName || it.name || '', it.spec || '', it.sku || '', it.qty || 0]);
+    });
+  });
+  sh.clearContents();
+  sh.getRange(1, 1, 1, DETAIL_DISPLAY_HEADER.length).setValues([DETAIL_DISPLAY_HEADER]);
+  if(out.length){
+    sh.getRange(2, 1, out.length, DETAIL_DISPLAY_HEADER.length).setValues(out);
+  }
 }
 
 // 保險機制：萬一還有資料列沒跑過 migrateOrdersColumnShift() 就先被claim/release/finalize動到，

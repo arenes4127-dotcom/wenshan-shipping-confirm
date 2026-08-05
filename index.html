@@ -696,7 +696,7 @@ async function syncOrders(){
       if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, routingStatus, items:[], status:'pending'};
       const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
       if(existingItem) existingItem.qty += qty;
-      else parsed[orderNo].items.push({sku, name, qty, scanned:0});
+      else parsed[orderNo].items.push({sku, name, baseName, spec, qty, scanned:0});
     }
     const n = Object.keys(parsed).length;
     const {added, updated, skippedShipped} = await mergeOrders(parsed);
@@ -758,7 +758,7 @@ document.getElementById('btnImportShipmentSheet').addEventListener('click', asyn
     if(hasBackend()){
       const entriesWithItems = candidateEntries.map(e=>{
         const order = orders[e.orderNo];
-        return Object.assign({}, e, {orderDate: order ? (order.date||'') : '', items: order ? order.items.map(i=>({sku:i.sku,name:i.name,qty:i.qty,scanned:i.qty})) : []});
+        return Object.assign({}, e, {orderDate: order ? (order.date||'') : '', items: order ? order.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.qty})) : []});
       });
       const result = await apiPost('importShippedBatch', {entries: entriesWithItems});
       imported = result.imported; skippedNotFound = result.skippedNotFound; skippedAlreadyShipped = result.skippedAlreadyShipped;
@@ -768,7 +768,7 @@ document.getElementById('btnImportShipmentSheet').addEventListener('click', asyn
         const order = orders[e.orderNo];
         if(!order){ skippedNotFound++; return; }
         if(order.status === 'shipped'){ skippedAlreadyShipped++; return; }
-        log.unshift(Object.assign({}, e, {orderDate: order.date||'', items: order.items.map(i=>({sku:i.sku,name:i.name,qty:i.qty,scanned:i.qty}))}));
+        log.unshift(Object.assign({}, e, {orderDate: order.date||'', items: order.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.qty}))}));
         order.status = 'shipped';
         imported++;
       });
@@ -1036,7 +1036,7 @@ async function finalizeShipment(){
     orderNo: current.orderNo,
     orderDate: current.date || '',
     waybill: waybill,
-    items: current.items.map(i=>({sku:i.sku,name:i.name,qty:i.qty,scanned:i.scanned})),
+    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned})),
     staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
     time: new Date().toLocaleString('zh-TW'),
     hadIssue: !!current.hadIssue,
