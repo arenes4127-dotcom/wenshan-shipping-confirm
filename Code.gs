@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.8';
+const BACKEND_VERSION = '2026-08-05.9';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -33,13 +33,14 @@ const SHEET_STAFF = '人員';
 // 會自動把舊分頁改名成新的中文名稱，資料原封不動保留，不用手動搬。
 const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'Staff' };
 
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus'];
-const LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails'];
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus'];
+const LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','skuSummary','nameSummary','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
 const HEADER_LABELS = {
-  orderNo:'訂單號', store:'賣場', date:'日期', itemsJson:'品項資料(JSON)', status:'狀態',
+  orderNo:'訂單號', store:'賣場', date:'日期', itemsJson:'品項資料(JSON)',
+  skuSummary:'貨號', nameSummary:'品名', status:'狀態',
   claimedBy:'認領人', claimedAt:'認領時間', updatedAt:'更新時間',
   orderDate:'訂單日期', waybill:'運單編號', staffId:'包貨人員工號', staffName:'包貨人員姓名',
   time:'完成時間', hadIssue:'曾觸發警示', hadManualEdit:'曾手動修改數量', importedExternal:'外部匯入',
@@ -154,6 +155,23 @@ function cellToText(v, withTime){
 function boolToText(b){ return b ? '是' : '否'; }
 function textToBool(v){ return v === '是' || v === true; }
 
+// 用欄位名稱查1-indexed欄號，不要用寫死的數字——加新欄位時舊的寫死數字會全部錯位
+function colOf(header, name){
+  const idx = header.indexOf(name);
+  if(idx < 0) throw new Error('colOf: 找不到欄位 '+name);
+  return idx + 1;
+}
+
+// 品項資料(JSON)不好直接在試算表裡看，另外拆出「貨號」「品名」兩欄方便肉眼掃視
+// （一張訂單可能有多個品項，用頓號串起來，跟itemsJson欄位是同一份資料，只是多一種顯示方式）
+function summarizeItems(items){
+  const list = items || [];
+  return {
+    skuSummary: list.map(i=>i.sku).join('、'),
+    nameSummary: list.map(i=>i.name).join('、')
+  };
+}
+
 // ---------------- 訂單同步（合併，已出貨的不覆蓋） ----------------
 function mergeOrders(incoming){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
@@ -169,12 +187,13 @@ function mergeOrders(incoming){
     const existing = byOrderNo[orderNo];
     if(existing && existing.status === 'shipped'){ skippedShipped++; return; }
     const itemsJson = JSON.stringify(o.items||[]);
+    const {skuSummary, nameSummary} = summarizeItems(o.items);
     const targetRow = existing ? existing._row : sh.getLastRow()+1;
-    // 「日期」欄位（第3欄）強制設成純文字格式再寫入，避免 Google試算表把「2026/8/5」這種字串
+    // 「日期」欄位強制設成純文字格式再寫入，避免 Google試算表把「2026/8/5」這種字串
     // 自動偵測轉成日期型別儲存格（那樣讀回來會變成UTC的ISO時間字串，跟原本存的字不一樣）
-    sh.getRange(targetRow, 3).setNumberFormat('@');
+    sh.getRange(targetRow, colOf(ORDERS_HEADER,'date')).setNumberFormat('@');
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([[
-      orderNo, o.store||'', String(o.date||''), itemsJson, 'pending', '', '', now, o.shipMethod||'', o.routingStatus||''
+      orderNo, o.store||'', String(o.date||''), itemsJson, skuSummary, nameSummary, 'pending', '', '', now, o.shipMethod||'', o.routingStatus||''
     ]]);
     if(existing) updated++; else added++;
   });
@@ -192,7 +211,7 @@ function claimOrder(orderNo, staffId, staffName){
     return {ok:false, reason:'claimed_by_other', claimedBy: row.claimedBy};
   }
   const now = new Date().toISOString();
-  sh.getRange(row._row, 5, 1, 4).setValues([['scanning', staffId||'', now, now]]);
+  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['scanning', staffId||'', now, now]]);
   return {ok:true, order: {orderNo: row.orderNo, store: row.store, date: cellToText(row.date), items: safeParse(row.itemsJson, []), shipMethod: row.shipMethod||'', routingStatus: row.routingStatus||''}};
 }
 
@@ -202,7 +221,7 @@ function releaseOrder(orderNo){
   const row = rows.find(r=>r.orderNo===orderNo);
   if(!row) return {ok:false, reason:'not_found'};
   if(row.status === 'shipped') return {ok:true}; // 已出貨就不用管了
-  sh.getRange(row._row, 5, 1, 3).setValues([['pending', '', '']]);
+  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 3).setValues([['pending', '', '']]);
   return {ok:true};
 }
 
@@ -214,7 +233,7 @@ function finalizeShipment(entry){
   const row = rows.find(r=>r.orderNo===entry.orderNo);
   if(row){
     const now = new Date().toISOString();
-    ordersSh.getRange(row._row, 5, 1, 4).setValues([['shipped', '', '', now]]);
+    ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['shipped', '', '', now]]);
   }
   appendLogRow(entry);
   return {ok:true};
@@ -223,12 +242,13 @@ function finalizeShipment(entry){
 function appendLogRow(entry){
   const logSh = getSheet(SHEET_LOG, LOG_HEADER);
   const targetRow = logSh.getLastRow()+1;
-  // orderDate（第2欄）跟 time（第7欄）都長得像日期/時間字串，強制設純文字格式再寫，
+  const {skuSummary, nameSummary} = summarizeItems(entry.items);
+  // orderDate跟time都長得像日期/時間字串，強制設純文字格式再寫，
   // 避免 Google試算表自動轉成日期型別（讀回來會變UTC ISO字串，顯示會跑掉）
-  logSh.getRange(targetRow, 2).setNumberFormat('@');
-  logSh.getRange(targetRow, 7).setNumberFormat('@');
+  logSh.getRange(targetRow, colOf(LOG_HEADER,'orderDate')).setNumberFormat('@');
+  logSh.getRange(targetRow, colOf(LOG_HEADER,'time')).setNumberFormat('@');
   logSh.getRange(targetRow, 1, 1, LOG_HEADER.length).setValues([[
-    entry.orderNo, String(entry.orderDate||''), entry.waybill||'', JSON.stringify(entry.items||[]),
+    entry.orderNo, String(entry.orderDate||''), entry.waybill||'', JSON.stringify(entry.items||[]), skuSummary, nameSummary,
     entry.staffId||'', entry.staffName||'', String(entry.time||''), boolToText(entry.hadIssue), boolToText(entry.hadManualEdit),
     boolToText(entry.importedExternal), entry.store||'', entry.shipMethod||'', entry.note||'',
     entry.requiredCount||0, entry.scannedCount||0, entry.routingStatus||'', entry.checkResult||'', entry.differenceDetails||''
@@ -248,7 +268,7 @@ function importShippedBatch(entries){
     const row = byOrderNo[entry.orderNo];
     if(!row){ skippedNotFound++; return; }
     if(row.status === 'shipped'){ skippedAlreadyShipped++; return; }
-    ordersSh.getRange(row._row, 5, 1, 4).setValues([['shipped', '', '', now]]);
+    ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['shipped', '', '', now]]);
     appendLogRow(entry);
     imported++;
   });
@@ -291,20 +311,25 @@ function setupLogSheetColors(){
   const numRows = 998; // 涵蓋第2列到第999列，之後新資料都會自動套用
   const fullRange = sh.getRange(2, 1, numRows, numCols);
 
-  // hadIssue=第8欄=H, hadManualEdit=第9欄=I, importedExternal=第10欄=J
+  // 欄位位置用 colOf() 動態換算成字母，不要寫死——之前 skuSummary/nameSummary 插入LOG_HEADER
+  // 就讓這三欄從 H/I/J 位移到 J/K/L，寫死字母的話顏色規則會套錯欄位
+  const colLetter = n => String.fromCharCode(64 + n); // 1->A, 2->B, ...
+  const hadIssueCol = colLetter(colOf(LOG_HEADER,'hadIssue'));
+  const hadManualEditCol = colLetter(colOf(LOG_HEADER,'hadManualEdit'));
+  const importedExternalCol = colLetter(colOf(LOG_HEADER,'importedExternal'));
   const rules = [
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=$H2="是"')
+      .whenFormulaSatisfied(`=$${hadIssueCol}2="是"`)
       .setBackground('#f4cccc')
       .setRanges([fullRange])
       .build(),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=AND($H2<>"是",$I2="是")')
+      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2="是")`)
       .setBackground('#fff2cc')
       .setRanges([fullRange])
       .build(),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=AND($H2<>"是",$I2<>"是",$J2="是")')
+      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${importedExternalCol}2="是")`)
       .setBackground('#cfe2f3')
       .setRanges([fullRange])
       .build()
