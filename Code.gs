@@ -4,13 +4,10 @@
  * 用途：讓多人、多台裝置同時使用同一份「待出貨清單／出貨紀錄／人員名單」，
  * 而不是各自存在自己瀏覽器的 localStorage 裡看不到彼此。
  *
- * 部署目標（使用者指定）：直接部署在既有的訂單來源試算表上——
- * https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU
- * 這個腳本只會另外「新增」訂單／出貨紀錄／人員 三個分頁來存共用狀態，
- * 不會動到原本放訂單資料的那個分頁。
- * 風險提醒：如果這份試算表本身是被某個流程整份定期覆蓋重建（例如每次蝦皮匯出都整份重存），
- * 這裡新增的 訂單／出貨紀錄／人員 分頁可能會被一起清掉；如果只是原分頁的資料列被更新、
- * 整份檔案本身沒被取代，就完全不受影響。實際狀況要請使用者確認這份表的維護方式。
+ * 部署目標：獨立的專用試算表「文山出貨確認系統-後端」——
+ * https://docs.google.com/spreadsheets/d/1ogk_YvgJvFhjlnlF0QFiy1LaNMd89Qoe49slswk7Ubs
+ * 跟使用者的共用業務試算表「文山核對 工作區」（1vCCJS...，放文山出貨V2/出貨核對A/B/國際碼等
+ * 原始工作表，使用者交代不可修改）完全分開，避免互相干擾。
  *
  * 部署步驟：
  * 1. 開啟上面那份試算表 → 擴充功能 → Apps Script，把這個檔案的內容整個貼進去（取代預設的 Code.gs）。
@@ -307,4 +304,29 @@ function setupLogSheetColors(){
   ];
   sh.setConditionalFormatRules(rules);
   Logger.log('已設定出貨紀錄分頁的顏色規則');
+}
+
+// ---------------- 一次性設定用：把「文山出貨V2」跟「國際碼」鏡像進這份後端試算表 ----------------
+// 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（不用重新部署）。
+// 用 IMPORTRANGE 從「文山核對 工作區」（1vCCJS...）即時鏡像過來，資料來源那邊只被「讀取」，
+// 不會寫入/修改任何東西，符合使用者「不可去動文山核對工作區」的交代。
+// 跑完之後：
+//   1. 打開這份後端試算表裡新出現的「文山出貨V2」「條碼轉品號」兩個分頁，
+//      如果 A1 儲存格顯示「#REF! 這個公式參照到未經授權的外部資料範圍」，
+//      點裡面的「允許存取」按鈕，做一次性授權（這一步一定要用瀏覽器手動點，Apps Script沒辦法代勞）。
+//   2. 授權完成後，資料會自動載入，之後來源那邊資料有變動，這兩個分頁也會自動跟著更新
+//      （IMPORTRANGE是活的連結，不是複製一次就結束）。
+function setupImportedMirrorSheets(){
+  const SOURCE_ID = '1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  let orderSh = ss.getSheetByName('文山出貨V2');
+  if(!orderSh) orderSh = ss.insertSheet('文山出貨V2');
+  orderSh.getRange('A1').setFormula(`=IMPORTRANGE("${SOURCE_ID}", "文山出貨V2!A1:J")`);
+
+  let barcodeSh = ss.getSheetByName('條碼轉品號');
+  if(!barcodeSh) barcodeSh = ss.insertSheet('條碼轉品號');
+  barcodeSh.getRange('A1').setFormula(`=IMPORTRANGE("${SOURCE_ID}", "國際碼!A1:E")`);
+
+  Logger.log('已建立「文山出貨V2」「條碼轉品號」鏡像分頁，請打開這兩個分頁手動完成一次性授權（如果有跳出提示的話）。');
 }
