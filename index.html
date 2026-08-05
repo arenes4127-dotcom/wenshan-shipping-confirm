@@ -277,7 +277,7 @@
         </div>
         <div class="tbl-wrap" style="margin-top:12px;">
           <table>
-            <thead><tr><th>訂單號</th><th>日期</th><th>運單編號</th><th>包貨人員</th><th>完成時間</th><th>警示</th><th>手動修改</th><th>來源</th></tr></thead>
+            <thead><tr><th>訂單號</th><th>日期</th><th>賣場</th><th>寄送方式</th><th>訂單狀態</th><th>需求件數</th><th>掃描件數</th><th>核對結果</th><th>運單編號</th><th>包貨人員</th><th>完成時間</th><th>警示</th><th>手動修改</th><th>來源</th></tr></thead>
             <tbody id="logTable"></tbody>
           </table>
         </div>
@@ -692,7 +692,8 @@ async function syncOrders(){
       const store = iStore>=0 ? (row[iStore]||'').trim() : '';
       const date = iDate>=0 ? parseOrderDate(row[iDate]) : '';
       const shipMethod = iShipMethod>=0 ? (row[iShipMethod]||'').trim() : '';
-      if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, items:[], status:'pending'};
+      const routingStatus = iStatus>=0 ? (row[iStatus]||'').trim() : '';
+      if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, routingStatus, items:[], status:'pending'};
       const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
       if(existingItem) existingItem.qty += qty;
       else parsed[orderNo].items.push({sku, name, qty, scanned:0});
@@ -1021,6 +1022,10 @@ async function finalizeShipment(){
     return;
   }
   const staffObj = staff.find(s=>s.id===currentStaffId);
+  const requiredCount = current.items.reduce((s,i)=>s+i.qty,0);
+  const scannedCount = current.items.reduce((s,i)=>s+i.scanned,0);
+  let checkResult = '完成';
+  if(current.hadManualEdit) checkResult += '（人工修正數量）';
   const entry = {
     orderNo: current.orderNo,
     orderDate: current.date || '',
@@ -1029,7 +1034,12 @@ async function finalizeShipment(){
     staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
     time: new Date().toLocaleString('zh-TW'),
     hadIssue: !!current.hadIssue,
-    hadManualEdit: !!current.hadManualEdit
+    hadManualEdit: !!current.hadManualEdit,
+    store: current.store || '',
+    shipMethod: current.shipMethod || '',
+    requiredCount, scannedCount,
+    routingStatus: current.routingStatus || '',
+    checkResult
   };
 
   document.getElementById('btnConfirm').disabled = true;
@@ -1069,9 +1079,11 @@ inputFinalWaybill.addEventListener('keydown', e=>{ if(e.key==='Enter') finalizeS
 // ============================================================
 function renderLog(){
   const tbody = document.getElementById('logTable');
-  if(!log.length){ tbody.innerHTML = `<tr><td colspan="8" class="empty-row">目前沒有出貨紀錄</td></tr>`; return; }
+  if(!log.length){ tbody.innerHTML = `<tr><td colspan="14" class="empty-row">目前沒有出貨紀錄</td></tr>`; return; }
   tbody.innerHTML = log.map(l=>`<tr>
-    <td>${l.orderNo}</td><td>${l.orderDate||'-'}</td><td>${l.waybill}</td>
+    <td>${l.orderNo}</td><td>${l.orderDate||'-'}</td><td>${l.store||'-'}</td><td>${l.shipMethod||'-'}</td>
+    <td>${l.routingStatus||'-'}</td><td>${l.requiredCount||'-'}</td><td>${l.scannedCount||'-'}</td><td>${l.checkResult||'-'}</td>
+    <td>${l.waybill}</td>
     <td>${l.staffId?`${l.staffId} `:''}${l.staffName||''}</td><td>${l.time}</td>
     <td>${l.hadIssue?'<span class="tag danger">有</span>':'<span class="tag">無</span>'}</td>
     <td>${l.hadManualEdit?'<span class="tag warn">有</span>':'<span class="tag">無</span>'}</td>
@@ -1079,10 +1091,11 @@ function renderLog(){
   </tr>`).join('');
 }
 document.getElementById('btnExportCsv').addEventListener('click', ()=>{
-  const rows = [['訂單號','訂單日期','運單編號','貨號','品名','應出數量','實際掃描數量','包貨人員工號','包貨人員姓名','完成時間','曾觸發警示','曾手動修改數量','來源']];
+  const rows = [['訂單號','訂單日期','賣場','寄送方式','訂單狀態','需求件數','掃描件數','核對結果','運單編號','貨號','品名','應出數量','實際掃描數量','包貨人員工號','包貨人員姓名','完成時間','曾觸發警示','曾手動修改數量','來源']];
   log.forEach(l=>{
     l.items.forEach(i=>{
-      rows.push([l.orderNo, l.orderDate||'', l.waybill, i.sku, i.name, i.qty, i.scanned, l.staffId, l.staffName, l.time,
+      rows.push([l.orderNo, l.orderDate||'', l.store||'', l.shipMethod||'', l.routingStatus||'', l.requiredCount||'', l.scannedCount||'', l.checkResult||'',
+        l.waybill, i.sku, i.name, i.qty, i.scanned, l.staffId, l.staffName, l.time,
         l.hadIssue?'是':'否', l.hadManualEdit?'是':'否', l.importedExternal?'外部匯入':'本系統掃描']);
     });
   });
