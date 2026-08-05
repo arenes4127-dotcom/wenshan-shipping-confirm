@@ -277,7 +277,7 @@
         </div>
         <div class="tbl-wrap" style="margin-top:12px;">
           <table>
-            <thead><tr><th>訂單號</th><th>日期</th><th>賣場</th><th>寄送方式</th><th>訂單狀態</th><th>需求件數</th><th>掃描件數</th><th>核對結果</th><th>運單編號</th><th>包貨人員</th><th>完成時間</th><th>警示</th><th>手動修改</th><th>來源</th></tr></thead>
+            <thead><tr><th>訂單號</th><th>日期</th><th>賣場</th><th>寄送方式</th><th>訂單狀態</th><th>需求件數</th><th>掃描件數</th><th>核對結果</th><th>差異明細</th><th>運單編號</th><th>包貨人員</th><th>完成時間</th><th>警示</th><th>手動修改</th><th>來源</th></tr></thead>
             <tbody id="logTable"></tbody>
           </table>
         </div>
@@ -896,6 +896,7 @@ inputOrder.addEventListener('keydown', async e=>{
   current.items.forEach(i=>i.scanned=0);
   current.hadIssue = false;
   current.hadManualEdit = false;
+  current.issueLog = []; // 差異明細：這次掃描過程中實際發生了什麼問題（不是只有真/假）
   document.getElementById('stage-order').style.display='none';
   document.getElementById('stage-items').style.display='block';
   document.getElementById('curOrderNo').textContent = current.orderNo;
@@ -923,12 +924,14 @@ inputBarcode.addEventListener('keydown', e=>{
   }
   if(!item){
     current.hadIssue = true;
+    current.issueLog.push(`商品不符：條碼「${code}」不屬於此訂單`);
     errorBeep();
     flash('err','商品不符', `條碼「${code}」不屬於此訂單，請確認拿錯商品`, 1200);
     return;
   }
   if(item.scanned >= item.qty){
     current.hadIssue = true;
+    current.issueLog.push(`數量超過：「${item.name}」（${item.sku}）已達應出數量 ${item.qty}`);
     errorBeep();
     flash('err','數量超過', `「${item.name}」已達應出數量，請勿重複裝箱`, 1200);
     return;
@@ -981,8 +984,10 @@ function adjustScanned(sku){
   if(input === null) return;
   const val = parseInt(input, 10);
   if(isNaN(val) || val < 0){ alert('請輸入 0 以上的整數'); return; }
+  const before = item.scanned;
   item.scanned = val;
   current.hadManualEdit = true;
+  current.issueLog.push(`人工修正：「${item.name}」（${item.sku}）已掃數量從 ${before} 改為 ${val}`);
   renderItemTable();
   checkComplete(true);
 }
@@ -1026,6 +1031,7 @@ async function finalizeShipment(){
   const scannedCount = current.items.reduce((s,i)=>s+i.scanned,0);
   let checkResult = '完成';
   if(current.hadManualEdit) checkResult += '（人工修正數量）';
+  const differenceDetails = (current.issueLog && current.issueLog.length) ? current.issueLog.join('；') : '無差異';
   const entry = {
     orderNo: current.orderNo,
     orderDate: current.date || '',
@@ -1039,7 +1045,8 @@ async function finalizeShipment(){
     shipMethod: current.shipMethod || '',
     requiredCount, scannedCount,
     routingStatus: current.routingStatus || '',
-    checkResult
+    checkResult,
+    differenceDetails
   };
 
   document.getElementById('btnConfirm').disabled = true;
@@ -1079,10 +1086,11 @@ inputFinalWaybill.addEventListener('keydown', e=>{ if(e.key==='Enter') finalizeS
 // ============================================================
 function renderLog(){
   const tbody = document.getElementById('logTable');
-  if(!log.length){ tbody.innerHTML = `<tr><td colspan="14" class="empty-row">目前沒有出貨紀錄</td></tr>`; return; }
+  if(!log.length){ tbody.innerHTML = `<tr><td colspan="15" class="empty-row">目前沒有出貨紀錄</td></tr>`; return; }
   tbody.innerHTML = log.map(l=>`<tr>
     <td>${l.orderNo}</td><td>${l.orderDate||'-'}</td><td>${l.store||'-'}</td><td>${l.shipMethod||'-'}</td>
     <td>${l.routingStatus||'-'}</td><td>${l.requiredCount||'-'}</td><td>${l.scannedCount||'-'}</td><td>${l.checkResult||'-'}</td>
+    <td style="max-width:260px;white-space:normal;">${l.differenceDetails||'-'}</td>
     <td>${l.waybill}</td>
     <td>${l.staffId?`${l.staffId} `:''}${l.staffName||''}</td><td>${l.time}</td>
     <td>${l.hadIssue?'<span class="tag danger">有</span>':'<span class="tag">無</span>'}</td>
@@ -1091,10 +1099,10 @@ function renderLog(){
   </tr>`).join('');
 }
 document.getElementById('btnExportCsv').addEventListener('click', ()=>{
-  const rows = [['訂單號','訂單日期','賣場','寄送方式','訂單狀態','需求件數','掃描件數','核對結果','運單編號','貨號','品名','應出數量','實際掃描數量','包貨人員工號','包貨人員姓名','完成時間','曾觸發警示','曾手動修改數量','來源']];
+  const rows = [['訂單號','訂單日期','賣場','寄送方式','訂單狀態','需求件數','掃描件數','核對結果','差異明細','運單編號','貨號','品名','應出數量','實際掃描數量','包貨人員工號','包貨人員姓名','完成時間','曾觸發警示','曾手動修改數量','來源']];
   log.forEach(l=>{
     l.items.forEach(i=>{
-      rows.push([l.orderNo, l.orderDate||'', l.store||'', l.shipMethod||'', l.routingStatus||'', l.requiredCount||'', l.scannedCount||'', l.checkResult||'',
+      rows.push([l.orderNo, l.orderDate||'', l.store||'', l.shipMethod||'', l.routingStatus||'', l.requiredCount||'', l.scannedCount||'', l.checkResult||'', l.differenceDetails||'',
         l.waybill, i.sku, i.name, i.qty, i.scanned, l.staffId, l.staffName, l.time,
         l.hadIssue?'是':'否', l.hadManualEdit?'是':'否', l.importedExternal?'外部匯入':'本系統掃描']);
     });

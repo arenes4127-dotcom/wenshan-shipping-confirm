@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.6';
+const BACKEND_VERSION = '2026-08-05.7';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -34,7 +34,7 @@ const SHEET_STAFF = '人員';
 const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'Staff' };
 
 const ORDERS_HEADER = ['orderNo','store','date','itemsJson','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus'];
-const LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult'];
+const LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -44,7 +44,8 @@ const HEADER_LABELS = {
   orderDate:'訂單日期', waybill:'運單編號', staffId:'包貨人員工號', staffName:'包貨人員姓名',
   time:'完成時間', hadIssue:'曾觸發警示', hadManualEdit:'曾手動修改數量', importedExternal:'外部匯入',
   shipMethod:'寄送方式', note:'備註', id:'工號', name:'姓名',
-  requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果'
+  requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
+  differenceDetails:'差異明細'
 };
 
 function doGet(e){
@@ -127,7 +128,8 @@ function getState(){
     time: cellToText(r.time, true), hadIssue: textToBool(r.hadIssue), hadManualEdit: textToBool(r.hadManualEdit),
     importedExternal: textToBool(r.importedExternal), store: r.store, shipMethod: r.shipMethod, note: r.note,
     requiredCount: r.requiredCount || '', scannedCount: r.scannedCount || '',
-    routingStatus: r.routingStatus || '', checkResult: r.checkResult || ''
+    routingStatus: r.routingStatus || '', checkResult: r.checkResult || '',
+    differenceDetails: r.differenceDetails || ''
   })).reverse(); // 最新的在前面
   const staffRows = readRows(SHEET_STAFF, STAFF_HEADER);
   const staff = staffRows.map(r=>({id:r.id, name:r.name}));
@@ -229,7 +231,7 @@ function appendLogRow(entry){
     entry.orderNo, String(entry.orderDate||''), entry.waybill||'', JSON.stringify(entry.items||[]),
     entry.staffId||'', entry.staffName||'', String(entry.time||''), boolToText(entry.hadIssue), boolToText(entry.hadManualEdit),
     boolToText(entry.importedExternal), entry.store||'', entry.shipMethod||'', entry.note||'',
-    entry.requiredCount||0, entry.scannedCount||0, entry.routingStatus||'', entry.checkResult||''
+    entry.requiredCount||0, entry.scannedCount||0, entry.routingStatus||'', entry.checkResult||'', entry.differenceDetails||''
   ]]);
 }
 
