@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.7';
+const BACKEND_VERSION = '2026-08-05.8-debug';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -133,7 +133,19 @@ function getState(){
   })).reverse(); // 最新的在前面
   const staffRows = readRows(SHEET_STAFF, STAFF_HEADER);
   const staff = staffRows.map(r=>({id:r.id, name:r.name}));
-  return {ok:true, orders, log, staff, version: BACKEND_VERSION};
+
+  // 除錯用：確認 SHEET_LOG 實際指到哪個分頁（名稱/gid/實際列數），
+  // 跟直接打開試算表看到的「出貨紀錄」分頁對不對得起來
+  const logSh2 = getSheet(SHEET_LOG, LOG_HEADER);
+  const debugInfo = {
+    logSheetName: logSh2.getName(),
+    logSheetGid: logSh2.getSheetId(),
+    logLastRow: logSh2.getLastRow(),
+    logMaxRows: logSh2.getMaxRows(),
+    allSheetNames: SpreadsheetApp.getActiveSpreadsheet().getSheets().map(s=>({name:s.getName(), gid:s.getSheetId(), lastRow:s.getLastRow()}))
+  };
+
+  return {ok:true, orders, log, staff, version: BACKEND_VERSION, _debug: debugInfo};
 }
 
 function safeParse(json, fallback){
