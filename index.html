@@ -888,6 +888,7 @@ inputOrder.addEventListener('keydown', async e=>{
     }
   } else {
     order.status = 'scanning';
+    if(!order.claimedAt) order.claimedAt = new Date().toISOString(); // 本機模式沒有後端幫忙記，自己記一份開始時間
   }
   orders[code] = order;
   saveJSON(LS.orders, orders);
@@ -1039,6 +1040,7 @@ async function finalizeShipment(){
     items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned})),
     staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
     time: new Date().toLocaleString('zh-TW'),
+    startTime: current.claimedAt ? new Date(current.claimedAt).toLocaleString('zh-TW') : '',
     hadIssue: !!current.hadIssue,
     hadManualEdit: !!current.hadManualEdit,
     store: current.store || '',

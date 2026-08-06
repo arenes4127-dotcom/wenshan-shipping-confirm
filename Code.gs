@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.12';
+const BACKEND_VERSION = '2026-08-05.13';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -34,7 +34,9 @@ const SHEET_STAFF = '人員';
 const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'Staff' };
 
 const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus'];
-const LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','skuSummary','nameSummary','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails'];
+const LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','skuSummary','nameSummary','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','startTime'];
+// startTime 加在最後面（不是插進中間），這樣舊資料列所有既有欄位的位置都不會被移動，
+// 不需要再跑一次欄位位移migration——上次把skuSummary/nameSummary插在中間就是因為這樣才搞出一次資料位移的大麻煩。
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -46,7 +48,7 @@ const HEADER_LABELS = {
   time:'完成時間', hadIssue:'曾觸發警示', hadManualEdit:'曾手動修改數量', importedExternal:'外部匯入',
   shipMethod:'寄送方式', note:'備註', id:'工號', name:'姓名',
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
-  differenceDetails:'差異明細'
+  differenceDetails:'差異明細', startTime:'確認訂單開始時間'
 };
 
 function doGet(e){
@@ -130,7 +132,7 @@ function getState(){
     importedExternal: textToBool(r.importedExternal), store: r.store, shipMethod: r.shipMethod, note: r.note,
     requiredCount: r.requiredCount || '', scannedCount: r.scannedCount || '',
     routingStatus: r.routingStatus || '', checkResult: r.checkResult || '',
-    differenceDetails: r.differenceDetails || ''
+    differenceDetails: r.differenceDetails || '', startTime: cellToText(r.startTime, true) || ''
   })).reverse(); // 最新的在前面
   const staffRows = readRows(SHEET_STAFF, STAFF_HEADER);
   const staff = staffRows.map(r=>({id:r.id, name:r.name}));
@@ -263,8 +265,11 @@ function claimOrder(orderNo, staffId, staffName){
     return {ok:false, reason:'claimed_by_other', claimedBy: row.claimedBy};
   }
   const now = new Date().toISOString();
-  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['scanning', staffId||'', now, now]]);
-  return {ok:true, order: {orderNo: row.orderNo, store: row.store, date: cellToText(row.date), items: safeParse(row.itemsJson, []), shipMethod: row.shipMethod||'', routingStatus: row.routingStatus||''}};
+  // 同一人重新叫出同一張還在掃描中的訂單（例如中途切到別的畫面又回來），
+  // 開始時間要延續原本第一次認領的時間，不要每次重新叫出來就往後跳
+  const claimedAt = (row.status === 'scanning' && row.claimedBy === staffId && row.claimedAt) ? row.claimedAt : now;
+  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['scanning', staffId||'', claimedAt, now]]);
+  return {ok:true, order: {orderNo: row.orderNo, store: row.store, date: cellToText(row.date), items: safeParse(row.itemsJson, []), shipMethod: row.shipMethod||'', routingStatus: row.routingStatus||'', claimedAt}};
 }
 
 function releaseOrder(orderNo){
@@ -297,15 +302,17 @@ function appendLogRow(entry){
   const logSh = getSheet(SHEET_LOG, LOG_HEADER);
   const targetRow = logSh.getLastRow()+1;
   const {skuSummary, nameSummary} = summarizeItems(entry.items);
-  // orderDate跟time都長得像日期/時間字串，強制設純文字格式再寫，
+  // orderDate跟time跟startTime都長得像日期/時間字串，強制設純文字格式再寫，
   // 避免 Google試算表自動轉成日期型別（讀回來會變UTC ISO字串，顯示會跑掉）
   logSh.getRange(targetRow, colOf(LOG_HEADER,'orderDate')).setNumberFormat('@');
   logSh.getRange(targetRow, colOf(LOG_HEADER,'time')).setNumberFormat('@');
+  logSh.getRange(targetRow, colOf(LOG_HEADER,'startTime')).setNumberFormat('@');
   logSh.getRange(targetRow, 1, 1, LOG_HEADER.length).setValues([[
     entry.orderNo, String(entry.orderDate||''), entry.waybill||'', JSON.stringify(entry.items||[]), skuSummary, nameSummary,
     entry.staffId||'', entry.staffName||'', String(entry.time||''), boolToText(entry.hadIssue), boolToText(entry.hadManualEdit),
     boolToText(entry.importedExternal), entry.store||'', entry.shipMethod||'', entry.note||'',
-    entry.requiredCount||0, entry.scannedCount||0, entry.routingStatus||'', entry.checkResult||'', entry.differenceDetails||''
+    entry.requiredCount||0, entry.scannedCount||0, entry.routingStatus||'', entry.checkResult||'', entry.differenceDetails||'',
+    String(entry.startTime||'')
   ]]);
   appendLogDetailRows_(entry);
 }
@@ -315,7 +322,7 @@ function appendLogRow(entry){
 // 這裡就同步多寫幾列（該訂單有幾個品項就幾列），包貨人員/完成時間等訂單層級欄位每列都重複顯示，
 // 方便直接篩選/排序特定品號。
 const SHEET_LOG_DETAIL = '出貨紀錄明細';
-const LOG_DETAIL_DISPLAY_HEADER = ['訂單號','運單編號','品名','規格','品號','數量','已掃數量','完成時間','包貨人員'];
+const LOG_DETAIL_DISPLAY_HEADER = ['訂單號','運單編號','品名','規格','品號','數量','已掃數量','完成時間','包貨人員','確認訂單開始時間'];
 function appendLogDetailRows_(entry){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(SHEET_LOG_DETAIL);
@@ -328,10 +335,12 @@ function appendLogDetailRows_(entry){
   const staffLabel = [entry.staffId, entry.staffName].filter(Boolean).join(' - ');
   const rows = items.map(it=>[
     entry.orderNo, entry.waybill||'', it.baseName || it.name || '', it.spec || '', it.sku || '',
-    it.qty || 0, it.scanned || 0, String(entry.time||''), staffLabel
+    it.qty || 0, it.scanned || 0, String(entry.time||''), staffLabel, String(entry.startTime||'')
   ]);
   const startRow = sh.getLastRow()+1;
-  sh.getRange(startRow, 8, rows.length, 1).setNumberFormat('@'); // 完成時間欄位固定純文字，避免被誤判成日期
+  // 完成時間／確認訂單開始時間欄位固定純文字，避免被誤判成日期
+  sh.getRange(startRow, 8, rows.length, 1).setNumberFormat('@');
+  sh.getRange(startRow, 10, rows.length, 1).setNumberFormat('@');
   sh.getRange(startRow, 1, rows.length, LOG_DETAIL_DISPLAY_HEADER.length).setValues(rows);
 }
 
@@ -349,7 +358,8 @@ function rebuildLogDetailSheet_(){
     const items = safeParse(r.itemsJson, []);
     appendLogDetailRows_({
       orderNo: r.orderNo, waybill: r.waybill, items,
-      time: cellToText(r.time, true), staffId: r.staffId, staffName: r.staffName
+      time: cellToText(r.time, true), staffId: r.staffId, staffName: r.staffName,
+      startTime: cellToText(r.startTime, true)
     });
   });
   Logger.log('出貨紀錄明細：已從 '+logRows.length+' 筆出貨紀錄回填完成');
