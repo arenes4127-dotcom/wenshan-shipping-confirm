@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.16';
+const BACKEND_VERSION = '2026-08-05.17';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -94,7 +94,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupLogSheetColors: () => setupLogSheetColors(),
   deleteLegacyEmptySheets: () => deleteLegacyEmptySheets(),
   setupImportedMirrorSheets: () => setupImportedMirrorSheets(),
-  rebuildOrderDetailSheet_: () => rebuildOrderDetailSheet_()
+  rebuildOrderDetailSheet_: () => rebuildOrderDetailSheet_(),
+  deleteTestOrders_: () => deleteTestOrders_()
 };
 function runOneTimeSetup(name){
   const fn = ONE_TIME_SETUP_FUNCTIONS[name];
@@ -385,6 +386,33 @@ function setStaffList(staffList){
   if(lastRow > 1) sh.getRange(2, 1, lastRow-1, STAFF_HEADER.length).clearContent();
   staffList.forEach(s=> sh.appendRow([s.id, s.name]));
   return {ok:true};
+}
+
+// ---------------- 一次性清理用：清掉這次開發過程中留下的測試訂單 ----------------
+// TEST-FINAL-CHECK/TEST-FULL-E2E/TEST-STARTTIME 是開發時用來驗證功能的假訂單，
+// 從「訂單」「出貨紀錄」兩個分頁刪掉對應列，「訂單明細」跟著重建一次自然就乾淨了。
+function deleteTestOrders_(){
+  const TEST_ORDER_NOS = ['TEST-FINAL-CHECK', 'TEST-FULL-E2E', 'TEST-STARTTIME'];
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const ordersSh = ss.getSheetByName(SHEET_ORDERS);
+  let deletedOrderRows = 0;
+  if(ordersSh){
+    const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+    const rowNums = rows.filter(r=>TEST_ORDER_NOS.includes(r.orderNo)).map(r=>r._row).sort((a,b)=>b-a);
+    rowNums.forEach(rowNum=>{ ordersSh.deleteRow(rowNum); deletedOrderRows++; });
+  }
+
+  const logSh = ss.getSheetByName(SHEET_LOG);
+  let deletedLogRows = 0;
+  if(logSh){
+    const rows = readRows(SHEET_LOG, LOG_HEADER);
+    const rowNums = rows.filter(r=>TEST_ORDER_NOS.includes(r.orderNo)).map(r=>r._row).sort((a,b)=>b-a);
+    rowNums.forEach(rowNum=>{ logSh.deleteRow(rowNum); deletedLogRows++; });
+  }
+
+  rebuildOrderDetailSheet_(); // 訂單明細是從訂單分頁重建的，訂單裡的測試列刪掉後這裡要跟著刷新
+  Logger.log('已刪除測試訂單「'+TEST_ORDER_NOS.join('、')+'」：訂單分頁 '+deletedOrderRows+' 列、出貨紀錄分頁 '+deletedLogRows+' 列。');
 }
 
 // ---------------- 一次性清理用：改成中文分頁名稱後留下的空舊分頁 ----------------
