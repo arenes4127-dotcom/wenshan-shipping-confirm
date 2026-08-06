@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.11';
+const BACKEND_VERSION = '2026-08-05.12';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -307,6 +307,52 @@ function appendLogRow(entry){
     boolToText(entry.importedExternal), entry.store||'', entry.shipMethod||'', entry.note||'',
     entry.requiredCount||0, entry.scannedCount||0, entry.routingStatus||'', entry.checkResult||'', entry.differenceDetails||''
   ]]);
+  appendLogDetailRows_(entry);
+}
+
+// ---------------- 「出貨紀錄明細」分頁：出貨紀錄一列是一整張訂單，品號用頓號串在一起不好看，
+// 這裡另外開一個一列一品項的版本，品號一格一個。appendLogRow() 每寫一筆出貨紀錄，
+// 這裡就同步多寫幾列（該訂單有幾個品項就幾列），包貨人員/完成時間等訂單層級欄位每列都重複顯示，
+// 方便直接篩選/排序特定品號。
+const SHEET_LOG_DETAIL = '出貨紀錄明細';
+const LOG_DETAIL_DISPLAY_HEADER = ['訂單號','運單編號','品名','規格','品號','數量','已掃數量','完成時間','包貨人員'];
+function appendLogDetailRows_(entry){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_LOG_DETAIL);
+  if(!sh){
+    sh = ss.insertSheet(SHEET_LOG_DETAIL);
+    sh.appendRow(LOG_DETAIL_DISPLAY_HEADER);
+  }
+  const items = entry.items || [];
+  if(!items.length) return;
+  const staffLabel = [entry.staffId, entry.staffName].filter(Boolean).join(' - ');
+  const rows = items.map(it=>[
+    entry.orderNo, entry.waybill||'', it.baseName || it.name || '', it.spec || '', it.sku || '',
+    it.qty || 0, it.scanned || 0, String(entry.time||''), staffLabel
+  ]);
+  const startRow = sh.getLastRow()+1;
+  sh.getRange(startRow, 8, rows.length, 1).setNumberFormat('@'); // 完成時間欄位固定純文字，避免被誤判成日期
+  sh.getRange(startRow, 1, rows.length, LOG_DETAIL_DISPLAY_HEADER.length).setValues(rows);
+}
+
+// 一次性補建用：出貨紀錄明細分頁上線前，既有的出貨紀錄還沒有對應的明細列，
+// 在 Apps Script 編輯器裡選這個函式執行一次，會清空明細分頁重新整個從出貨紀錄回填。
+// appendLogDetailRows_()本身是「新紀錄才增量寫入」，不會重複補之前的資料，所以只需要跑這一次。
+function rebuildLogDetailSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_LOG_DETAIL);
+  if(sh) ss.deleteSheet(sh);
+  sh = ss.insertSheet(SHEET_LOG_DETAIL);
+  sh.appendRow(LOG_DETAIL_DISPLAY_HEADER);
+  const logRows = readRows(SHEET_LOG, LOG_HEADER);
+  logRows.forEach(r=>{
+    const items = safeParse(r.itemsJson, []);
+    appendLogDetailRows_({
+      orderNo: r.orderNo, waybill: r.waybill, items,
+      time: cellToText(r.time, true), staffId: r.staffId, staffName: r.staffName
+    });
+  });
+  Logger.log('出貨紀錄明細：已從 '+logRows.length+' 筆出貨紀錄回填完成');
 }
 
 // ---------------- 批次匯入已出貨紀錄（指定出貨Excel那個功能用） ----------------
