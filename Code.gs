@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.15';
+const BACKEND_VERSION = '2026-08-05.16';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -487,14 +487,17 @@ function migrateOrdersColumnShift(){
 //   2. 依 items 展開成新格式重新寫入（一個品項一列，訂單層級欄位每列重複），
 //   3. 刪除「出貨紀錄明細」分頁——這個分頁的功能已經併入「出貨紀錄」本身，不用再開兩個分頁對照。
 // 執行完後記得重新跑一次 setupLogSheetColors()：分頁被整個重建，舊的顏色規則會失效需要重新套用。
+// 防止 migrateLogToPerItemFormat_() 重複執行用的標記格：故意放在遠超過 LOG_HEADER
+// 欄位範圍之外的欄位（getSheet()每次讀取都會強制重寫表頭列，但只會動到 1~LOG_HEADER.length
+// 這個範圍內的欄位，不會碰到這裡），才不會被「隨便呼叫一次API結果表頭列被重寫」誤判成已經轉換過。
+const LOG_MIGRATION_MARKER_COL = 30; // AD欄
+const LOG_MIGRATION_MARKER_VALUE = 'migrated-per-item-v1';
 function migrateLogToPerItemFormat_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const OLD_LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','skuSummary','nameSummary','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','startTime'];
   const oldSh = ss.getSheetByName(SHEET_LOG);
-  // 防止重複執行：新格式第4欄標題是「品名」，舊格式第4欄標題是「品項資料(JSON)」。
-  // 已經跑過一次的話這裡會直接偵測到並跳過，不會把已經轉換好的資料再誤當成舊格式處理一次。
-  if(oldSh && oldSh.getRange(1,4).getValue() === HEADER_LABELS['baseName']){
-    Logger.log('出貨紀錄第4欄標題已經是「'+HEADER_LABELS['baseName']+'」，看起來已經轉換過了，不重複執行。');
+  if(oldSh && oldSh.getRange(1, LOG_MIGRATION_MARKER_COL).getValue() === LOG_MIGRATION_MARKER_VALUE){
+    Logger.log('偵測到已轉換標記，出貨紀錄已經是一列一品項格式，不重複執行。');
     return;
   }
   const oldEntries = [];
@@ -525,6 +528,7 @@ function migrateLogToPerItemFormat_(){
   });
   const detailSh = ss.getSheetByName('出貨紀錄明細');
   if(detailSh) ss.deleteSheet(detailSh);
+  ss.getSheetByName(SHEET_LOG).getRange(1, LOG_MIGRATION_MARKER_COL).setValue(LOG_MIGRATION_MARKER_VALUE);
   Logger.log('出貨紀錄已轉成一列一品項格式，共轉換 '+oldEntries.length+' 筆出貨紀錄；出貨紀錄明細分頁已刪除（功能已併入出貨紀錄）。記得重新執行一次 setupLogSheetColors() 套用顏色規則。');
 }
 
