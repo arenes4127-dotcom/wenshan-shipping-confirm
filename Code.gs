@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.9';
+const BACKEND_VERSION = '2026-08-06.10';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -147,8 +147,12 @@ function uploadFileToDrive(folderId, fileName, content, mimeType){
 // 才會跳出「這個應用程式需要存取你的Google帳戶」的授權視窗，點「允許」就完成授權，
 // 之後 uploadFileToDrive 不管是編輯器執行還是API呼叫都能正常用了。跑一次就好，之後不用再跑。
 function authorizeDriveAccess_(){
-  const name = DriveApp.getRootFolder().getName();
-  Logger.log('雲端硬碟授權成功，根目錄名稱：'+name);
+  // 一定要真的「寫」一次（不能只是讀），Google才會請求完整的drive寫入權限範圍，
+  // 只讀資料夾名稱那種操作只會拿到唯讀權限，之後createFile()還是會失敗。
+  const folder = DriveApp.getFolderById('1quwo_65K5YQMZtuLD-vkheg-g97kYond');
+  const testFile = folder.createFile('_授權測試_可刪除', '測試寫入權限', MimeType.PLAIN_TEXT);
+  testFile.setTrashed(true);
+  Logger.log('雲端硬碟授權成功（讀寫都已確認）');
 }
 
 function getSheet(name, header){
