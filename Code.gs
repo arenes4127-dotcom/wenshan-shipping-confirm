@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.3';
+const BACKEND_VERSION = '2026-08-06.4';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -100,7 +100,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   rebuildOrderDetailSheet_: () => rebuildOrderDetailSheet_(),
   deleteTestOrders_: () => deleteTestOrders_(),
   fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
-  fixCheckResultEmoji_: () => fixCheckResultEmoji_()
+  fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
+  fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_()
 };
 function runOneTimeSetup(name){
   const fn = ONE_TIME_SETUP_FUNCTIONS[name];
@@ -198,8 +199,11 @@ function cellToText(v, withTime){
 }
 
 // 出貨紀錄表的是非欄位存成中文「是／否」方便直接看試算表，讀回來時轉回真正的布林值給前端用
-function boolToText(b){ return b ? '是' : '否'; }
-function textToBool(v){ return v === '是' || v === true; }
+// 是/否文字後面加燈號emoji方便肉眼掃視：否＝綠燈（沒事），是＝橘燈（有觸發/有發生，要留意）。
+function boolToText(b){ return b ? '是 🟠' : '否 🟢'; }
+// 用indexOf而不是完全比對字串，這樣不管是舊資料（純「是」/「否」沒有emoji）
+// 還是新資料（「是 🟠」/「否 🟢」）都能正確判讀，不用特地跑migration轉換舊資料。
+function textToBool(v){ return v === true || String(v).indexOf('是') === 0; }
 
 // 用欄位名稱查1-indexed欄號，不要用寫死的數字——加新欄位時舊的寫死數字會全部錯位
 function colOf(header, name){
@@ -431,6 +435,29 @@ function fixCheckResultEmoji_(){
   Logger.log('已補上燈號的核對結果：'+fixed+' 列');
 }
 
+// ---------------- 一次性修復用：把既有出貨紀錄的是/否欄位補上燈號emoji ----------------
+// boolToText()是這次才改成回傳「是 🟠」/「否 🟢」，之前寫入的既有列這幾欄還是純文字「是」/「否」。
+// 判斷「補過了沒」用是否已經含有🟠或🟢字元，補過的列會跳過，可以放心重複執行。
+function fixBooleanColumnEmoji_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const boolFields = ['hadIssue', 'hadManualEdit', 'importedExternal', 'hadNoBarcodeConfirm'];
+  const cols = {};
+  boolFields.forEach(f=> cols[f] = colOf(LOG_HEADER, f));
+  let fixed = 0;
+  rows.forEach(r=>{
+    boolFields.forEach(f=>{
+      const current = String(r[f]||'');
+      if(/[🟠🟢]/.test(current)) return; // 已經補過燈號了，跳過
+      if(current !== '是' && current !== '否') return; // 不是預期的是非文字就不動它
+      sh.getRange(r._row, cols[f]).setValue(boolToText(current === '是'));
+      fixed++;
+    });
+  });
+  Logger.log('已補上燈號的是/否欄位：'+fixed+' 格');
+}
+
 // ---------------- 批次匯入已出貨紀錄（指定出貨Excel那個功能用） ----------------
 function importShippedBatch(entries){
   const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
@@ -525,28 +552,32 @@ function setupLogSheetColors(){
   const hadManualEditCol = colLetter(colOf(LOG_HEADER,'hadManualEdit'));
   const importedExternalCol = colLetter(colOf(LOG_HEADER,'importedExternal'));
   const hadNoBarcodeConfirmCol = colLetter(colOf(LOG_HEADER,'hadNoBarcodeConfirm'));
+  // boolToText()現在存的是「是 🟠」/「否 🟢」（文字+燈號），不是單純「是」/「否」了，
+  // 用LEFT(...,1)="是"只比對開頭那個字，新舊資料（含不含燈號）都吃得下，不用另外判斷。
+  const isYes = col => `LEFT($${col}2,1)="是"`;
+  const isNo = col => `LEFT($${col}2,1)<>"是"`;
   const rules = [
     // 紅燈：錯誤
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=$${hadIssueCol}2="是"`)
+      .whenFormulaSatisfied(`=${isYes(hadIssueCol)}`)
       .setBackground('#f4cccc')
       .setRanges([fullRange])
       .build(),
     // 橘燈：警示（人工修正數量 或 無條碼手動核對，但沒有真的出錯）
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",OR($${hadManualEditCol}2="是",$${hadNoBarcodeConfirmCol}2="是"))`)
+      .whenFormulaSatisfied(`=AND(${isNo(hadIssueCol)},OR(${isYes(hadManualEditCol)},${isYes(hadNoBarcodeConfirmCol)}))`)
       .setBackground('#fce5cd')
       .setRanges([fullRange])
       .build(),
     // 藍燈：完成（外部匯入的紀錄，且沒有錯誤也沒有警示）
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${hadNoBarcodeConfirmCol}2<>"是",$${importedExternalCol}2="是")`)
+      .whenFormulaSatisfied(`=AND(${isNo(hadIssueCol)},${isNo(hadManualEditCol)},${isNo(hadNoBarcodeConfirmCol)},${isYes(importedExternalCol)})`)
       .setBackground('#cfe2f3')
       .setRanges([fullRange])
       .build(),
     // 綠燈：正確（以上皆非，全程正常掃描完成）
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${hadNoBarcodeConfirmCol}2<>"是",$${importedExternalCol}2<>"是")`)
+      .whenFormulaSatisfied(`=AND(${isNo(hadIssueCol)},${isNo(hadManualEditCol)},${isNo(hadNoBarcodeConfirmCol)},${isNo(importedExternalCol)})`)
       .setBackground('#d9ead3')
       .setRanges([fullRange])
       .build()
