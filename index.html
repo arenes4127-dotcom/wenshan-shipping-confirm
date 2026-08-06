@@ -1013,7 +1013,7 @@ function confirmNoBarcode(sku){
     flash('err','數量超過', `「${item.name}」已達應出數量，請勿重複確認`, 1200);
     return;
   }
-  if(!confirm(`「${item.name}」（${item.sku}）確定要手動核對這一件嗎？\n（商品沒貼條碼才用這個，會記錄在差異明細供事後稽核）`)) return;
+  if(!confirm(`「${item.sku}／${item.spec||'-'}／${item.baseName||item.name}」\n確定要手動核對這一件嗎？\n（商品沒貼條碼才用這個，會記錄在差異明細供事後稽核）`)) return;
   item.scanned++;
   item.noBarcodeCount = (item.noBarcodeCount||0) + 1; // 這個品項本身被無條碼手動核對過幾件，差異明細會記在它自己那一列
   current.hadNoBarcodeConfirm = true;
