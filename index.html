@@ -894,7 +894,7 @@ inputOrder.addEventListener('keydown', async e=>{
   saveJSON(LS.orders, orders);
 
   current = order;
-  current.items.forEach(i=>i.scanned=0);
+  current.items.forEach(i=>{ i.scanned=0; i.noBarcodeCount=0; });
   current.hadIssue = false;
   current.hadManualEdit = false;
   current.hadNoBarcodeConfirm = false; // 這次出貨有沒有用過「找不到條碼，手動核對」
@@ -1012,6 +1012,7 @@ function confirmNoBarcode(sku){
   }
   if(!confirm(`「${item.name}」（${item.sku}）確定要手動核對這一件嗎？\n（商品沒貼條碼才用這個，會記錄在差異明細供事後稽核）`)) return;
   item.scanned++;
+  item.noBarcodeCount = (item.noBarcodeCount||0) + 1; // 這個品項本身被無條碼手動核對過幾件，出貨紀錄那邊會列出貨號+這個數字
   current.hadNoBarcodeConfirm = true;
   current.issueLog.push(`無條碼手動核對：「${item.name}」（${item.sku}）第 ${item.scanned}/${item.qty} 件`);
   okBeep();
@@ -1064,7 +1065,7 @@ async function finalizeShipment(){
     orderNo: current.orderNo,
     orderDate: current.date || '',
     waybill: waybill,
-    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned})),
+    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned,noBarcodeCount:i.noBarcodeCount||0})),
     staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
     time: new Date().toLocaleString('zh-TW'),
     startTime: current.claimedAt ? new Date(current.claimedAt).toLocaleString('zh-TW') : '',

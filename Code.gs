@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.13';
+const BACKEND_VERSION = '2026-08-06.14';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -37,9 +37,10 @@ const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSu
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
 // 這樣原本另外開的「出貨紀錄明細」分頁就不需要了，兩個分頁合併成這一個。
 // 同一次出貨如果有N個品項，出貨紀錄就會連續寫N列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複顯示。
-// hadNoBarcodeConfirm 加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
+// hadNoBarcodeConfirm/noBarcodeDetail 都加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
+// noBarcodeDetail緊接在hadNoBarcodeConfirm後面，剛好同時滿足「相鄰」跟「加在最後面最安全」兩個需求。
 // （原本另外開過一欄「verifyStatus」/「核對狀態」，後來依需求併回「核對結果」欄位本身，欄位已移除。）
-const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm'];
+const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm','noBarcodeDetail'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -53,7 +54,7 @@ const HEADER_LABELS = {
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
-  hadNoBarcodeConfirm:'曾無條碼手動核對'
+  hadNoBarcodeConfirm:'曾無條碼手動核對', noBarcodeDetail:'無條碼手動核對明細'
 };
 
 function doGet(e){
@@ -456,7 +457,10 @@ function appendLogRow(entry){
       routingStatus: entry.routingStatus||'',
       checkResult: checkResultText,
       differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||''),
-      hadNoBarcodeConfirm: boolToText(entry.hadNoBarcodeConfirm)
+      // 這兩欄是「這個品項自己」有沒有被無條碼手動核對過（不是整張訂單層級），
+      // 跟核對結果用的entry.hadNoBarcodeConfirm（訂單裡只要有任一品項用過就算）分開判斷。
+      hadNoBarcodeConfirm: boolToText((it.noBarcodeCount||0) > 0),
+      noBarcodeDetail: (it.noBarcodeCount||0) > 0 ? `${it.sku||''} x${it.noBarcodeCount}件` : ''
     };
     return LOG_HEADER.map(h=>rowObj[h]);
   });
