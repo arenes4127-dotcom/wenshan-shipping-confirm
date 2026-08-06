@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.21';
+const BACKEND_VERSION = '2026-08-06.22';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -37,10 +37,11 @@ const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSu
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
 // 這樣原本另外開的「出貨紀錄明細」分頁就不需要了，兩個分頁合併成這一個。
 // 同一次出貨如果有N個品項，出貨紀錄就會連續寫N列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複顯示。
-// hadNoBarcodeConfirm 加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
 // （原本另外開過一欄「verifyStatus」/「核對狀態」，後來依需求併回「核對結果」欄位本身，欄位已移除；
 // 「無條碼手動核對明細」欄位也是同樣道理，後來依需求併回「差異明細」欄位，改成依貨號分別記錄。）
-const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm'];
+// hadNoBarcodeConfirm 原本放在最後面，2026-08-06再依需求移到differenceDetails前面——這是欄位中間插入
+// （不是純append），既有資料列會跟著位移，需要跑一次migrateLogColumnReorder2_()把舊資料重新對齊。
+const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','hadNoBarcodeConfirm','differenceDetails','note'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -96,6 +97,7 @@ function respond(obj){
 const ONE_TIME_SETUP_FUNCTIONS = {
   migrateLogToPerItemFormat_: () => migrateLogToPerItemFormat_(),
   migrateLogColumnReorder_: () => migrateLogColumnReorder_(),
+  migrateLogColumnReorder2_: () => migrateLogColumnReorder2_(),
   migrateOrdersColumnShift: () => migrateOrdersColumnShift(),
   setupLogSheetColors: () => setupLogSheetColors(),
   deleteLegacyEmptySheets: () => deleteLegacyEmptySheets(),
@@ -1127,6 +1129,46 @@ function migrateLogColumnReorder_(){
   }
   newSh.getRange(1, LOG_REORDER_MARKER_COL).setValue(LOG_REORDER_MARKER_VALUE);
   Logger.log('出貨紀錄欄位順序調整完成，共 '+oldEntries.length+' 列。記得重新執行一次 setupLogSheetColors() 套用顏色規則（分頁被重建，舊規則會失效）。');
+}
+
+// ---------------- 一次性重建用：把「曾無條碼手動核對」欄位移到「差異明細」前面 ----------------
+// 跟 migrateLogColumnReorder_() 同樣做法：讀出「重新排序前」的舊欄位順序，依欄位名稱轉成物件，
+// 再用目前（已經改好順序的）LOG_HEADER重新寫回，不管欄位怎麼調都不會對錯欄位。
+// 標記格用第32欄（AF），跟前面兩次重建用的AD/AE分開，避免互相干擾判斷。
+const LOG_REORDER2_MARKER_COL = 32; // AF欄
+const LOG_REORDER2_MARKER_VALUE = 'reordered-v2';
+function migrateLogColumnReorder2_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  // 這次重新排序前，LOG_HEADER當時的順序（hadNoBarcodeConfirm還在最後面、note在它前面）
+  const PRE_REORDER2_LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm'];
+  const sh = ss.getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  if(sh.getRange(1, LOG_REORDER2_MARKER_COL).getValue() === LOG_REORDER2_MARKER_VALUE){
+    Logger.log('偵測到已重新排序標記，不重複執行。');
+    return;
+  }
+  const lastRow = sh.getLastRow();
+  const oldEntries = [];
+  if(lastRow >= 2){
+    const numCols = Math.max(sh.getLastColumn(), PRE_REORDER2_LOG_HEADER.length);
+    const values = sh.getRange(2, 1, lastRow-1, numCols).getValues();
+    values.forEach(row=>{
+      const obj = {};
+      PRE_REORDER2_LOG_HEADER.forEach((h, idx)=> obj[h] = row[idx]);
+      oldEntries.push(obj);
+    });
+  }
+  ss.deleteSheet(sh);
+  const newSh = getSheet(SHEET_LOG, LOG_HEADER);
+  if(oldEntries.length){
+    newSh.getRange(2, colOf(LOG_HEADER,'orderDate'), oldEntries.length, 1).setNumberFormat('@');
+    newSh.getRange(2, colOf(LOG_HEADER,'time'), oldEntries.length, 1).setNumberFormat('@');
+    newSh.getRange(2, colOf(LOG_HEADER,'startTime'), oldEntries.length, 1).setNumberFormat('@');
+    const rows = oldEntries.map(r=> LOG_HEADER.map(h=> r[h]));
+    newSh.getRange(2, 1, rows.length, LOG_HEADER.length).setValues(rows);
+  }
+  newSh.getRange(1, LOG_REORDER2_MARKER_COL).setValue(LOG_REORDER2_MARKER_VALUE);
+  Logger.log('出貨紀錄欄位順序調整完成（曾無條碼手動核對移到差異明細前面），共 '+oldEntries.length+' 列。記得重新執行一次 setupLogSheetColors() 套用顏色規則（分頁被重建，舊規則會失效）。');
 }
 
 // ---------------- 一次性設定用：把「文山出貨V2」跟「國際碼」鏡像進這份後端試算表 ----------------
