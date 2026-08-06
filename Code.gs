@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.4';
+const BACKEND_VERSION = '2026-08-06.5';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -101,13 +101,30 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   deleteTestOrders_: () => deleteTestOrders_(),
   fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
-  fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_()
+  fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
+  debugConditionalFormatRules_: () => debugConditionalFormatRules_()
 };
 function runOneTimeSetup(name){
   const fn = ONE_TIME_SETUP_FUNCTIONS[name];
   if(!fn) return {ok:false, error:'unknown setup function: '+name};
-  fn();
-  return {ok:true, ran:name};
+  const result = fn();
+  return {ok:true, ran:name, result: result===undefined ? null : result};
+}
+
+// 暫時性診斷用：把出貨紀錄目前實際存的條件式格式規則（公式＋顏色＋範圍）以JSON回傳，
+// 方便直接從API看到規則到底存成什麼樣子，不用猜。用完可以刪掉，不是常駐功能。
+function debugConditionalFormatRules_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh) return {error:'no sheet'};
+  const rules = sh.getConditionalFormatRules();
+  return rules.map(r=>{
+    const cond = r.getBooleanCondition();
+    return {
+      formula: cond ? cond.getCriteriaValues()[0] : null,
+      background: cond ? cond.getBackground() : null,
+      ranges: r.getRanges().map(rg=>rg.getA1Notation())
+    };
+  });
 }
 
 function getSheet(name, header){
