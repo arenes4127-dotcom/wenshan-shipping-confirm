@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.12';
+const BACKEND_VERSION = '2026-08-06.13';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -37,8 +37,9 @@ const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSu
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
 // 這樣原本另外開的「出貨紀錄明細」分頁就不需要了，兩個分頁合併成這一個。
 // 同一次出貨如果有N個品項，出貨紀錄就會連續寫N列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複顯示。
-// hadNoBarcodeConfirm/verifyStatus 都加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
-const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm','verifyStatus'];
+// hadNoBarcodeConfirm 加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
+// （原本另外開過一欄「verifyStatus」/「核對狀態」，後來依需求併回「核對結果」欄位本身，欄位已移除。）
+const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -52,7 +53,7 @@ const HEADER_LABELS = {
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
-  hadNoBarcodeConfirm:'曾無條碼手動核對', verifyStatus:'核對狀態'
+  hadNoBarcodeConfirm:'曾無條碼手動核對'
 };
 
 function doGet(e){
@@ -103,7 +104,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
-  fixVerifyStatus_: () => fixVerifyStatus_(),
+  mergeVerifyStatusIntoCheckResult_: () => mergeVerifyStatusIntoCheckResult_(),
   debugConditionalFormatRules_: () => debugConditionalFormatRules_(),
   authorizeDriveAccess_: () => authorizeDriveAccess_()
 };
@@ -215,8 +216,7 @@ function getState(){
         requiredCount: r.requiredCount || '', scannedCount: r.scannedCount || '',
         routingStatus: r.routingStatus || '', checkResult: r.checkResult || '',
         differenceDetails: r.differenceDetails || '', startTime: cellToText(r.startTime, true) || '',
-        hadNoBarcodeConfirm: textToBool(r.hadNoBarcodeConfirm),
-        verifyStatus: r.verifyStatus || ''
+        hadNoBarcodeConfirm: textToBool(r.hadNoBarcodeConfirm)
       };
       logKeyOrder.push(key);
     }
@@ -393,21 +393,12 @@ function finalizeShipment(entry){
   return {ok:true};
 }
 
-// 跟 setupLogSheetColors() 整列上色用的是同一套四選一分類邏輯，這裡額外把對應的燈號emoji
-// 直接寫進「核對結果」文字後面，這樣即使沒開啟顏色格式（例如匯出CSV、手機小螢幕看不清楚背景色）
-// 也能一眼看出這筆是哪一種狀態。
-function classifyLogEmoji_(entry){
-  if(entry.hadIssue) return '🔴';
-  if(entry.hadManualEdit || entry.hadNoBarcodeConfirm) return '🟠';
-  if(entry.importedExternal) return '🔵';
-  return '🟢';
-}
-
 // 對照原生系統「訂單」追蹤表的「核對狀態」欄位概念（待核對／完成／錯誤：商品不符／錯誤：少N件），
-// 用我們自己資料算出對應狀態。跟原生系統不同的是：我們的掃描流程本來就要求數量對齊才能完成出貨，
-// 所以「掃描件數」低於「需求件數」正常情況下不會發生在本系統掃描完成的紀錄裡——
-// 只有「指定出貨Excel匯入」那種沒有真的逐項掃描驗證過的外部匯入紀錄，才會出現需求/掃描件數是0
-// （沒有這個資訊可比對），這種情況歸類成「待核對」，不誤標成「完成」。
+// 用我們自己資料算出對應狀態，現在直接併入「核對結果」欄位本身顯示（不再另外開一欄）。
+// 跟原生系統不同的是：我們的掃描流程本來就要求數量對齊才能完成出貨，所以「掃描件數」低於
+// 「需求件數」正常情況下不會發生在本系統掃描完成的紀錄裡——只有「指定出貨Excel匯入」那種
+// 沒有真的逐項掃描驗證過的外部匯入紀錄，才會出現需求/掃描件數是0（沒有這個資訊可比對），
+// 這種情況歸類成「待核對」，不誤標成「完成」。
 function classifyVerifyStatus_(entry){
   if(entry.hadIssue && String(entry.differenceDetails||'').indexOf('商品不符') >= 0) return '錯誤：商品不符';
   const required = Number(entry.requiredCount) || 0;
@@ -415,6 +406,25 @@ function classifyVerifyStatus_(entry){
   if(required > 0 && scanned < required) return '錯誤：少'+(required-scanned)+'件';
   if(required > 0 && scanned >= required) return '完成';
   return '待核對';
+}
+
+// 跟 setupLogSheetColors() 整列上色用的是同一套判斷邏輯，這裡額外把對應的燈號emoji
+// 直接寫進「核對結果」文字後面，這樣即使沒開啟顏色格式（例如匯出CSV、手機小螢幕看不清楚背景色）
+// 也能一眼看出這筆是哪一種狀態。verifyStatus可以省略不傳，函式會自己算一次。
+function classifyLogEmoji_(entry, verifyStatus){
+  const vs = verifyStatus !== undefined ? verifyStatus : classifyVerifyStatus_(entry);
+  if(entry.hadIssue || String(vs).indexOf('錯誤') === 0) return '🔴';
+  if(entry.hadManualEdit || entry.hadNoBarcodeConfirm) return '🟠';
+  if(vs === '待核對' || entry.importedExternal) return '🔵';
+  return '🟢';
+}
+
+// 把「核對狀態」文字＋人工介入註記＋燈號emoji組成最終的「核對結果」欄位內容。
+function buildCheckResult_(entry, verifyStatus){
+  let text = verifyStatus;
+  if(entry.hadManualEdit) text += '（人工修正數量）';
+  if(entry.hadNoBarcodeConfirm) text += '（含無條碼手動核對）';
+  return text + ' ' + classifyLogEmoji_(entry, verifyStatus);
 }
 
 // entry.items 有幾個品項就寫幾列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複填入。
@@ -429,6 +439,10 @@ function appendLogRow(entry){
   logSh.getRange(startRow, colOf(LOG_HEADER,'orderDate'), items.length, 1).setNumberFormat('@');
   logSh.getRange(startRow, colOf(LOG_HEADER,'time'), items.length, 1).setNumberFormat('@');
   logSh.getRange(startRow, colOf(LOG_HEADER,'startTime'), items.length, 1).setNumberFormat('@');
+  // 核對結果是整張訂單層級的判斷（核對狀態＋人工介入註記＋燈號），每個品項列都一樣，
+  // 只需要算一次，不用放進.map()裡每個品項都重算一次。
+  const verifyStatus = classifyVerifyStatus_(entry);
+  const checkResultText = buildCheckResult_(entry, verifyStatus);
   const rows = items.map((it, idx)=>{
     const rowObj = {
       orderNo: entry.orderNo, orderDate: String(entry.orderDate||''), waybill: entry.waybill||'',
@@ -440,11 +454,9 @@ function appendLogRow(entry){
       // 後面幾列品項留空，不要每一列都重複顯示同一組總數字，容易誤會成是那個品項自己的數量。
       requiredCount: idx===0 ? (entry.requiredCount||0) : '', scannedCount: idx===0 ? (entry.scannedCount||0) : '',
       routingStatus: entry.routingStatus||'',
-      checkResult: (entry.checkResult||'完成') + ' ' + classifyLogEmoji_(entry),
+      checkResult: checkResultText,
       differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||''),
-      hadNoBarcodeConfirm: boolToText(entry.hadNoBarcodeConfirm),
-      // 跟需求件數/掃描件數一樣是訂單層級的判斷，只填在第一列，其餘品項列留空
-      verifyStatus: idx===0 ? classifyVerifyStatus_(entry) : ''
+      hadNoBarcodeConfirm: boolToText(entry.hadNoBarcodeConfirm)
     };
     return LOG_HEADER.map(h=>rowObj[h]);
   });
@@ -476,29 +488,43 @@ function fixRequiredScannedCountDisplay_(){
   Logger.log('已清空 '+cleared+' 列非該訂單第一列的需求件數／掃描件數重複值。');
 }
 
-// ---------------- 一次性修復用：把既有出貨紀錄補上「核對狀態」欄位 ----------------
-// verifyStatus是這次才加的，之前寫入的既有列這欄是空的。只補在每個訂單的第一列
-// （跟需求件數/掃描件數同樣道理，是訂單層級的判斷，不是每個品項各自的狀態）。
-function fixVerifyStatus_(){
+// ---------------- 一次性修復用：把獨立的「核對狀態」欄位併回「核對結果」欄位，並刪掉舊欄位 ----------------
+// 用標題文字（而不是寫死欄號）找出舊「核對狀態」欄實際在哪一欄，因為LOG_HEADER已經拿掉這個欄位了、
+// colOf()查不到。需求件數/掃描件數只存在每組訂單的第一列，其餘品項列要沿用同一組的值才能正確判斷，
+// 不能直接拿自己那一列的（會是空白，誤判成「待核對」）。
+function mergeVerifyStatusIntoCheckResult_(){
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
   if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const lastCol = sh.getLastColumn();
+  const headerRow = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  const oldVerifyStatusColIdx = headerRow.indexOf('核對狀態'); // 0-indexed，-1代表這次沒找到（可能已經處理過了）
+
   const rows = readRows(SHEET_LOG, LOG_HEADER);
-  const verifyStatusCol = colOf(LOG_HEADER,'verifyStatus');
-  const seenKeys = {};
-  let fixed = 0;
+  const checkResultCol = colOf(LOG_HEADER,'checkResult');
+  const groupInfo = {};
   rows.forEach(r=>{
     const key = r.orderNo + '||' + r.time;
-    if(seenKeys[key]) return; // 不是該訂單第一列，維持空白
-    seenKeys[key] = true;
-    if(r.verifyStatus) return; // 已經有值了，跳過
-    const status = classifyVerifyStatus_({
-      hadIssue: textToBool(r.hadIssue), differenceDetails: r.differenceDetails,
-      requiredCount: r.requiredCount, scannedCount: r.scannedCount
-    });
-    sh.getRange(r._row, verifyStatusCol).setValue(status);
-    fixed++;
+    if(!groupInfo[key] && r.requiredCount !== '' && r.requiredCount !== undefined){
+      groupInfo[key] = {requiredCount: r.requiredCount, scannedCount: r.scannedCount};
+    }
   });
-  Logger.log('已補上核對狀態：'+fixed+' 列');
+  rows.forEach(r=>{
+    const key = r.orderNo + '||' + r.time;
+    const g = groupInfo[key] || {requiredCount: 0, scannedCount: 0};
+    const entryLike = {
+      hadIssue: textToBool(r.hadIssue), hadManualEdit: textToBool(r.hadManualEdit),
+      hadNoBarcodeConfirm: textToBool(r.hadNoBarcodeConfirm), importedExternal: textToBool(r.importedExternal),
+      differenceDetails: r.differenceDetails, requiredCount: g.requiredCount, scannedCount: g.scannedCount
+    };
+    const verifyStatus = classifyVerifyStatus_(entryLike);
+    sh.getRange(r._row, checkResultCol).setValue(buildCheckResult_(entryLike, verifyStatus));
+  });
+
+  if(oldVerifyStatusColIdx >= 0){
+    sh.deleteColumn(oldVerifyStatusColIdx + 1);
+    Logger.log('已刪除舊的獨立「核對狀態」欄位（原第'+(oldVerifyStatusColIdx+1)+'欄）。');
+  }
+  Logger.log('已重新計算 '+rows.length+' 列的核對結果（併入核對狀態資訊）。');
 }
 
 // ---------------- 一次性修復用：把既有出貨紀錄的核對結果補上燈號emoji ----------------
@@ -623,7 +649,7 @@ function deleteLegacyEmptySheets(){
 // 設定的是「條件式格式」，套一次之後，之後每一筆新的出貨紀錄會自動套用顏色，
 // 不用每次寫入資料時都重新設定一次。
 // 整列上色，四選一、互斥（每列一定會落在其中一種，不會沒有顏色）：
-// 錯誤(紅燈)：曾觸發警示(是)——真的掃錯商品或超量掃描。
+// 錯誤(紅燈)：曾觸發警示(是)，或「核對結果」顯示錯誤（少件/商品不符，目前只有外部匯入的紀錄才可能出現）。
 // 警示(橘燈)：沒有錯誤，但曾手動修改數量或曾無條碼手動核對——過程有人工介入，值得留意但不算出錯。
 // 完成(藍燈)：沒有錯誤也沒有警示，但是外部匯入的紀錄——不是這個系統掃描出來的，來源不同特別標示。
 // 正確(綠燈)：以上皆非，全程正常掃描完成，沒有任何人工介入——最單純、最理想的狀態。
@@ -640,59 +666,41 @@ function setupLogSheetColors(){
   const hadManualEditCol = colLetter(colOf(LOG_HEADER,'hadManualEdit'));
   const importedExternalCol = colLetter(colOf(LOG_HEADER,'importedExternal'));
   const hadNoBarcodeConfirmCol = colLetter(colOf(LOG_HEADER,'hadNoBarcodeConfirm'));
+  const checkResultCol = colLetter(colOf(LOG_HEADER,'checkResult'));
   // boolToText()現在存的是「是 🟠」/「否 🟢」（文字+燈號），不是單純「是」/「否」了，
   // 用LEFT(...,1)="是"只比對開頭那個字，新舊資料（含不含燈號）都吃得下，不用另外判斷。
   const isYes = col => `LEFT($${col}2,1)="是"`;
   const isNo = col => `LEFT($${col}2,1)<>"是"`;
+  // 「核對結果」欄位現在把核對狀態（完成/待核對/錯誤：xxx）併進去了，
+  // 整列判斷是否出錯除了看曾觸發警示，也要看核對結果開頭是不是「錯誤」。
+  const isError = `OR(${isYes(hadIssueCol)},LEFT($${checkResultCol}2,2)="錯誤")`;
+  const isNotError = `AND(${isNo(hadIssueCol)},LEFT($${checkResultCol}2,2)<>"錯誤")`;
   const rules = [
     // 紅燈：錯誤
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=${isYes(hadIssueCol)}`)
+      .whenFormulaSatisfied(`=${isError}`)
       .setBackground('#f4cccc')
       .setRanges([fullRange])
       .build(),
     // 橘燈：警示（人工修正數量 或 無條碼手動核對，但沒有真的出錯）
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND(${isNo(hadIssueCol)},OR(${isYes(hadManualEditCol)},${isYes(hadNoBarcodeConfirmCol)}))`)
+      .whenFormulaSatisfied(`=AND(${isNotError},OR(${isYes(hadManualEditCol)},${isYes(hadNoBarcodeConfirmCol)}))`)
       .setBackground('#fce5cd')
       .setRanges([fullRange])
       .build(),
     // 藍燈：完成（外部匯入的紀錄，且沒有錯誤也沒有警示）
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND(${isNo(hadIssueCol)},${isNo(hadManualEditCol)},${isNo(hadNoBarcodeConfirmCol)},${isYes(importedExternalCol)})`)
+      .whenFormulaSatisfied(`=AND(${isNotError},${isNo(hadManualEditCol)},${isNo(hadNoBarcodeConfirmCol)},${isYes(importedExternalCol)})`)
       .setBackground('#cfe2f3')
       .setRanges([fullRange])
       .build(),
     // 綠燈：正確（以上皆非，全程正常掃描完成）
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND(${isNo(hadIssueCol)},${isNo(hadManualEditCol)},${isNo(hadNoBarcodeConfirmCol)},${isNo(importedExternalCol)})`)
+      .whenFormulaSatisfied(`=AND(${isNotError},${isNo(hadManualEditCol)},${isNo(hadNoBarcodeConfirmCol)},${isNo(importedExternalCol)})`)
       .setBackground('#d9ead3')
       .setRanges([fullRange])
       .build()
   ];
-
-  // 「核對狀態」欄位只上色那一格（不是整列），對照原生系統「訂單」追蹤表的顯示習慣：
-  // 錯誤：商品不符／錯誤：少N件＝紅、待核對＝黃、完成＝綠。
-  const verifyStatusCol = colOf(LOG_HEADER,'verifyStatus');
-  const verifyStatusRange = sh.getRange(2, verifyStatusCol, numRows, 1);
-  const vsColLetter = colLetter(verifyStatusCol);
-  rules.push(
-    SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=LEFT($${vsColLetter}2,2)="錯誤"`)
-      .setBackground('#f4cccc')
-      .setRanges([verifyStatusRange])
-      .build(),
-    SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=$${vsColLetter}2="待核對"`)
-      .setBackground('#fff2cc')
-      .setRanges([verifyStatusRange])
-      .build(),
-    SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=$${vsColLetter}2="完成"`)
-      .setBackground('#d9ead3')
-      .setRanges([verifyStatusRange])
-      .build()
-  );
 
   sh.setConditionalFormatRules(rules);
   Logger.log('已設定出貨紀錄分頁的顏色規則');
