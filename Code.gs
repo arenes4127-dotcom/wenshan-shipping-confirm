@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.13';
+const BACKEND_VERSION = '2026-08-05.14';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -34,9 +34,10 @@ const SHEET_STAFF = '人員';
 const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'Staff' };
 
 const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus'];
-const LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','skuSummary','nameSummary','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','startTime'];
-// startTime 加在最後面（不是插進中間），這樣舊資料列所有既有欄位的位置都不會被移動，
-// 不需要再跑一次欄位位移migration——上次把skuSummary/nameSummary插在中間就是因為這樣才搞出一次資料位移的大麻煩。
+// 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
+// 這樣原本另外開的「出貨紀錄明細」分頁就不需要了，兩個分頁合併成這一個。
+// 同一次出貨如果有N個品項，出貨紀錄就會連續寫N列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複顯示。
+const LOG_HEADER = ['orderNo','orderDate','waybill','baseName','spec','sku','qty','scanned','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','startTime'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -48,7 +49,8 @@ const HEADER_LABELS = {
   time:'完成時間', hadIssue:'曾觸發警示', hadManualEdit:'曾手動修改數量', importedExternal:'外部匯入',
   shipMethod:'寄送方式', note:'備註', id:'工號', name:'姓名',
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
-  differenceDetails:'差異明細', startTime:'確認訂單開始時間'
+  differenceDetails:'差異明細', startTime:'確認訂單開始時間',
+  baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量'
 };
 
 function doGet(e){
@@ -124,16 +126,32 @@ function getState(){
       shipMethod: r.shipMethod || '', routingStatus: r.routingStatus || ''
     };
   });
+  // 出貨紀錄現在存的是「一列一品項」，同一次出貨的N個品項會連續寫N列（訂單層級欄位重複），
+  // 這裡依「訂單號+完成時間」把同一次出貨的品項列重新組回一筆帶items陣列的紀錄，
+  // 維持給前端APP的資料格狀跟以前一樣（APP自己畫面上還是把出貨紀錄當「一次出貨一筆」呈現）。
   const logRows = readRows(SHEET_LOG, LOG_HEADER);
-  const log = logRows.map(r=>({
-    orderNo: r.orderNo, orderDate: cellToText(r.orderDate), waybill: r.waybill,
-    items: safeParse(r.itemsJson, []), staffId: r.staffId, staffName: r.staffName,
-    time: cellToText(r.time, true), hadIssue: textToBool(r.hadIssue), hadManualEdit: textToBool(r.hadManualEdit),
-    importedExternal: textToBool(r.importedExternal), store: r.store, shipMethod: r.shipMethod, note: r.note,
-    requiredCount: r.requiredCount || '', scannedCount: r.scannedCount || '',
-    routingStatus: r.routingStatus || '', checkResult: r.checkResult || '',
-    differenceDetails: r.differenceDetails || '', startTime: cellToText(r.startTime, true) || ''
-  })).reverse(); // 最新的在前面
+  const logGroups = {};
+  const logKeyOrder = [];
+  logRows.forEach(r=>{
+    const key = r.orderNo + '||' + r.time;
+    if(!logGroups[key]){
+      logGroups[key] = {
+        orderNo: r.orderNo, orderDate: cellToText(r.orderDate), waybill: r.waybill,
+        items: [], staffId: r.staffId, staffName: r.staffName,
+        time: cellToText(r.time, true), hadIssue: textToBool(r.hadIssue), hadManualEdit: textToBool(r.hadManualEdit),
+        importedExternal: textToBool(r.importedExternal), store: r.store, shipMethod: r.shipMethod, note: r.note,
+        requiredCount: r.requiredCount || '', scannedCount: r.scannedCount || '',
+        routingStatus: r.routingStatus || '', checkResult: r.checkResult || '',
+        differenceDetails: r.differenceDetails || '', startTime: cellToText(r.startTime, true) || ''
+      };
+      logKeyOrder.push(key);
+    }
+    if(r.sku || r.baseName){
+      const displayName = r.spec ? `${r.baseName}（${r.spec}）` : (r.baseName || '');
+      logGroups[key].items.push({sku: r.sku, name: displayName, baseName: r.baseName, spec: r.spec, qty: r.qty, scanned: r.scanned});
+    }
+  });
+  const log = logKeyOrder.map(k=>logGroups[k]).reverse(); // 最新的在前面
   const staffRows = readRows(SHEET_STAFF, STAFF_HEADER);
   const staff = staffRows.map(r=>({id:r.id, name:r.name}));
   return {ok:true, orders, log, staff, version: BACKEND_VERSION};
@@ -298,71 +316,26 @@ function finalizeShipment(entry){
   return {ok:true};
 }
 
+// entry.items 有幾個品項就寫幾列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複填入。
 function appendLogRow(entry){
   const logSh = getSheet(SHEET_LOG, LOG_HEADER);
-  const targetRow = logSh.getLastRow()+1;
-  const {skuSummary, nameSummary} = summarizeItems(entry.items);
+  const items = (entry.items && entry.items.length) ? entry.items : [{}]; // 萬一沒有品項資料，至少留一列基本記錄，不整筆遺失
+  const startRow = logSh.getLastRow()+1;
   // orderDate跟time跟startTime都長得像日期/時間字串，強制設純文字格式再寫，
   // 避免 Google試算表自動轉成日期型別（讀回來會變UTC ISO字串，顯示會跑掉）
-  logSh.getRange(targetRow, colOf(LOG_HEADER,'orderDate')).setNumberFormat('@');
-  logSh.getRange(targetRow, colOf(LOG_HEADER,'time')).setNumberFormat('@');
-  logSh.getRange(targetRow, colOf(LOG_HEADER,'startTime')).setNumberFormat('@');
-  logSh.getRange(targetRow, 1, 1, LOG_HEADER.length).setValues([[
-    entry.orderNo, String(entry.orderDate||''), entry.waybill||'', JSON.stringify(entry.items||[]), skuSummary, nameSummary,
-    entry.staffId||'', entry.staffName||'', String(entry.time||''), boolToText(entry.hadIssue), boolToText(entry.hadManualEdit),
-    boolToText(entry.importedExternal), entry.store||'', entry.shipMethod||'', entry.note||'',
+  logSh.getRange(startRow, colOf(LOG_HEADER,'orderDate'), items.length, 1).setNumberFormat('@');
+  logSh.getRange(startRow, colOf(LOG_HEADER,'time'), items.length, 1).setNumberFormat('@');
+  logSh.getRange(startRow, colOf(LOG_HEADER,'startTime'), items.length, 1).setNumberFormat('@');
+  const rows = items.map(it=>[
+    entry.orderNo, String(entry.orderDate||''), entry.waybill||'',
+    it.baseName || it.name || '', it.spec || '', it.sku || '', it.qty || 0, it.scanned || 0,
+    entry.staffId||'', entry.staffName||'', String(entry.time||''),
+    boolToText(entry.hadIssue), boolToText(entry.hadManualEdit), boolToText(entry.importedExternal),
+    entry.store||'', entry.shipMethod||'', entry.note||'',
     entry.requiredCount||0, entry.scannedCount||0, entry.routingStatus||'', entry.checkResult||'', entry.differenceDetails||'',
     String(entry.startTime||'')
-  ]]);
-  appendLogDetailRows_(entry);
-}
-
-// ---------------- 「出貨紀錄明細」分頁：出貨紀錄一列是一整張訂單，品號用頓號串在一起不好看，
-// 這裡另外開一個一列一品項的版本，品號一格一個。appendLogRow() 每寫一筆出貨紀錄，
-// 這裡就同步多寫幾列（該訂單有幾個品項就幾列），包貨人員/完成時間等訂單層級欄位每列都重複顯示，
-// 方便直接篩選/排序特定品號。
-const SHEET_LOG_DETAIL = '出貨紀錄明細';
-const LOG_DETAIL_DISPLAY_HEADER = ['訂單號','運單編號','品名','規格','品號','數量','已掃數量','完成時間','包貨人員','確認訂單開始時間'];
-function appendLogDetailRows_(entry){
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName(SHEET_LOG_DETAIL);
-  if(!sh){
-    sh = ss.insertSheet(SHEET_LOG_DETAIL);
-    sh.appendRow(LOG_DETAIL_DISPLAY_HEADER);
-  }
-  const items = entry.items || [];
-  if(!items.length) return;
-  const staffLabel = [entry.staffId, entry.staffName].filter(Boolean).join(' - ');
-  const rows = items.map(it=>[
-    entry.orderNo, entry.waybill||'', it.baseName || it.name || '', it.spec || '', it.sku || '',
-    it.qty || 0, it.scanned || 0, String(entry.time||''), staffLabel, String(entry.startTime||'')
   ]);
-  const startRow = sh.getLastRow()+1;
-  // 完成時間／確認訂單開始時間欄位固定純文字，避免被誤判成日期
-  sh.getRange(startRow, 8, rows.length, 1).setNumberFormat('@');
-  sh.getRange(startRow, 10, rows.length, 1).setNumberFormat('@');
-  sh.getRange(startRow, 1, rows.length, LOG_DETAIL_DISPLAY_HEADER.length).setValues(rows);
-}
-
-// 一次性補建用：出貨紀錄明細分頁上線前，既有的出貨紀錄還沒有對應的明細列，
-// 在 Apps Script 編輯器裡選這個函式執行一次，會清空明細分頁重新整個從出貨紀錄回填。
-// appendLogDetailRows_()本身是「新紀錄才增量寫入」，不會重複補之前的資料，所以只需要跑這一次。
-function rebuildLogDetailSheet_(){
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName(SHEET_LOG_DETAIL);
-  if(sh) ss.deleteSheet(sh);
-  sh = ss.insertSheet(SHEET_LOG_DETAIL);
-  sh.appendRow(LOG_DETAIL_DISPLAY_HEADER);
-  const logRows = readRows(SHEET_LOG, LOG_HEADER);
-  logRows.forEach(r=>{
-    const items = safeParse(r.itemsJson, []);
-    appendLogDetailRows_({
-      orderNo: r.orderNo, waybill: r.waybill, items,
-      time: cellToText(r.time, true), staffId: r.staffId, staffName: r.staffName,
-      startTime: cellToText(r.startTime, true)
-    });
-  });
-  Logger.log('出貨紀錄明細：已從 '+logRows.length+' 筆出貨紀錄回填完成');
+  logSh.getRange(startRow, 1, rows.length, LOG_HEADER.length).setValues(rows);
 }
 
 // ---------------- 批次匯入已出貨紀錄（指定出貨Excel那個功能用） ----------------
@@ -486,37 +459,48 @@ function migrateOrdersColumnShift(){
   Logger.log('訂單分頁：已還原 '+migrated+' 列舊資料的欄位位移');
 }
 
-function migrateLogColumnShift(){
-  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
-  if(!sh) { Logger.log('找不到「出貨紀錄」分頁'); return; }
-  const lastRow = sh.getLastRow();
-  if(lastRow < 2){ Logger.log('沒有資料列'); return; }
-  const numCols = Math.max(sh.getLastColumn(), LOG_HEADER.length);
-  const values = sh.getRange(2, 1, lastRow-1, numCols).getValues();
-  const orderDateCol = colOf(LOG_HEADER,'orderDate');
-  const timeCol = colOf(LOG_HEADER,'time');
-  let migrated = 0;
-  values.forEach((row, i)=>{
-    if(row[18]) return; // 第19欄(核對結果)已經有值，代表這列已經是新版，跳過
-    const orderNo=row[0], orderDate=row[1], waybill=row[2], itemsJson=row[3];
-    const oldStaffId=row[4], oldStaffName=row[5], oldTime=row[6], oldHadIssue=row[7],
-          oldHadManualEdit=row[8], oldImportedExternal=row[9], oldStore=row[10], oldShipMethod=row[11],
-          oldNote=row[12], oldRequiredCount=row[13], oldScannedCount=row[14], oldRoutingStatus=row[15],
-          oldCheckResult=row[16], oldDifferenceDetails=row[17];
-    const items = safeParse(itemsJson, []);
-    const {skuSummary, nameSummary} = summarizeItems(items);
-    const targetRow = i + 2;
-    sh.getRange(targetRow, orderDateCol).setNumberFormat('@');
-    sh.getRange(targetRow, timeCol).setNumberFormat('@');
-    sh.getRange(targetRow, 1, 1, LOG_HEADER.length).setValues([[
-      orderNo, orderDate, waybill, itemsJson, skuSummary, nameSummary,
-      oldStaffId, oldStaffName, oldTime, oldHadIssue, oldHadManualEdit, oldImportedExternal,
-      oldStore, oldShipMethod, oldNote, oldRequiredCount, oldScannedCount, oldRoutingStatus,
-      oldCheckResult, oldDifferenceDetails
-    ]]);
-    migrated++;
+// （migrateLogColumnShift() 這個舊的一次性修復函式已經完成階段性任務並移除——
+// 出貨紀錄後來又整個改成一列一品項格式，下面 migrateLogToPerItemFormat_() 是取代它的新版本。）
+
+// ---------------- 一次性重建用：出貨紀錄改成「一列一品項」格式，順便併入出貨紀錄明細分頁 ----------------
+// 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（不用重新部署）：
+//   1. 讀出「出貨紀錄」現有的每一列（訂單層級一列，itemsJson整包塞在一欄），
+//   2. 依 items 展開成新格式重新寫入（一個品項一列，訂單層級欄位每列重複），
+//   3. 刪除「出貨紀錄明細」分頁——這個分頁的功能已經併入「出貨紀錄」本身，不用再開兩個分頁對照。
+// 執行完後記得重新跑一次 setupLogSheetColors()：分頁被整個重建，舊的顏色規則會失效需要重新套用。
+function migrateLogToPerItemFormat_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const OLD_LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','skuSummary','nameSummary','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','startTime'];
+  const oldSh = ss.getSheetByName(SHEET_LOG);
+  const oldEntries = [];
+  if(oldSh){
+    const lastRow = oldSh.getLastRow();
+    if(lastRow >= 2){
+      const numCols = Math.max(oldSh.getLastColumn(), OLD_LOG_HEADER.length);
+      const values = oldSh.getRange(2, 1, lastRow-1, numCols).getValues();
+      values.forEach(row=>{
+        const obj = {};
+        OLD_LOG_HEADER.forEach((h, idx)=> obj[h] = row[idx]);
+        oldEntries.push(obj);
+      });
+    }
+    ss.deleteSheet(oldSh);
+  }
+  getSheet(SHEET_LOG, LOG_HEADER); // 用新表頭重新建立空白分頁
+  oldEntries.forEach(r=>{
+    appendLogRow({
+      orderNo: r.orderNo, orderDate: cellToText(r.orderDate), waybill: r.waybill,
+      items: safeParse(r.itemsJson, []), staffId: r.staffId, staffName: r.staffName,
+      time: cellToText(r.time, true),
+      hadIssue: textToBool(r.hadIssue), hadManualEdit: textToBool(r.hadManualEdit), importedExternal: textToBool(r.importedExternal),
+      store: r.store, shipMethod: r.shipMethod, note: r.note,
+      requiredCount: r.requiredCount, scannedCount: r.scannedCount, routingStatus: r.routingStatus,
+      checkResult: r.checkResult, differenceDetails: r.differenceDetails, startTime: cellToText(r.startTime, true)
+    });
   });
-  Logger.log('出貨紀錄分頁：已還原 '+migrated+' 列舊資料的欄位位移');
+  const detailSh = ss.getSheetByName('出貨紀錄明細');
+  if(detailSh) ss.deleteSheet(detailSh);
+  Logger.log('出貨紀錄已轉成一列一品項格式，共轉換 '+oldEntries.length+' 筆出貨紀錄；出貨紀錄明細分頁已刪除（功能已併入出貨紀錄）。記得重新執行一次 setupLogSheetColors() 套用顏色規則。');
 }
 
 // ---------------- 一次性設定用：把「文山出貨V2」跟「國際碼」鏡像進這份後端試算表 ----------------
