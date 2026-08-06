@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.16';
+const BACKEND_VERSION = '2026-08-06.17';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -107,6 +107,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
   mergeVerifyStatusIntoCheckResult_: () => mergeVerifyStatusIntoCheckResult_(),
   mergeNoBarcodeDetailIntoDifferenceDetails_: () => mergeNoBarcodeDetailIntoDifferenceDetails_(),
+  fixNoteHadNoBarcodeConfirmShift_: () => fixNoteHadNoBarcodeConfirmShift_(),
   debugConditionalFormatRules_: () => debugConditionalFormatRules_(),
   authorizeDriveAccess_: () => authorizeDriveAccess_()
 };
@@ -621,6 +622,31 @@ function mergeNoBarcodeDetailIntoDifferenceDetails_(){
     Logger.log('已刪除舊的獨立「無條碼手動核對明細」欄位（原第'+(oldNoBarcodeDetailColIdx+1)+'欄）。');
   }
   Logger.log('已重新整理 '+updated+' 列的差異明細（改成依貨號分別記錄）。');
+}
+
+// ---------------- 一次性修復用：還原特定一批在部署交接期間寫入、備註／曾無條碼手動核對欄位錯位的資料列 ----------------
+// 背景：這次session中間有個時間點LOG_HEADER還在調整，剛好在那個交接窗口寫入的出貨紀錄
+// （目前已知只有一張訂單、8列品項）備註欄跟曾無條碔手動核對欄的內容整組錯開了一格——
+// 備註欄目前存的其實是「是/否+燈號」（本來應該是曾無條碼手動核對的值），曾無條碼手動核對欄
+// 存的是舊「無條碼手動核對明細」欄的殘留值（本來已經併入差異明細，這裡多的是孤兒資料）。
+// 判斷依據：備註欄本來一定是空字串（掃描流程從來不會寫入備註，只有外部匯入Excel才會用到這欄），
+// 只要備註欄目前看起來像「是 ...」或「否 ...」就代表是這個錯位，其餘正常資料列不會被誤判。
+function fixNoteHadNoBarcodeConfirmShift_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const noteCol = colOf(LOG_HEADER,'note');
+  const hadNoBarcodeConfirmCol = colOf(LOG_HEADER,'hadNoBarcodeConfirm');
+  let fixed = 0;
+  rows.forEach(r=>{
+    const noteVal = String(r.note||'');
+    if(/^(是|否)[\s　]/.test(noteVal)){
+      sh.getRange(r._row, hadNoBarcodeConfirmCol).setValue(noteVal);
+      sh.getRange(r._row, noteCol).setValue('');
+      fixed++;
+    }
+  });
+  Logger.log('已修正 '+fixed+' 列的備註／曾無條碼手動核對欄位錯位。');
 }
 
 // ---------------- 一次性修復用：把既有出貨紀錄的核對結果補上燈號emoji ----------------
