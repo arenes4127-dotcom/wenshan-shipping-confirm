@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.14';
+const BACKEND_VERSION = '2026-08-06.15';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -290,8 +290,16 @@ function mergeOrders(incoming){
     // 「日期」欄位強制設成純文字格式再寫入，避免 Google試算表把「2026/8/5」這種字串
     // 自動偵測轉成日期型別儲存格（那樣讀回來會變成UTC的ISO時間字串，跟原本存的字不一樣）
     sh.getRange(targetRow, colOf(ORDERS_HEADER,'date')).setNumberFormat('@');
+    // 防呆：如果這張訂單目前正在被認領/掃描中，重新同步只更新品項/賣場等資料本身，
+    // 不要動狀態／認領人／認領時間——不然等於把人家正在處理的訂單無聲無息退回待處理，
+    // 之後如果又被別人認領，同一張訂單就可能被兩個人各自完成一次出貨，造成重複出貨紀錄。
+    const keepClaim = existing && existing.status === 'scanning';
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([[
-      orderNo, o.store||'', String(o.date||''), itemsJson, skuSummary, nameSummary, 'pending', '', '', now, o.shipMethod||'', o.routingStatus||''
+      orderNo, o.store||'', String(o.date||''), itemsJson, skuSummary, nameSummary,
+      keepClaim ? existing.status : 'pending',
+      keepClaim ? existing.claimedBy : '',
+      keepClaim ? existing.claimedAt : '',
+      now, o.shipMethod||'', o.routingStatus||''
     ]]);
     if(existing) updated++; else added++;
   });
@@ -387,6 +395,11 @@ function finalizeShipment(entry){
   let row = rows.find(r=>r.orderNo===entry.orderNo);
   if(row){
     row = healOrderRowIfNeeded_(ordersSh, row);
+    // 防呆：這張訂單已經出貨過了就不要再記錄第二次（例如兩台裝置都認領到同一張訂單、
+    // 或使用者不小心點了兩次完成出貨）。找不到這張訂單（row為null，理論上不該發生）維持原行為照樣記錄。
+    if(row.status === 'shipped'){
+      return {ok:false, reason:'already_shipped'};
+    }
     const now = new Date().toISOString();
     ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['shipped', '', '', now]]);
   }

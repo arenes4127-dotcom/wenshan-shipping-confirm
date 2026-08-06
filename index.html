@@ -1081,9 +1081,15 @@ async function finalizeShipment(){
   };
 
   document.getElementById('btnConfirm').disabled = true;
+  let alreadyShipped = false;
   try{
     if(hasBackend()){
-      await apiPost('finalizeShipment', {entry});
+      const result = await apiPost('finalizeShipment', {entry});
+      // 防呆：這張訂單已經被（可能是別台裝置）標記完成出貨過了，不要再重複記錄一次，
+      // 明確告知使用者實際狀況，而不是讓畫面看起來像「又成功出貨了一次」。
+      if(result && result.ok === false && result.reason === 'already_shipped'){
+        alreadyShipped = true;
+      }
       await refreshFromBackend(true);
     } else {
       log.unshift(entry);
@@ -1099,6 +1105,11 @@ async function finalizeShipment(){
     return;
   }
   document.getElementById('btnConfirm').disabled = false;
+
+  if(alreadyShipped){
+    errorBeep();
+    flash('err', '這張訂單已經出貨過了', '系統偵測到重複，不會再記錄一次（可能剛剛已經在其他裝置完成）', 1800);
+  }
 
   current = null;
   inputFinalWaybill.value = '';
