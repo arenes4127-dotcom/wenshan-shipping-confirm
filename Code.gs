@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.17';
+const BACKEND_VERSION = '2026-08-06.18';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -103,6 +103,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   rebuildOrderDetailSheet_: () => rebuildOrderDetailSheet_(),
   deleteTestOrders_: () => deleteTestOrders_(),
   fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
+  fixScannedCountCheckmark_: () => fixScannedCountCheckmark_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
   mergeVerifyStatusIntoCheckResult_: () => mergeVerifyStatusIntoCheckResult_(),
@@ -424,6 +425,15 @@ function classifyVerifyStatus_(entry){
   return '待核對';
 }
 
+// 掃描件數如果等於（或超過）需求件數，代表這張訂單真的全部確認完成，數字後面加個綠色打勾方便一眼看出來。
+// 沒有需求件數可比對（例如外部匯入）或還沒補滿就只顯示數字，不會誤加打勾。
+function formatScannedCount_(required, scanned){
+  const req = Number(required) || 0;
+  const sc = Number(scanned) || 0;
+  if(req > 0 && sc >= req) return `${sc} ✅`;
+  return sc;
+}
+
 // 跟 setupLogSheetColors() 整列上色用的是同一套判斷邏輯，這裡額外把對應的燈號emoji
 // 直接寫進「核對結果」文字後面，這樣即使沒開啟顏色格式（例如匯出CSV、手機小螢幕看不清楚背景色）
 // 也能一眼看出這筆是哪一種狀態。verifyStatus可以省略不傳，函式會自己算一次。
@@ -472,7 +482,8 @@ function appendLogRow(entry){
       store: entry.store||'', shipMethod: entry.shipMethod||'', note: entry.note||'',
       // 需求件數／掃描件數是整張訂單的加總，不是這一列品項自己的數量——只填在該訂單第一列，
       // 後面幾列品項留空，不要每一列都重複顯示同一組總數字，容易誤會成是那個品項自己的數量。
-      requiredCount: idx===0 ? (entry.requiredCount||0) : '', scannedCount: idx===0 ? (entry.scannedCount||0) : '',
+      requiredCount: idx===0 ? (entry.requiredCount||0) : '',
+      scannedCount: idx===0 ? formatScannedCount_(entry.requiredCount, entry.scannedCount) : '',
       routingStatus: entry.routingStatus||'',
       checkResult: checkResultText,
       differenceDetails: idx===0
@@ -511,6 +522,28 @@ function fixRequiredScannedCountDisplay_(){
     }
   });
   Logger.log('已清空 '+cleared+' 列非該訂單第一列的需求件數／掃描件數重複值。');
+}
+
+// ---------------- 一次性修復用：把既有出貨紀錄的掃描件數補上綠色打勾 ----------------
+// formatScannedCount_()是這次才加的，之前寫入的既有列還只是純數字，沒有打勾。
+// 用是否已經含有✅字元判斷「補過了沒」，補過的列會跳過，可以放心重複執行。
+function fixScannedCountCheckmark_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const scannedCol = colOf(LOG_HEADER,'scannedCount');
+  let fixed = 0;
+  rows.forEach(r=>{
+    if(r.requiredCount === '' || r.requiredCount === undefined) return; // 不是該訂單第一列，維持空白
+    const current = String(r.scannedCount||'');
+    if(current.indexOf('✅') >= 0) return; // 已經補過了，跳過
+    const newVal = formatScannedCount_(r.requiredCount, r.scannedCount);
+    if(String(newVal) !== current){
+      sh.getRange(r._row, scannedCol).setValue(newVal);
+      fixed++;
+    }
+  });
+  Logger.log('已補上掃描件數的綠色打勾：'+fixed+' 列');
 }
 
 // ---------------- 一次性修復用：把獨立的「核對狀態」欄位併回「核對結果」欄位，並刪掉舊欄位 ----------------
