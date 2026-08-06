@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.6';
+const BACKEND_VERSION = '2026-08-06.7';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -73,6 +73,7 @@ function doPost(e){
       case 'importShippedBatch': result = importShippedBatch(body.entries || []); break;
       case 'setStaffList': result = setStaffList(body.staff || []); break;
       case 'runOneTimeSetup': result = runOneTimeSetup(body.name); break;
+      case 'uploadFileToDrive': result = uploadFileToDrive(body.folderId, body.fileName, body.content, body.mimeType); break;
       default: result = {ok:false, error:'unknown action: '+body.action};
     }
     return respond(result);
@@ -125,6 +126,20 @@ function debugConditionalFormatRules_(){
       ranges: r.getRanges().map(rg=>rg.getA1Notation())
     };
   });
+}
+
+// 把APP原始碼（index.html）之類的檔案放進使用者自己的Google雲端硬碟指定資料夾——
+// 這個腳本本來只用到SpreadsheetApp，第一次呼叫到DriveApp（雲端硬碟）時Google會需要
+// 額外授權範圍，這一步一定要使用者自己在Apps Script編輯器裡手動執行這個函式一次
+// 才會跳出授權視窗（透過API用HTTP呼叫沒有互動畫面，跳不出授權提示，只會直接失敗）。
+// 之後授權過一次，不管是編輯器執行還是API呼叫都可以正常用。
+// 同名檔案已存在就先丟進垃圾桶再建新的，不會越傳越多份同名檔案。
+function uploadFileToDrive(folderId, fileName, content, mimeType){
+  const folder = DriveApp.getFolderById(folderId);
+  const existing = folder.getFilesByName(fileName);
+  while(existing.hasNext()){ existing.next().setTrashed(true); }
+  const file = folder.createFile(fileName, content, mimeType || MimeType.HTML);
+  return {fileId: file.getId(), url: file.getUrl()};
 }
 
 function getSheet(name, header){
