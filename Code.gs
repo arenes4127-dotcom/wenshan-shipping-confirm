@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.1';
+const BACKEND_VERSION = '2026-08-06.2';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -473,8 +473,11 @@ function deleteLegacyEmptySheets(){
 // 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（不用重新部署）。
 // 設定的是「條件式格式」，套一次之後，之後每一筆新的出貨紀錄會自動套用顏色，
 // 不用每次寫入資料時都重新設定一次。
-// 整列上色，依優先順序：曾觸發警示(是)＝紅色 > 曾手動修改數量(是，且無警示)＝黃色 >
-// 曾無條碼手動核對(是，且無警示無手動修改)＝橘色 > 外部匯入(是，且以上皆無)＝藍色。
+// 整列上色，四選一、互斥（每列一定會落在其中一種，不會沒有顏色）：
+// 錯誤(紅燈)：曾觸發警示(是)——真的掃錯商品或超量掃描。
+// 警示(橘燈)：沒有錯誤，但曾手動修改數量或曾無條碼手動核對——過程有人工介入，值得留意但不算出錯。
+// 完成(藍燈)：沒有錯誤也沒有警示，但是外部匯入的紀錄——不是這個系統掃描出來的，來源不同特別標示。
+// 正確(綠燈)：以上皆非，全程正常掃描完成，沒有任何人工介入——最單純、最理想的狀態。
 function setupLogSheetColors(){
   const sh = getSheet(SHEET_LOG, LOG_HEADER);
   const numCols = LOG_HEADER.length;
@@ -489,24 +492,28 @@ function setupLogSheetColors(){
   const importedExternalCol = colLetter(colOf(LOG_HEADER,'importedExternal'));
   const hadNoBarcodeConfirmCol = colLetter(colOf(LOG_HEADER,'hadNoBarcodeConfirm'));
   const rules = [
+    // 紅燈：錯誤
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied(`=$${hadIssueCol}2="是"`)
       .setBackground('#f4cccc')
       .setRanges([fullRange])
       .build(),
+    // 橘燈：警示（人工修正數量 或 無條碼手動核對，但沒有真的出錯）
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2="是")`)
-      .setBackground('#fff2cc')
-      .setRanges([fullRange])
-      .build(),
-    SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${hadNoBarcodeConfirmCol}2="是")`)
+      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",OR($${hadManualEditCol}2="是",$${hadNoBarcodeConfirmCol}2="是"))`)
       .setBackground('#fce5cd')
       .setRanges([fullRange])
       .build(),
+    // 藍燈：完成（外部匯入的紀錄，且沒有錯誤也沒有警示）
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${hadNoBarcodeConfirmCol}2<>"是",$${importedExternalCol}2="是")`)
       .setBackground('#cfe2f3')
+      .setRanges([fullRange])
+      .build(),
+    // 綠燈：正確（以上皆非，全程正常掃描完成）
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${hadNoBarcodeConfirmCol}2<>"是",$${importedExternalCol}2<>"是")`)
+      .setBackground('#d9ead3')
       .setRanges([fullRange])
       .build()
   ];
