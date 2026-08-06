@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.14';
+const BACKEND_VERSION = '2026-08-05.15';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -70,6 +70,7 @@ function doPost(e){
       case 'finalizeShipment': result = finalizeShipment(body.entry); break;
       case 'importShippedBatch': result = importShippedBatch(body.entries || []); break;
       case 'setStaffList': result = setStaffList(body.staff || []); break;
+      case 'runOneTimeSetup': result = runOneTimeSetup(body.name); break;
       default: result = {ok:false, error:'unknown action: '+body.action};
     }
     return respond(result);
@@ -82,6 +83,24 @@ function doPost(e){
 
 function respond(obj){
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// Apps Script編輯器裡「選取函式來執行」下拉選單偶爾會卡住/漏列某些函式（曾經實際發生過，
+// 重新整理、重開分頁都沒用），這裡開一個白名單讓一次性設定/修復函式也能直接用API觸發，
+// 不用完全依賴那個下拉選單。只有白名單內的名字可以被呼叫，不能任意呼叫檔案裡其他函式。
+const ONE_TIME_SETUP_FUNCTIONS = {
+  migrateLogToPerItemFormat_: () => migrateLogToPerItemFormat_(),
+  migrateOrdersColumnShift: () => migrateOrdersColumnShift(),
+  setupLogSheetColors: () => setupLogSheetColors(),
+  deleteLegacyEmptySheets: () => deleteLegacyEmptySheets(),
+  setupImportedMirrorSheets: () => setupImportedMirrorSheets(),
+  rebuildOrderDetailSheet_: () => rebuildOrderDetailSheet_()
+};
+function runOneTimeSetup(name){
+  const fn = ONE_TIME_SETUP_FUNCTIONS[name];
+  if(!fn) return {ok:false, error:'unknown setup function: '+name};
+  fn();
+  return {ok:true, ran:name};
 }
 
 function getSheet(name, header){
@@ -472,6 +491,12 @@ function migrateLogToPerItemFormat_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const OLD_LOG_HEADER = ['orderNo','orderDate','waybill','itemsJson','skuSummary','nameSummary','staffId','staffName','time','hadIssue','hadManualEdit','importedExternal','store','shipMethod','note','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','startTime'];
   const oldSh = ss.getSheetByName(SHEET_LOG);
+  // 防止重複執行：新格式第4欄標題是「品名」，舊格式第4欄標題是「品項資料(JSON)」。
+  // 已經跑過一次的話這裡會直接偵測到並跳過，不會把已經轉換好的資料再誤當成舊格式處理一次。
+  if(oldSh && oldSh.getRange(1,4).getValue() === HEADER_LABELS['baseName']){
+    Logger.log('出貨紀錄第4欄標題已經是「'+HEADER_LABELS['baseName']+'」，看起來已經轉換過了，不重複執行。');
+    return;
+  }
   const oldEntries = [];
   if(oldSh){
     const lastRow = oldSh.getLastRow();
