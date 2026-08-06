@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.18';
+const BACKEND_VERSION = '2026-08-06.19';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -104,6 +104,9 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   deleteTestOrders_: () => deleteTestOrders_(),
   fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
   fixScannedCountCheckmark_: () => fixScannedCountCheckmark_(),
+  autoSyncOrders_: () => autoSyncOrders_(),
+  backupAndClearShippingLog_: () => backupAndClearShippingLog_(),
+  installAutomationTriggers_: () => installAutomationTriggers_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
   mergeVerifyStatusIntoCheckResult_: () => mergeVerifyStatusIntoCheckResult_(),
@@ -308,6 +311,135 @@ function mergeOrders(incoming){
   });
   rebuildOrderDetailSheet_();
   return {ok:true, added, updated, skippedShipped};
+}
+
+// ---------------- 自動排程：配合蝦皮隔日到貨，一天四次自動同步訂單，不用等人手動按同步鈕 ----------------
+// 直接讀「文山出貨V2」鏡像分頁本身（IMPORTRANGE即時同步自真正源頭），不用像前端那樣還要fetch
+// CSV文字自己解析——Apps Script可以直接用SpreadsheetApp拿到已經解析好型別的儲存格值，比較穩。
+// 邏輯完全比照 index.html 的 syncOrders()：用「訂單」「品號」「數量」三欄判斷資料完整性，
+// 用「訂單狀態」欄篩選只留本倉（文山）負責的訂單，同一張訂單同一個品號的數量會加總。
+// 週六日／國定假日／颱風假不出貨：這裡完全不用特別處理，觸發器照排程執行，
+// 只是那幾天源頭多半沒有「文山」狀態的新資料、同步等於空跑，訂單本身會照樣累積在「訂單」
+// 分頁等到下一個營業日才被掃描出貨，跟平常一模一樣，不需要另外寫假日判斷邏輯。
+const HANDLED_ROUTING_STATUS = '文山';
+const MIRROR_ORDER_SHEET_NAME = '文山出貨V2';
+function autoSyncOrders_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(MIRROR_ORDER_SHEET_NAME);
+  if(!sh){ Logger.log('找不到「'+MIRROR_ORDER_SHEET_NAME+'」鏡像分頁，無法自動同步'); return; }
+  const values = sh.getDataRange().getValues();
+  if(values.length < 2){ Logger.log('鏡像分頁目前沒有資料列，略過這次自動同步'); return; }
+  const header = values[0];
+  const idx = name => header.indexOf(name);
+  const iOrder = idx('訂單'), iSku = idx('品號'), iName = idx('品名'), iSpec = idx('規格'),
+        iQty = idx('數量'), iStore = idx('賣場'), iDate = idx('日期'), iStatus = idx('訂單狀態'),
+        iShipMethod = idx('寄送方式');
+  if(iOrder < 0 || iSku < 0 || iQty < 0){
+    Logger.log('鏡像分頁欄位格式不符（找不到訂單/品號/數量欄），無法自動同步');
+    return;
+  }
+
+  const parsed = {};
+  let skippedRows = 0, skippedOtherWarehouse = 0;
+  for(let i = 1; i < values.length; i++){
+    const row = values[i];
+    const orderNo = String(row[iOrder]||'').trim();
+    const sku = String(row[iSku]||'').trim();
+    const qty = parseInt(row[iQty], 10);
+    if(!orderNo || !sku || isNaN(qty)){ skippedRows++; continue; }
+    if(iStatus >= 0){
+      const status = String(row[iStatus]||'').trim();
+      if(status && status !== HANDLED_ROUTING_STATUS){ skippedOtherWarehouse++; continue; }
+    }
+    const spec = iSpec>=0 ? String(row[iSpec]||'').trim() : '';
+    const baseName = iName>=0 ? String(row[iName]||'').trim() : sku;
+    const name = spec ? `${baseName}（${spec}）` : baseName;
+    const store = iStore>=0 ? String(row[iStore]||'').trim() : '';
+    const date = iDate>=0 ? parseOrderDate_(row[iDate]) : '';
+    const shipMethod = iShipMethod>=0 ? String(row[iShipMethod]||'').trim() : '';
+    const routingStatus = iStatus>=0 ? String(row[iStatus]||'').trim() : '';
+    if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, routingStatus, items:[]};
+    const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
+    if(existingItem) existingItem.qty += qty;
+    else parsed[orderNo].items.push({sku, name, baseName, spec, qty});
+  }
+
+  const result = mergeOrders(parsed);
+  Logger.log('自動同步完成：新增'+result.added+'／更新'+result.updated+'／已出貨略過'+result.skippedShipped
+    +'，非本倉略過'+skippedOtherWarehouse+'，資料欄位不全略過'+skippedRows+'。');
+}
+
+// 跟 index.html 的 parseOrderDate()/excelSerialToDateStr() 邏輯對應：純數字字串當Excel序列日期換算，
+// 一般字串取空白前的日期部分。多一種SpreadsheetApp才會遇到的情況：儲存格本身已經是Date型別
+// （getValues()讀到的是真正的Date物件，不是CSV那種一定是文字），直接用cellToText()的邏輯格式化。
+function parseOrderDate_(raw){
+  if(raw instanceof Date){
+    return Utilities.formatDate(raw, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy/M/d');
+  }
+  const s = String(raw||'').trim();
+  if(!s) return '';
+  if(/^\d+(\.\d+)?$/.test(s)){
+    const ms = Math.round((Number(s) - 25569) * 86400 * 1000);
+    return Utilities.formatDate(new Date(ms), 'UTC', 'yyyy/M/d');
+  }
+  return s.split(' ')[0];
+}
+
+// ---------------- 自動排程：每天晚上把「出貨紀錄」備份成獨立試算表，備份完清空準備隔天使用 ----------------
+// 出貨紀錄不會無限長大（對照效能：整批讀取的耗時會隨資料量增加），也符合使用者要的
+// 「備份後清空舊資料，尚未出貨的新資料繼續照樣累積」——這裡的「舊資料」單純指出貨紀錄本身，
+// 「訂單」分頁裡還沒出貨的訂單完全不受影響，繼續留著等下一個營業日被掃描（週末/假日也一樣）。
+// 同名檔案已存在就先丟垃圾桶再建新的，同一天重跑不會留下好幾份重複的備份檔。
+const SHIPPING_LOG_BACKUP_FOLDER_ID = '1fC7kFv-6ozYmrY1S_up55R_yslcu2qYE';
+function backupAndClearShippingLog_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if(lastRow < 2){ Logger.log('出貨紀錄目前沒有資料，略過備份與清空'); return; }
+
+  const tz = ss.getSpreadsheetTimeZone();
+  const fileName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_已出貨備份';
+  const allValues = sh.getRange(1, 1, lastRow, lastCol).getValues();
+
+  const folder = DriveApp.getFolderById(SHIPPING_LOG_BACKUP_FOLDER_ID);
+  const existing = folder.getFilesByName(fileName);
+  while(existing.hasNext()){ existing.next().setTrashed(true); }
+
+  const backupSs = SpreadsheetApp.create(fileName);
+  const backupSh = backupSs.getSheets()[0];
+  backupSh.setName(SHEET_LOG);
+  backupSh.getRange(1, 1, allValues.length, lastCol).setValues(allValues);
+  const backupFile = DriveApp.getFileById(backupSs.getId());
+  folder.addFile(backupFile);
+  DriveApp.getRootFolder().removeFile(backupFile); // 只留在指定資料夾，不要同時出現在雲端硬碟根目錄
+
+  sh.getRange(2, 1, lastRow - 1, lastCol).clearContent(); // 只清內容，條件式格式規則不會被清掉，明天新資料一樣自動套色
+  Logger.log('已備份 '+(allValues.length-1)+' 列出貨紀錄到「'+fileName+'」，並清空出貨紀錄分頁準備明天使用。');
+}
+
+// ---------------- 一次性設定用：安裝上面兩組自動排程的時間觸發器 ----------------
+// 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（觸發器的建立需要授權，
+// 透過API用HTTP呼叫可能拿不到，這一步比照之前DriveApp授權的做法，用編輯器手動跑一次比較保險）。
+// 會先清掉這兩個函式名稱底下所有舊觸發器再重新建立，重複執行不會裝出好幾份一樣的排程。
+// 注意：Apps Script的時間觸發器本身不保證精準命中指定的分鐘數（Google官方文件說明會有數十分鐘
+// 內的誤差空間），9:00/9:15、14:05/14:15這種只差10-15分鐘的排程實際執行時間可能會前後飄動、
+// 甚至順序調換——但因為mergeOrders()本來就是「同步現況」的概念，同一天重複執行/順序調換
+// 都不會有副作用（只是把「訂單」分頁同步到源頭當下最新的樣子），不影響最終結果只是可能差幾分鐘。
+function installAutomationTriggers_(){
+  const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_'];
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
+  });
+
+  [[9,0],[9,15],[14,5],[14,15]].forEach(([h,m])=>{
+    ScriptApp.newTrigger('autoSyncOrders_').timeBased().atHour(h).nearMinute(m).everyDays(1).create();
+  });
+  ScriptApp.newTrigger('backupAndClearShippingLog_').timeBased().atHour(20).nearMinute(0).everyDays(1).create();
+
+  Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)，共'
+    +ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
 // ---------------- 「訂單明細」分頁：一列一品項，方便直接在試算表裡肉眼看 ----------------
