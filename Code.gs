@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.19';
+const BACKEND_VERSION = '2026-08-06.20';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -162,6 +162,10 @@ function authorizeDriveAccess_(){
   const testFile = folder.createFile('_授權測試_可刪除', '測試寫入權限', MimeType.PLAIN_TEXT);
   testFile.setTrashed(true);
   Logger.log('雲端硬碟授權成功（讀寫都已確認）');
+  // 建立/管理時間觸發器（installAutomationTriggers_要用）也是獨立的授權範圍，跟DriveApp分開，
+  // 這裡一併順便觸發，不用再為了這個另外跑一次授權流程。
+  ScriptApp.getProjectTriggers();
+  Logger.log('時間觸發器管理權限授權成功。');
 }
 
 function getSheet(name, header){
@@ -921,6 +925,7 @@ function deleteTestOrders_(){
 // 執行前已經人工核對過 Orders/Log/Staff/工作表1 都只剩表頭或完全空白，資料都在
 // 訂單/出貨紀錄/人員 這三個中文分頁裡，刪除這幾個不會遺失任何資料。
 function deleteLegacyEmptySheets(){
+  authorizeDriveAccess_(); // 暫時性：借這個一定找得到的函式觸發時間觸發器的授權，授權完成後這行會刪掉
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const namesToDelete = ['Orders', 'Log', 'Staff', '工作表1'];
   const deleted = [];
