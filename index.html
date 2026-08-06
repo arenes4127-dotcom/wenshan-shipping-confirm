@@ -897,6 +897,7 @@ inputOrder.addEventListener('keydown', async e=>{
   current.items.forEach(i=>i.scanned=0);
   current.hadIssue = false;
   current.hadManualEdit = false;
+  current.hadNoBarcodeConfirm = false; // 這次出貨有沒有用過「找不到條碼，手動核對」
   current.issueLog = []; // 差異明細：這次掃描過程中實際發生了什麼問題（不是只有真/假）
   document.getElementById('stage-order').style.display='none';
   document.getElementById('stage-items').style.display='block';
@@ -954,8 +955,12 @@ function renderItemTable(){
     if(i.scanned>i.qty){ cls='over'; label='<span class="tag danger">超量</span>'; }
     else if(i.scanned===i.qty){ cls='ok'; label='<span class="tag ok">OK</span>'; }
     tr.className=cls;
+    const skuEsc = i.sku.replace(/'/g,"\\'");
     tr.innerHTML = `<td>${i.sku}</td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
-      `<td><button class="btn gray sm" onclick="adjustScanned('${i.sku.replace(/'/g,"\\'")}')">修改</button></td>`;
+      `<td style="white-space:nowrap;">`+
+      `<button class="btn gray sm" onclick="adjustScanned('${skuEsc}')">修改</button> `+
+      `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button>`+
+      `</td>`;
     tbody.appendChild(tr);
   });
   document.getElementById('progressDone').textContent=done;
@@ -991,6 +996,27 @@ function adjustScanned(sku){
   current.issueLog.push(`人工修正：「${item.name}」（${item.sku}）已掃數量從 ${before} 改為 ${val}`);
   renderItemTable();
   checkComplete(true);
+}
+
+// 商品本身沒貼條碼掃不到時的手動核對：一次只確認一件（跟正常掃描一樣一件一件累加，
+// 不是直接把數量設到滿），避免包貨人員一次按太多次不小心多算。會記錄進差異明細方便事後稽核，
+// 跟真的掃描出錯（hadIssue）分開用 hadNoBarcodeConfirm 標記，不會混在一起稀釋「曾觸發警示」的意義。
+function confirmNoBarcode(sku){
+  if(!current) return;
+  const item = current.items.find(i=>i.sku===sku);
+  if(!item) return;
+  if(item.scanned >= item.qty){
+    errorBeep();
+    flash('err','數量超過', `「${item.name}」已達應出數量，請勿重複確認`, 1200);
+    return;
+  }
+  if(!confirm(`「${item.name}」（${item.sku}）確定要手動核對這一件嗎？\n（商品沒貼條碼才用這個，會記錄在差異明細供事後稽核）`)) return;
+  item.scanned++;
+  current.hadNoBarcodeConfirm = true;
+  current.issueLog.push(`無條碼手動核對：「${item.name}」（${item.sku}）第 ${item.scanned}/${item.qty} 件`);
+  okBeep();
+  renderItemTable();
+  checkComplete();
 }
 
 function setPill(kind, text){
@@ -1032,6 +1058,7 @@ async function finalizeShipment(){
   const scannedCount = current.items.reduce((s,i)=>s+i.scanned,0);
   let checkResult = '完成';
   if(current.hadManualEdit) checkResult += '（人工修正數量）';
+  if(current.hadNoBarcodeConfirm) checkResult += '（含無條碼手動核對）';
   const differenceDetails = (current.issueLog && current.issueLog.length) ? current.issueLog.join('；') : '無差異';
   const entry = {
     orderNo: current.orderNo,
@@ -1043,6 +1070,7 @@ async function finalizeShipment(){
     startTime: current.claimedAt ? new Date(current.claimedAt).toLocaleString('zh-TW') : '',
     hadIssue: !!current.hadIssue,
     hadManualEdit: !!current.hadManualEdit,
+    hadNoBarcodeConfirm: !!current.hadNoBarcodeConfirm,
     store: current.store || '',
     shipMethod: current.shipMethod || '',
     requiredCount, scannedCount,

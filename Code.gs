@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.19';
+const BACKEND_VERSION = '2026-08-06.1';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -37,7 +37,8 @@ const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSu
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
 // 這樣原本另外開的「出貨紀錄明細」分頁就不需要了，兩個分頁合併成這一個。
 // 同一次出貨如果有N個品項，出貨紀錄就會連續寫N列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複顯示。
-const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note'];
+// hadNoBarcodeConfirm 加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
+const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -50,7 +51,8 @@ const HEADER_LABELS = {
   shipMethod:'寄送方式', note:'備註', id:'工號', name:'姓名',
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
-  baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量'
+  baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
+  hadNoBarcodeConfirm:'曾無條碼手動核對'
 };
 
 function doGet(e){
@@ -164,7 +166,8 @@ function getState(){
         importedExternal: textToBool(r.importedExternal), store: r.store, shipMethod: r.shipMethod, note: r.note,
         requiredCount: r.requiredCount || '', scannedCount: r.scannedCount || '',
         routingStatus: r.routingStatus || '', checkResult: r.checkResult || '',
-        differenceDetails: r.differenceDetails || '', startTime: cellToText(r.startTime, true) || ''
+        differenceDetails: r.differenceDetails || '', startTime: cellToText(r.startTime, true) || '',
+        hadNoBarcodeConfirm: textToBool(r.hadNoBarcodeConfirm)
       };
       logKeyOrder.push(key);
     }
@@ -361,7 +364,8 @@ function appendLogRow(entry){
       // 後面幾列品項留空，不要每一列都重複顯示同一組總數字，容易誤會成是那個品項自己的數量。
       requiredCount: idx===0 ? (entry.requiredCount||0) : '', scannedCount: idx===0 ? (entry.scannedCount||0) : '',
       routingStatus: entry.routingStatus||'',
-      checkResult: entry.checkResult||'', differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||'')
+      checkResult: entry.checkResult||'', differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||''),
+      hadNoBarcodeConfirm: boolToText(entry.hadNoBarcodeConfirm)
     };
     return LOG_HEADER.map(h=>rowObj[h]);
   });
@@ -470,7 +474,7 @@ function deleteLegacyEmptySheets(){
 // 設定的是「條件式格式」，套一次之後，之後每一筆新的出貨紀錄會自動套用顏色，
 // 不用每次寫入資料時都重新設定一次。
 // 整列上色，依優先順序：曾觸發警示(是)＝紅色 > 曾手動修改數量(是，且無警示)＝黃色 >
-// 外部匯入(是，且無警示無手動修改)＝藍色。
+// 曾無條碼手動核對(是，且無警示無手動修改)＝橘色 > 外部匯入(是，且以上皆無)＝藍色。
 function setupLogSheetColors(){
   const sh = getSheet(SHEET_LOG, LOG_HEADER);
   const numCols = LOG_HEADER.length;
@@ -483,6 +487,7 @@ function setupLogSheetColors(){
   const hadIssueCol = colLetter(colOf(LOG_HEADER,'hadIssue'));
   const hadManualEditCol = colLetter(colOf(LOG_HEADER,'hadManualEdit'));
   const importedExternalCol = colLetter(colOf(LOG_HEADER,'importedExternal'));
+  const hadNoBarcodeConfirmCol = colLetter(colOf(LOG_HEADER,'hadNoBarcodeConfirm'));
   const rules = [
     SpreadsheetApp.newConditionalFormatRule()
       .whenFormulaSatisfied(`=$${hadIssueCol}2="是"`)
@@ -495,7 +500,12 @@ function setupLogSheetColors(){
       .setRanges([fullRange])
       .build(),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${importedExternalCol}2="是")`)
+      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${hadNoBarcodeConfirmCol}2="是")`)
+      .setBackground('#fce5cd')
+      .setRanges([fullRange])
+      .build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=AND($${hadIssueCol}2<>"是",$${hadManualEditCol}2<>"是",$${hadNoBarcodeConfirmCol}2<>"是",$${importedExternalCol}2="是")`)
       .setBackground('#cfe2f3')
       .setRanges([fullRange])
       .build()
