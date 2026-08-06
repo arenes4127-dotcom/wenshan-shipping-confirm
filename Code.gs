@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-05.18';
+const BACKEND_VERSION = '2026-08-05.19';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -96,7 +96,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   deleteLegacyEmptySheets: () => deleteLegacyEmptySheets(),
   setupImportedMirrorSheets: () => setupImportedMirrorSheets(),
   rebuildOrderDetailSheet_: () => rebuildOrderDetailSheet_(),
-  deleteTestOrders_: () => deleteTestOrders_()
+  deleteTestOrders_: () => deleteTestOrders_(),
+  fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_()
 };
 function runOneTimeSetup(name){
   const fn = ONE_TIME_SETUP_FUNCTIONS[name];
@@ -349,19 +350,47 @@ function appendLogRow(entry){
   logSh.getRange(startRow, colOf(LOG_HEADER,'orderDate'), items.length, 1).setNumberFormat('@');
   logSh.getRange(startRow, colOf(LOG_HEADER,'time'), items.length, 1).setNumberFormat('@');
   logSh.getRange(startRow, colOf(LOG_HEADER,'startTime'), items.length, 1).setNumberFormat('@');
-  const rows = items.map(it=>{
+  const rows = items.map((it, idx)=>{
     const rowObj = {
       orderNo: entry.orderNo, orderDate: String(entry.orderDate||''), waybill: entry.waybill||'',
       baseName: it.baseName || it.name || '', spec: it.spec || '', sku: it.sku || '', qty: it.qty || 0, scanned: it.scanned || 0,
       staffId: entry.staffId||'', staffName: entry.staffName||'', time: String(entry.time||''),
       hadIssue: boolToText(entry.hadIssue), hadManualEdit: boolToText(entry.hadManualEdit), importedExternal: boolToText(entry.importedExternal),
       store: entry.store||'', shipMethod: entry.shipMethod||'', note: entry.note||'',
-      requiredCount: entry.requiredCount||0, scannedCount: entry.scannedCount||0, routingStatus: entry.routingStatus||'',
+      // 需求件數／掃描件數是整張訂單的加總，不是這一列品項自己的數量——只填在該訂單第一列，
+      // 後面幾列品項留空，不要每一列都重複顯示同一組總數字，容易誤會成是那個品項自己的數量。
+      requiredCount: idx===0 ? (entry.requiredCount||0) : '', scannedCount: idx===0 ? (entry.scannedCount||0) : '',
+      routingStatus: entry.routingStatus||'',
       checkResult: entry.checkResult||'', differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||'')
     };
     return LOG_HEADER.map(h=>rowObj[h]);
   });
   logSh.getRange(startRow, 1, rows.length, LOG_HEADER.length).setValues(rows);
+}
+
+// ---------------- 一次性修復用：把既有出貨紀錄裡重複顯示的需求件數／掃描件數清乾淨 ----------------
+// 這兩欄改成「只顯示在該訂單第一列」之前寫入的資料，每個品項列都重複著同一組總數字。
+// 這裡依「訂單號+完成時間」分組（跟getState()用的分組邏輯一樣），同一組裡除了第一列，
+// 其餘列的需求件數／掃描件數清空。用colOf()動態抓欄位，不管欄位順序後來又怎麼調都不受影響。
+function fixRequiredScannedCountDisplay_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const requiredCol = colOf(LOG_HEADER,'requiredCount');
+  const scannedCol = colOf(LOG_HEADER,'scannedCount');
+  const seenKeys = {};
+  let cleared = 0;
+  rows.forEach(r=>{
+    const key = r.orderNo + '||' + r.time;
+    if(seenKeys[key]){
+      sh.getRange(r._row, requiredCol).setValue('');
+      sh.getRange(r._row, scannedCol).setValue('');
+      cleared++;
+    } else {
+      seenKeys[key] = true;
+    }
+  });
+  Logger.log('已清空 '+cleared+' 列非該訂單第一列的需求件數／掃描件數重複值。');
 }
 
 // ---------------- 批次匯入已出貨紀錄（指定出貨Excel那個功能用） ----------------
