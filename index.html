@@ -1089,8 +1089,15 @@ async function finalizeShipment(){
       // 明確告知使用者實際狀況，而不是讓畫面看起來像「又成功出貨了一次」。
       if(result && result.ok === false && result.reason === 'already_shipped'){
         alreadyShipped = true;
+        await refreshFromBackend(true); // 真的衝突了，這時候才值得花一次網路來回把權威資料抓回來對齊
+      } else {
+        // 後端已經成功寫入，不用再整批重新抓一次資料才能繼續（那要多等一次Apps Script來回，
+        // 完成出貨的按鈕會卡住比較久）。直接更新本機狀態，其他裝置的異動交給20秒背景刷新去同步。
+        if(orders[entry.orderNo]) orders[entry.orderNo].status = 'shipped';
+        log.unshift(entry);
+        saveJSON(LS.orders, orders);
+        saveJSON(LS.log, log);
       }
-      await refreshFromBackend(true);
     } else {
       log.unshift(entry);
       saveJSON(LS.log, log);
@@ -1332,6 +1339,7 @@ if(settings.barcodeSheetUrl){
 // （掃描中的訂單current不會被這個刷新動到，見 refreshFromBackend 只換orders/log/staff）
 setInterval(()=>{
   if(!hasBackend()) return;
+  if(current) return; // 正在掃描中就不要背景刷新，避免搶網路/運算資源影響掃描時的反應速度，等這張訂單掃完再說
   refreshFromBackend(true).then(ok=>{
     if(!ok) return;
     const activeView = document.querySelector('.view.active');
