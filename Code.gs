@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.15';
+const BACKEND_VERSION = '2026-08-06.16';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -37,10 +37,10 @@ const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSu
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
 // 這樣原本另外開的「出貨紀錄明細」分頁就不需要了，兩個分頁合併成這一個。
 // 同一次出貨如果有N個品項，出貨紀錄就會連續寫N列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複顯示。
-// hadNoBarcodeConfirm/noBarcodeDetail 都加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
-// noBarcodeDetail緊接在hadNoBarcodeConfirm後面，剛好同時滿足「相鄰」跟「加在最後面最安全」兩個需求。
-// （原本另外開過一欄「verifyStatus」/「核對狀態」，後來依需求併回「核對結果」欄位本身，欄位已移除。）
-const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm','noBarcodeDetail'];
+// hadNoBarcodeConfirm 加在最後面（不是插進中間）——這樣不會位移到任何既有欄位，不需要再跑一次migration。
+// （原本另外開過一欄「verifyStatus」/「核對狀態」，後來依需求併回「核對結果」欄位本身，欄位已移除；
+// 「無條碼手動核對明細」欄位也是同樣道理，後來依需求併回「差異明細」欄位，改成依貨號分別記錄。）
+const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','differenceDetails','note','hadNoBarcodeConfirm'];
 const STAFF_HEADER = ['id','name'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
@@ -54,7 +54,7 @@ const HEADER_LABELS = {
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
-  hadNoBarcodeConfirm:'曾無條碼手動核對', noBarcodeDetail:'無條碼手動核對明細'
+  hadNoBarcodeConfirm:'曾無條碼手動核對'
 };
 
 function doGet(e){
@@ -106,6 +106,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
   mergeVerifyStatusIntoCheckResult_: () => mergeVerifyStatusIntoCheckResult_(),
+  mergeNoBarcodeDetailIntoDifferenceDetails_: () => mergeNoBarcodeDetailIntoDifferenceDetails_(),
   debugConditionalFormatRules_: () => debugConditionalFormatRules_(),
   authorizeDriveAccess_: () => authorizeDriveAccess_()
 };
@@ -457,6 +458,10 @@ function appendLogRow(entry){
   // 只需要算一次，不用放進.map()裡每個品項都重算一次。
   const verifyStatus = classifyVerifyStatus_(entry);
   const checkResultText = buildCheckResult_(entry, verifyStatus);
+  // entry.differenceDetails是「跟特定品項無關」的訂單層級事件（目前只有：掃到不屬於這張訂單的條碼），
+  // 只會出現在第一列；每個品項「自己」的差異（無條碼手動核對/數量超過/人工修正）由it.itemDifferenceDetails
+  // 帶過來，放在那個品項自己的列，不會像以前那樣把整張訂單所有品項的事件混在同一段文字裡重複顯示。
+  const orderLevelText = (entry.differenceDetails && entry.differenceDetails !== '無差異') ? entry.differenceDetails : '';
   const rows = items.map((it, idx)=>{
     const rowObj = {
       orderNo: entry.orderNo, orderDate: String(entry.orderDate||''), waybill: entry.waybill||'',
@@ -469,11 +474,13 @@ function appendLogRow(entry){
       requiredCount: idx===0 ? (entry.requiredCount||0) : '', scannedCount: idx===0 ? (entry.scannedCount||0) : '',
       routingStatus: entry.routingStatus||'',
       checkResult: checkResultText,
-      differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||''),
-      // 這兩欄是「這個品項自己」有沒有被無條碼手動核對過（不是整張訂單層級），
+      differenceDetails: idx===0
+        ? ([orderLevelText, it.itemDifferenceDetails].filter(Boolean).join('；') || '無差異')
+        : (it.itemDifferenceDetails || ''),
+      startTime: String(entry.startTime||''),
+      // 這一欄是「這個品項自己」有沒有被無條碼手動核對過（不是整張訂單層級），
       // 跟核對結果用的entry.hadNoBarcodeConfirm（訂單裡只要有任一品項用過就算）分開判斷。
-      hadNoBarcodeConfirm: boolToText((it.noBarcodeCount||0) > 0),
-      noBarcodeDetail: (it.noBarcodeCount||0) > 0 ? `${it.sku||''} x${it.noBarcodeCount}件` : ''
+      hadNoBarcodeConfirm: boolToText((it.noBarcodeCount||0) > 0)
     };
     return LOG_HEADER.map(h=>rowObj[h]);
   });
@@ -542,6 +549,78 @@ function mergeVerifyStatusIntoCheckResult_(){
     Logger.log('已刪除舊的獨立「核對狀態」欄位（原第'+(oldVerifyStatusColIdx+1)+'欄）。');
   }
   Logger.log('已重新計算 '+rows.length+' 列的核對結果（併入核對狀態資訊）。');
+}
+
+// ---------------- 一次性修復用：把差異明細改成依貨號分別記錄，並刪掉舊的「無條碼手動核對明細」欄位 ----------------
+// 舊版每一列的差異明細都是整張訂單的事件全部串成一長串文字、每個品項的列都重複顯示同一份，
+// 不容易看出「這個貨號」實際發生了什麼事。這裡把舊差異明細文字拆開，依內容裡出現的貨號分別歸類：
+//   - 找得到對應貨號的片段（數量超過／人工修正／無條碔手動核對，這幾種原本的文字就有帶貨號）
+//     → 簡化成「貨號／規格／處理方式」格式（不帶品名），只放在那個貨號自己的列。
+//   - 找不到對應貨號的片段（目前只有「商品不符」，因為掃到的是根本不屬於這張訂單的條碼）
+//     → 算訂單層級事件，維持原樣只放在該次出貨的第一列。
+// 用標題文字找出舊「無條碼手動核對明細」欄實際在哪一欄，因為LOG_HEADER已經拿掉這個欄位、colOf()查不到。
+function mergeNoBarcodeDetailIntoDifferenceDetails_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const lastCol = sh.getLastColumn();
+  const headerRow = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  const oldNoBarcodeDetailColIdx = headerRow.indexOf('無條碼手動核對明細'); // 0-indexed，-1代表已經處理過或本來就沒有
+
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const differenceDetailsCol = colOf(LOG_HEADER,'differenceDetails');
+
+  const groups = {};
+  const groupOrder = [];
+  rows.forEach(r=>{
+    const key = r.orderNo + '||' + r.time;
+    if(!groups[key]){ groups[key] = []; groupOrder.push(key); }
+    groups[key].push(r);
+  });
+
+  // 把舊格式的一句話簡化成「處理方式」短句，不帶品名；無法辨識的格式就整句原樣保留，不憑空遺失資訊
+  const methodLabel = f=>{
+    if(/^數量超過：/.test(f)) return '數量超過應出數量';
+    let m = f.match(/^無條碼手動核對：.*第\s*(\d+)\/(\d+)\s*件/);
+    if(m) return `無條碼手動核對第${m[1]}件`;
+    m = f.match(/^人工修正：.*已掃數量從\s*(\d+)\s*改為\s*(\d+)/);
+    if(m) return `人工修正數量（${m[1]}→${m[2]}）`;
+    return f;
+  };
+
+  let updated = 0;
+  groupOrder.forEach(key=>{
+    const groupRows = groups[key];
+    const fullText = groupRows[0].differenceDetails || '';
+    const fragments = (fullText && fullText !== '無差異') ? fullText.split('；') : [];
+    const orderLevelFragments = [];
+    const perSkuMethods = {}; // sku -> [處理方式,...]
+
+    fragments.forEach(f=>{
+      const owner = groupRows.find(r=> r.sku && f.indexOf(r.sku) >= 0);
+      if(owner){
+        if(!perSkuMethods[owner.sku]) perSkuMethods[owner.sku] = [];
+        perSkuMethods[owner.sku].push(methodLabel(f));
+      } else {
+        orderLevelFragments.push(f); // 比對不到任何品號，算訂單層級（例如商品不符）
+      }
+    });
+
+    groupRows.forEach((r, idx)=>{
+      const methods = perSkuMethods[r.sku] || [];
+      let rowText = methods.length ? `${r.sku}／${r.spec || '-'}／${methods.join('、')}` : '';
+      if(idx === 0){
+        rowText = [orderLevelFragments.join('；'), rowText].filter(Boolean).join('；') || '無差異';
+      }
+      sh.getRange(r._row, differenceDetailsCol).setValue(rowText);
+      updated++;
+    });
+  });
+
+  if(oldNoBarcodeDetailColIdx >= 0){
+    sh.deleteColumn(oldNoBarcodeDetailColIdx + 1);
+    Logger.log('已刪除舊的獨立「無條碼手動核對明細」欄位（原第'+(oldNoBarcodeDetailColIdx+1)+'欄）。');
+  }
+  Logger.log('已重新整理 '+updated+' 列的差異明細（改成依貨號分別記錄）。');
 }
 
 // ---------------- 一次性修復用：把既有出貨紀錄的核對結果補上燈號emoji ----------------

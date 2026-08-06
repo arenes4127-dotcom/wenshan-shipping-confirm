@@ -894,11 +894,13 @@ inputOrder.addEventListener('keydown', async e=>{
   saveJSON(LS.orders, orders);
 
   current = order;
-  current.items.forEach(i=>{ i.scanned=0; i.noBarcodeCount=0; });
+  // scanned/noBarcodeCount/overScanCount/manualEditHistory 都是「這個品項自己」的紀錄，
+  // 差異明細會依貨號分別組成，不會再把整張訂單所有品項的事件混在同一段文字裡。
+  current.items.forEach(i=>{ i.scanned=0; i.noBarcodeCount=0; i.overScanCount=0; i.manualEditHistory=[]; });
   current.hadIssue = false;
   current.hadManualEdit = false;
   current.hadNoBarcodeConfirm = false; // 這次出貨有沒有用過「找不到條碼，手動核對」
-  current.issueLog = []; // 差異明細：這次掃描過程中實際發生了什麼問題（不是只有真/假）
+  current.issueLog = []; // 差異明細裡「跟特定品項無關」的訂單層級事件（目前只有：掃到不屬於這張訂單的條碼）
   document.getElementById('stage-order').style.display='none';
   document.getElementById('stage-items').style.display='block';
   document.getElementById('curOrderNo').textContent = current.orderNo;
@@ -933,7 +935,7 @@ inputBarcode.addEventListener('keydown', e=>{
   }
   if(item.scanned >= item.qty){
     current.hadIssue = true;
-    current.issueLog.push(`數量超過：「${item.name}」（${item.sku}）已達應出數量 ${item.qty}`);
+    item.overScanCount = (item.overScanCount||0) + 1; // 這個品項自己被多掃了幾次，差異明細只會記在它自己那一列
     errorBeep();
     flash('err','數量超過', `「${item.name}」已達應出數量，請勿重複裝箱`, 1200);
     return;
@@ -993,7 +995,8 @@ function adjustScanned(sku){
   const before = item.scanned;
   item.scanned = val;
   current.hadManualEdit = true;
-  current.issueLog.push(`人工修正：「${item.name}」（${item.sku}）已掃數量從 ${before} 改為 ${val}`);
+  item.manualEditHistory = item.manualEditHistory || [];
+  item.manualEditHistory.push(`${before}→${val}`); // 差異明細只會記在這個品項自己那一列，不會混進其他品項
   renderItemTable();
   checkComplete(true);
 }
@@ -1012,12 +1015,22 @@ function confirmNoBarcode(sku){
   }
   if(!confirm(`「${item.name}」（${item.sku}）確定要手動核對這一件嗎？\n（商品沒貼條碼才用這個，會記錄在差異明細供事後稽核）`)) return;
   item.scanned++;
-  item.noBarcodeCount = (item.noBarcodeCount||0) + 1; // 這個品項本身被無條碼手動核對過幾件，出貨紀錄那邊會列出貨號+這個數字
+  item.noBarcodeCount = (item.noBarcodeCount||0) + 1; // 這個品項本身被無條碼手動核對過幾件，差異明細會記在它自己那一列
   current.hadNoBarcodeConfirm = true;
-  current.issueLog.push(`無條碼手動核對：「${item.name}」（${item.sku}）第 ${item.scanned}/${item.qty} 件`);
   okBeep();
   renderItemTable();
   checkComplete();
+}
+
+// 把這個品項自己發生過的事件組成「貨號／規格／處理方式」格式，不帶品名（品名已經是另外的欄位）。
+// 每個品項只會看到自己的事件，不會像以前那樣把整張訂單所有品項的差異全部串成一長串文字。
+function buildItemDifferenceDetails(item){
+  const methods = [];
+  if(item.overScanCount) methods.push('數量超過應出數量');
+  if(item.manualEditHistory && item.manualEditHistory.length) methods.push(`人工修正數量（${item.manualEditHistory.join('、')}）`);
+  if(item.noBarcodeCount) methods.push(`無條碼手動核對${item.noBarcodeCount}件`);
+  if(!methods.length) return '';
+  return `${item.sku}／${item.spec||'-'}／${methods.join('、')}`;
 }
 
 function setPill(kind, text){
@@ -1065,7 +1078,7 @@ async function finalizeShipment(){
     orderNo: current.orderNo,
     orderDate: current.date || '',
     waybill: waybill,
-    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned,noBarcodeCount:i.noBarcodeCount||0})),
+    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned,noBarcodeCount:i.noBarcodeCount||0,itemDifferenceDetails:buildItemDifferenceDetails(i)})),
     staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
     time: new Date().toLocaleString('zh-TW'),
     startTime: current.claimedAt ? new Date(current.claimedAt).toLocaleString('zh-TW') : '',
