@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.2';
+const BACKEND_VERSION = '2026-08-06.3';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -99,7 +99,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupImportedMirrorSheets: () => setupImportedMirrorSheets(),
   rebuildOrderDetailSheet_: () => rebuildOrderDetailSheet_(),
   deleteTestOrders_: () => deleteTestOrders_(),
-  fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_()
+  fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
+  fixCheckResultEmoji_: () => fixCheckResultEmoji_()
 };
 function runOneTimeSetup(name){
   const fn = ONE_TIME_SETUP_FUNCTIONS[name];
@@ -341,6 +342,16 @@ function finalizeShipment(entry){
   return {ok:true};
 }
 
+// 跟 setupLogSheetColors() 整列上色用的是同一套四選一分類邏輯，這裡額外把對應的燈號emoji
+// 直接寫進「核對結果」文字後面，這樣即使沒開啟顏色格式（例如匯出CSV、手機小螢幕看不清楚背景色）
+// 也能一眼看出這筆是哪一種狀態。
+function classifyLogEmoji_(entry){
+  if(entry.hadIssue) return '🔴';
+  if(entry.hadManualEdit || entry.hadNoBarcodeConfirm) return '🟠';
+  if(entry.importedExternal) return '🔵';
+  return '🟢';
+}
+
 // entry.items 有幾個品項就寫幾列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複填入。
 // 先組成「欄位名稱→值」的物件，再用 LOG_HEADER.map() 依目前欄位順序取值——
 // 這樣以後要調整 LOG_HEADER 欄位順序，這裡完全不用跟著改，不會又發生手動排列的陣列跟欄位順序對不起來的問題。
@@ -364,7 +375,8 @@ function appendLogRow(entry){
       // 後面幾列品項留空，不要每一列都重複顯示同一組總數字，容易誤會成是那個品項自己的數量。
       requiredCount: idx===0 ? (entry.requiredCount||0) : '', scannedCount: idx===0 ? (entry.scannedCount||0) : '',
       routingStatus: entry.routingStatus||'',
-      checkResult: entry.checkResult||'', differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||''),
+      checkResult: (entry.checkResult||'完成') + ' ' + classifyLogEmoji_(entry),
+      differenceDetails: entry.differenceDetails||'', startTime: String(entry.startTime||''),
       hadNoBarcodeConfirm: boolToText(entry.hadNoBarcodeConfirm)
     };
     return LOG_HEADER.map(h=>rowObj[h]);
@@ -395,6 +407,28 @@ function fixRequiredScannedCountDisplay_(){
     }
   });
   Logger.log('已清空 '+cleared+' 列非該訂單第一列的需求件數／掃描件數重複值。');
+}
+
+// ---------------- 一次性修復用：把既有出貨紀錄的核對結果補上燈號emoji ----------------
+// classifyLogEmoji_() 是這次才加的，之前寫入的既有列「核對結果」欄還只是純文字，沒有燈號。
+// 用是否已經含有🔴🟠🔵🟢其中一個字元判斷「補過了沒」，補過的列會跳過，可以放心重複執行。
+function fixCheckResultEmoji_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const checkResultCol = colOf(LOG_HEADER,'checkResult');
+  let fixed = 0;
+  rows.forEach(r=>{
+    const current = String(r.checkResult||'');
+    if(/[🔴🟠🔵🟢]/.test(current)) return; // 已經補過燈號了，跳過
+    const emoji = classifyLogEmoji_({
+      hadIssue: textToBool(r.hadIssue), hadManualEdit: textToBool(r.hadManualEdit),
+      hadNoBarcodeConfirm: textToBool(r.hadNoBarcodeConfirm), importedExternal: textToBool(r.importedExternal)
+    });
+    sh.getRange(r._row, checkResultCol).setValue((current||'完成') + ' ' + emoji);
+    fixed++;
+  });
+  Logger.log('已補上燈號的核對結果：'+fixed+' 列');
 }
 
 // ---------------- 批次匯入已出貨紀錄（指定出貨Excel那個功能用） ----------------
