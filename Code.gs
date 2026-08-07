@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.25';
+const BACKEND_VERSION = '2026-08-06.26';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -116,6 +116,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   backupAndClearShippingLog_: () => backupAndClearShippingLog_(),
   installAutomationTriggers_: () => installAutomationTriggers_(),
   setupOrderManualCloseDropdown_: () => setupOrderManualCloseDropdown_(),
+  setupOrderSheetColors: () => setupOrderSheetColors(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
   archiveShippedOrders_: () => archiveShippedOrders_(),
   previewArchiveShippedOrders_: () => previewArchiveShippedOrders_(),
@@ -278,14 +279,22 @@ function textToBool(v){ return v === true || String(v).indexOf('是') === 0; }
 
 // 「狀態」欄比照是非欄位的做法：試算表裡存繁體中文方便直接看，程式內部（含前端APP）
 // 一律還是用英文代碼判斷，兩邊靠這組對照轉換，不用把散在各處的狀態比較全部改掉。
-const STATUS_LABELS = {pending:'待出貨', scanning:'掃描中', shipped:'已出貨'};
+// 文字後面加燈號emoji的做法跟出貨紀錄的是非欄位一致：即使沒開啟顏色格式（匯出CSV、
+// 手機小螢幕看不清背景色）也能一眼看出狀態。藍＝還在排隊等出貨、橘＝有人正在處理、綠＝完成。
+const STATUS_LABELS = {pending:'待出貨 🔵', scanning:'掃描中 🟠', shipped:'已出貨 🟢'};
 const STATUS_FROM_LABEL = {'待出貨':'pending', '掃描中':'scanning', '已出貨':'shipped'};
 function statusToText(s){ return STATUS_LABELS[s] || s || ''; }
-// 舊資料存的是英文（pending/scanning/shipped），新資料存中文，兩種都要讀得懂——
-// 這樣不跑資料轉換也能正常運作，轉換只是為了讓試算表看起來一致。
+// 三種格式都要讀得懂，才能不強制跑資料轉換也正常運作（轉換只是為了讓試算表看起來一致）：
+//   舊的英文代碼（pending/scanning/shipped）、純中文（待出貨）、中文+燈號（待出貨 🔵）。
+// 中文+燈號用「開頭比對」處理，比照 textToBool() 用 indexOf 的做法，
+// 以後燈號要換或要在後面加字都不用再改這裡。
 function textToStatus(v){
   const s = String(v||'').trim();
-  return STATUS_FROM_LABEL[s] || s;
+  if(STATUS_FROM_LABEL[s]) return STATUS_FROM_LABEL[s];
+  for(const label in STATUS_FROM_LABEL){
+    if(s.indexOf(label) === 0) return STATUS_FROM_LABEL[label];
+  }
+  return s;
 }
 // 讀「訂單」分頁一律走這個，狀態欄在這裡統一轉成英文代碼，
 // 後面所有 row.status === 'shipped' 之類的判斷就完全不用動。
@@ -474,34 +483,67 @@ function backupAndClearShippingLog_(){
 // 主管直接在試算表這一欄用下拉選單挑一個原因，APP的待出貨清單就不會再顯示這張訂單，
 // 但資料列留著不刪，之後要查「這張到底怎麼結掉的」看這一欄就知道。
 // 選單範圍鋪到第1000列，之後新同步進來的訂單也一樣有下拉選單可以選，不用每次重跑。
-// 順便把三種結案原因上不同顏色，直接掃過去就看得出哪些是缺貨/取消、哪些是別的倉出掉的。
+// 顏色規則統一由 setupOrderSheetColors() 一次設定（兩邊分開設定的話會互相覆蓋掉對方的規則）。
 function setupOrderManualCloseDropdown_(){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const col = colOf(ORDERS_HEADER, 'manualClose');
-  const numRows = 999; // 第2列到第1000列
-  const range = sh.getRange(2, col, numRows, 1);
+  const range = sh.getRange(2, col, 999, 1); // 第2列到第1000列
   const rule = SpreadsheetApp.newDataValidation()
     .requireValueInList(MANUAL_CLOSE_OPTIONS, true)
     .setAllowInvalid(false)
     .setHelpText('不是由文山掃描出貨的訂單，選一個結案原因；選了之後APP待出貨清單就不會再顯示這張訂單。')
     .build();
   range.setDataValidation(rule);
+  setupOrderSheetColors(); // 順便把顏色規則一起套上，不用再多跑一個函式
+  Logger.log('已在「訂單」分頁第'+col+'欄（人工結案）裝好下拉選單：'+MANUAL_CLOSE_OPTIONS.join('／')+'，範圍第2~1000列。');
+}
 
-  // 舊的條件式格式規則只清掉「這一欄」的，其他欄位（如果之後有加）不受影響
-  const colLetter = String.fromCharCode(64 + col);
-  const keep = sh.getConditionalFormatRules().filter(r=>
-    !r.getRanges().some(rg=>rg.getColumn() === col && rg.getNumColumns() === 1)
-  );
-  const colorOf = {'出貨完成':'#cfe2f3', '缺貨取消':'#fce5cd', '取消訂單':'#f4cccc'};
+// ---------------- 「訂單」分頁的顏色規則（狀態整列上色 ＋ 人工結案單欄上色）----------------
+// 兩組規則一定要在同一個函式裡一次設定完：Google試算表的條件式格式是「先符合的先套用」，
+// 分兩次 setConditionalFormatRules() 後面那次會整組蓋掉前面那次的規則。
+// 順序也很重要——人工結案那一欄的規則要排在整列規則前面，否則整列的底色會蓋過去，
+// 就看不出那一欄挑的是哪一種結案原因了。
+// 顏色跟「核對結果」燈號同一套語意：藍＝等待中、橘＝進行中/要留意、綠＝完成、紅＝取消。
+function setupOrderSheetColors(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const colLetter = n => String.fromCharCode(64 + n);
+  const numCols = ORDERS_HEADER.length;
+  const numRows = 999; // 第2列到第1000列，之後新同步進來的訂單也會自動套用
+
+  const closeCol = colOf(ORDERS_HEADER, 'manualClose');
+  const closeRange = sh.getRange(2, closeCol, numRows, 1);
+  const closeLetter = colLetter(closeCol);
+  const statusLetter = colLetter(colOf(ORDERS_HEADER, 'status'));
+  const fullRange = sh.getRange(2, 1, numRows, numCols);
+
+  const rules = [];
+  // 1. 人工結案欄（單欄，優先）
+  const closeColor = {'出貨完成':'#cfe2f3', '缺貨取消':'#fce5cd', '取消訂單':'#f4cccc'};
   MANUAL_CLOSE_OPTIONS.forEach(opt=>{
-    keep.push(SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=$${colLetter}2="${opt}"`)
-      .setBackground(colorOf[opt])
-      .setRanges([range])
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${closeLetter}2="${opt}"`)
+      .setBackground(closeColor[opt])
+      .setRanges([closeRange])
       .build());
   });
-  sh.setConditionalFormatRules(keep);
-  Logger.log('已在「訂單」分頁第'+col+'欄（人工結案）裝好下拉選單：'+MANUAL_CLOSE_OPTIONS.join('／')+'，範圍第2~1000列。');
+  // 2. 已經人工結案的訂單整列打灰，一眼看出這張不用出（比狀態本身的顏色優先）
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied(`=$${closeLetter}2<>""`)
+    .setBackground('#e0e0e0')
+    .setRanges([fullRange])
+    .build());
+  // 3. 依狀態整列上色。狀態欄存的是「待出貨 🔵」這種中文+燈號，
+  //    用 LEFT(...,3) 只比對前三個中文字，燈號之後要換也不用回頭改這裡。
+  const statusColor = {'待出貨':'#cfe2f3', '掃描中':'#fce5cd', '已出貨':'#d9ead3'};
+  Object.keys(statusColor).forEach(label=>{
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=LEFT($${statusLetter}2,3)="${label}"`)
+      .setBackground(statusColor[label])
+      .setRanges([fullRange])
+      .build());
+  });
+  sh.setConditionalFormatRules(rules);
+  Logger.log('已套用「訂單」分頁顏色規則：待出貨(藍)／掃描中(橘)／已出貨(綠)，人工結案整列打灰，共'+rules.length+'條規則。');
 }
 
 // ---------------- 一次性修復用：把「訂單」分頁既有的英文狀態值換成繁體中文 ----------------
@@ -516,13 +558,15 @@ function migrateOrderStatusToChinese_(){
   const range = sh.getRange(2, col, lastRow-1, 1);
   const values = range.getValues();
   let changed = 0;
+  // 英文代碼、純中文、中文+燈號 都先用 textToStatus() 轉回代碼，再統一寫成目前的標準寫法，
+  // 所以不管跑幾次、之前是哪一種格式，跑完都會變成一致的「中文 + 燈號」。
   const out = values.map(([v])=>{
-    const s = String(v||'').trim();
-    if(STATUS_LABELS[s]){ changed++; return [STATUS_LABELS[s]]; } // 英文代碼→中文
-    return [v]; // 已經是中文（或空白）就原樣保留
+    const label = STATUS_LABELS[textToStatus(v)];
+    if(label && label !== String(v||'').trim()){ changed++; return [label]; }
+    return [v];
   });
   if(changed) range.setValues(out);
-  Logger.log('已把 '+changed+' 列的狀態從英文代碼轉成繁體中文（共'+values.length+'列）。');
+  Logger.log('已把 '+changed+' 列的狀態統一成「中文＋燈號」寫法（共'+values.length+'列）。');
 }
 
 // ---------------- 自動排程：已出貨訂單定期歸檔，避免「訂單」分頁無限長大 ----------------
