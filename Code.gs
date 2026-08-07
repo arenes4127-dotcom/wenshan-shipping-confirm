@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.26';
+const BACKEND_VERSION = '2026-08-06.27';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -362,6 +362,10 @@ function mergeOrders(incoming){
     if(existing) updated++; else added++;
   });
   rebuildOrderDetailSheet_();
+  // 顏色規則的範圍依實際列數計算，所以每次同步完（訂單列數可能變多）都要重新套用一次，
+  // 新增的訂單才不會落在規則範圍外變成沒有顏色。順便也有自動修復的效果：
+  // 萬一哪個一次性函式把分頁重建掉、規則跟著消失，下一次同步就會自己補回來。
+  setupOrderSheetColors();
   return {ok:true, added, updated, skippedShipped};
 }
 
@@ -508,7 +512,11 @@ function setupOrderSheetColors(){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const colLetter = n => String.fromCharCode(64 + n);
   const numCols = ORDERS_HEADER.length;
-  const numRows = 999; // 第2列到第1000列，之後新同步進來的訂單也會自動套用
+  // 範圍不要寫死一個固定數字（寫死1000的話訂單累積超過就默默沒顏色，不會有任何錯誤訊息），
+  // 改成依目前實際列數再多留200列緩衝，並且在 mergeOrders() 每次同步完重新套用一次，
+  // 這樣不管訂單累積到幾列都不會漏掉，分頁被重建導致規則消失也會自動補回來。
+  const lastRow = Math.max(sh.getLastRow(), 2);
+  const numRows = Math.max(Math.min(lastRow - 1 + 200, sh.getMaxRows() - 1), 1);
 
   const closeCol = colOf(ORDERS_HEADER, 'manualClose');
   const closeRange = sh.getRange(2, closeCol, numRows, 1);
@@ -532,18 +540,20 @@ function setupOrderSheetColors(){
     .setBackground('#e0e0e0')
     .setRanges([fullRange])
     .build());
-  // 3. 依狀態整列上色。狀態欄存的是「待出貨 🔵」這種中文+燈號，
-  //    用 LEFT(...,3) 只比對前三個中文字，燈號之後要換也不用回頭改這裡。
+  // 3. 依狀態整列上色。狀態欄存的是「待出貨 🔵」這種中文+燈號，用 LEFT() 只比對前面的中文字，
+  //    取幾個字直接由標籤本身的長度算出來——不要寫死數字，不然哪天狀態改成四個字（例如「待出貨中」）
+  //    比對就會不相等、顏色無聲無息消失。用 LEFT 而不是完整比對，是為了讓還沒加燈號的舊資料也吃得到。
   const statusColor = {'待出貨':'#cfe2f3', '掃描中':'#fce5cd', '已出貨':'#d9ead3'};
   Object.keys(statusColor).forEach(label=>{
     rules.push(SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=LEFT($${statusLetter}2,3)="${label}"`)
+      .whenFormulaSatisfied(`=LEFT($${statusLetter}2,${label.length})="${label}"`)
       .setBackground(statusColor[label])
       .setRanges([fullRange])
       .build());
   });
   sh.setConditionalFormatRules(rules);
-  Logger.log('已套用「訂單」分頁顏色規則：待出貨(藍)／掃描中(橘)／已出貨(綠)，人工結案整列打灰，共'+rules.length+'條規則。');
+  Logger.log('已套用「訂單」分頁顏色規則：待出貨(藍)／掃描中(橘)／已出貨(綠)，人工結案整列打灰，'
+    +'共'+rules.length+'條規則，範圍第2~'+(numRows+1)+'列。');
 }
 
 // ---------------- 一次性修復用：把「訂單」分頁既有的英文狀態值換成繁體中文 ----------------
