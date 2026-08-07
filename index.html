@@ -309,8 +309,8 @@
           <input id="settingSheetUrl" type="text" placeholder="https://docs.google.com/spreadsheets/d/...">
         </label>
         <label class="field">
-          <span>本倉負責的「訂單狀態」標籤（留空＝不篩選，全部匯入）</span>
-          <input id="settingHandledStatus" type="text" placeholder="例如：文山">
+          <span>本倉負責的「訂單狀態」標籤（留空＝自動套用「文山」；要不篩選全部匯入請填「全部」）</span>
+          <input id="settingHandledStatus" type="text" placeholder="文山">
         </label>
       </div>
 
@@ -412,7 +412,19 @@ const OLD_DEFAULT_BARCODE_URL = 'https://docs.google.com/spreadsheets/d/1vCCJS_i
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(LS.settings, {}));
 if(settings.sheetUrl === OLD_DEFAULT_SHEET_URL) settings.sheetUrl = DEFAULT_SETTINGS.sheetUrl;
 if(settings.barcodeSheetUrl === OLD_DEFAULT_BARCODE_URL) settings.barcodeSheetUrl = DEFAULT_SETTINGS.barcodeSheetUrl;
+// 「本倉負責的訂單狀態」如果是空白，原本的行為是「不篩選、全部匯入」——但來源資料裡本來就混著
+// 其他倉／調撥的訂單（實測135列裡有51列是「調中華」「調OM」「山物出」「1」「2」「3」之類，
+// 只有84列是文山），全部匯進來等於讓人員可能掃到根本不該由本倉出的貨。
+// 所以空白一律視為「沒設定」自動補回預設的「文山」；真的要全部匯入請在設定頁明確填「全部」兩個字，
+// 才不會因為欄位被手滑清空就無聲無息把全部倉別混在一起。後端自動排程也是篩「文山」，兩邊一致。
+const IMPORT_ALL_KEYWORD = '全部';
+if(!String(settings.handledStatus||'').trim()) settings.handledStatus = DEFAULT_SETTINGS.handledStatus;
 saveJSON(LS.settings, settings);
+// 回傳實際要拿來比對的訂單狀態；填「全部」代表刻意不篩選，回傳空字串
+function handledStatusFilter(){
+  const v = String(settings.handledStatus||'').trim();
+  return v === IMPORT_ALL_KEYWORD ? '' : v;
+}
 
 // 條碼對照表（國際碼）：條碼 → 品號。掃描商品時如果掃到的是外包裝條碼而不是內部品號，
 // 用這份表轉換過去再比對，跟「文山核對 工作區」原生系統的「轉換品號」欄位同樣邏輯。
@@ -682,9 +694,10 @@ async function syncOrders(){
       const sku = (row[iSku]||'').trim();
       const qty = parseInt(row[iQty], 10);
       if(!orderNo || !sku || isNaN(qty)){ skippedRows++; continue; }
-      if(iStatus>=0 && settings.handledStatus){
+      const handled = handledStatusFilter();
+      if(iStatus>=0 && handled){
         const status = (row[iStatus]||'').trim();
-        if(status && status !== settings.handledStatus){ skippedOtherWarehouse++; continue; }
+        if(status && status !== handled){ skippedOtherWarehouse++; continue; }
       }
       const spec = iSpec>=0 ? (row[iSpec]||'').trim() : '';
       const baseName = iName>=0 ? (row[iName]||'').trim() : sku;
@@ -702,7 +715,7 @@ async function syncOrders(){
     const {added, updated, skippedShipped} = await mergeOrders(parsed);
     settings.lastSyncAt = new Date().toLocaleString('zh-TW');
     saveJSON(LS.settings, settings);
-    const statusLabel = settings.handledStatus ? `「${settings.handledStatus}」` : '';
+    const statusLabel = handledStatusFilter() ? `「${handledStatusFilter()}」` : '';
     msg.className='msg ok';
     msg.textContent = `同步完成：共讀到 ${n} 張${statusLabel}訂單（新增 ${added}／更新 ${updated}／已出貨略過 ${skippedShipped}）`
       + `${skippedOtherWarehouse>0 ? `，${skippedOtherWarehouse} 列非本倉訂單已略過` : ''}`
@@ -1269,7 +1282,10 @@ document.getElementById('btnLoadBarcodeMap').addEventListener('click', async ()=
 });
 document.getElementById('btnSaveSettings').addEventListener('click', async ()=>{
   settings.sheetUrl = document.getElementById('settingSheetUrl').value.trim();
-  settings.handledStatus = document.getElementById('settingHandledStatus').value.trim();
+  // 存檔時清空這欄一樣視為「沒設定」補回預設的「文山」，不要讓它變成無聲無息的全部匯入
+  // （真的要全部匯入請明確填「全部」）；順便把補回來的值寫回畫面，讓使用者看得到實際生效的是什麼。
+  settings.handledStatus = document.getElementById('settingHandledStatus').value.trim() || DEFAULT_SETTINGS.handledStatus;
+  document.getElementById('settingHandledStatus').value = settings.handledStatus;
   settings.backendUrl = document.getElementById('settingBackendUrl').value.trim();
   settings.barcodeSheetUrl = document.getElementById('settingBarcodeUrl').value.trim();
   saveJSON(LS.settings, settings);
