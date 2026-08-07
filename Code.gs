@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.23';
+const BACKEND_VERSION = '2026-08-06.24';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -33,7 +33,13 @@ const SHEET_STAFF = '人員';
 // 會自動把舊分頁改名成新的中文名稱，資料原封不動保留，不用手動搬。
 const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'Staff' };
 
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus'];
+// manualClose（人工結案）加在最後面（不是插進中間），既有資料列不會位移，不用跑migration。
+// 這一欄是給主管直接在試算表裡用下拉選單處理「不是由文山實際掃描出貨」的訂單用的：
+// 別的門市／倉庫已經出掉的、缺貨取消的、整張取消的，選一個結案原因，APP待出貨清單就不會再顯示，
+// 但資料列本身留著（有紀錄可追），不是直接把訂單刪掉。
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose'];
+// 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
+const MANUAL_CLOSE_OPTIONS = ['出貨完成', '缺貨取消', '取消訂單'];
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
 // 這樣原本另外開的「出貨紀錄明細」分頁就不需要了，兩個分頁合併成這一個。
 // 同一次出貨如果有N個品項，出貨紀錄就會連續寫N列，訂單層級欄位（運單編號/包貨人員/完成時間等）每列都重複顯示。
@@ -55,7 +61,7 @@ const HEADER_LABELS = {
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
-  hadNoBarcodeConfirm:'曾無條碼手動核對'
+  hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案'
 };
 
 function doGet(e){
@@ -109,6 +115,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   autoSyncOrders_: () => autoSyncOrders_(),
   backupAndClearShippingLog_: () => backupAndClearShippingLog_(),
   installAutomationTriggers_: () => installAutomationTriggers_(),
+  setupOrderManualCloseDropdown_: () => setupOrderManualCloseDropdown_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
   mergeVerifyStatusIntoCheckResult_: () => mergeVerifyStatusIntoCheckResult_(),
@@ -209,7 +216,8 @@ function getState(){
       orderNo: r.orderNo, store: r.store, date: cellToText(r.date),
       items: safeParse(r.itemsJson, []), status: r.status,
       claimedBy: r.claimedBy || '', claimedAt: r.claimedAt || '',
-      shipMethod: r.shipMethod || '', routingStatus: r.routingStatus || ''
+      shipMethod: r.shipMethod || '', routingStatus: r.routingStatus || '',
+      manualClose: String(r.manualClose || '').trim()
     };
   });
   // 出貨紀錄現在存的是「一列一品項」，同一次出貨的N個品項會連續寫N列（訂單層級欄位重複），
@@ -306,13 +314,20 @@ function mergeOrders(incoming){
     // 不要動狀態／認領人／認領時間——不然等於把人家正在處理的訂單無聲無息退回待處理，
     // 之後如果又被別人認領，同一張訂單就可能被兩個人各自完成一次出貨，造成重複出貨紀錄。
     const keepClaim = existing && existing.status === 'scanning';
-    sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([[
-      orderNo, o.store||'', String(o.date||''), itemsJson, skuSummary, nameSummary,
-      keepClaim ? existing.status : 'pending',
-      keepClaim ? existing.claimedBy : '',
-      keepClaim ? existing.claimedAt : '',
-      now, o.shipMethod||'', o.routingStatus||''
-    ]]);
+    // 用「欄位名稱→值」再依 ORDERS_HEADER 順序取值，之後再加欄位這裡完全不用改，
+    // 也不會發生手寫的陣列少一格就整列往左位移的問題（出貨紀錄那邊已經吃過這種虧）。
+    const rowObj = {
+      orderNo: orderNo, store: o.store||'', date: String(o.date||''), itemsJson: itemsJson,
+      skuSummary: skuSummary, nameSummary: nameSummary,
+      status: keepClaim ? existing.status : 'pending',
+      claimedBy: keepClaim ? existing.claimedBy : '',
+      claimedAt: keepClaim ? existing.claimedAt : '',
+      updatedAt: now, shipMethod: o.shipMethod||'', routingStatus: o.routingStatus||'',
+      // 人工結案是主管在試算表裡自己填的，同步只是更新訂單內容，絕對不能把它洗掉——
+      // 不然結案完的訂單下一輪自動同步就又跳回待出貨清單，等於白結。
+      manualClose: existing ? (existing.manualClose||'') : ''
+    };
+    sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     if(existing) updated++; else added++;
   });
   rebuildOrderDetailSheet_();
@@ -432,6 +447,41 @@ function backupAndClearShippingLog_(){
   Logger.log('已備份 '+(allValues.length-1)+' 列出貨紀錄到「'+fileName+'」，並清空出貨紀錄分頁準備明天使用。');
 }
 
+// ---------------- 一次性設定用：在「訂單」分頁的「人工結案」欄裝下拉選單 ----------------
+// 不是由文山實際掃描出貨的訂單（別的門市/倉庫已經出掉、缺貨取消、整張訂單取消），
+// 主管直接在試算表這一欄用下拉選單挑一個原因，APP的待出貨清單就不會再顯示這張訂單，
+// 但資料列留著不刪，之後要查「這張到底怎麼結掉的」看這一欄就知道。
+// 選單範圍鋪到第1000列，之後新同步進來的訂單也一樣有下拉選單可以選，不用每次重跑。
+// 順便把三種結案原因上不同顏色，直接掃過去就看得出哪些是缺貨/取消、哪些是別的倉出掉的。
+function setupOrderManualCloseDropdown_(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const col = colOf(ORDERS_HEADER, 'manualClose');
+  const numRows = 999; // 第2列到第1000列
+  const range = sh.getRange(2, col, numRows, 1);
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(MANUAL_CLOSE_OPTIONS, true)
+    .setAllowInvalid(false)
+    .setHelpText('不是由文山掃描出貨的訂單，選一個結案原因；選了之後APP待出貨清單就不會再顯示這張訂單。')
+    .build();
+  range.setDataValidation(rule);
+
+  // 舊的條件式格式規則只清掉「這一欄」的，其他欄位（如果之後有加）不受影響
+  const colLetter = String.fromCharCode(64 + col);
+  const keep = sh.getConditionalFormatRules().filter(r=>
+    !r.getRanges().some(rg=>rg.getColumn() === col && rg.getNumColumns() === 1)
+  );
+  const colorOf = {'出貨完成':'#cfe2f3', '缺貨取消':'#fce5cd', '取消訂單':'#f4cccc'};
+  MANUAL_CLOSE_OPTIONS.forEach(opt=>{
+    keep.push(SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${colLetter}2="${opt}"`)
+      .setBackground(colorOf[opt])
+      .setRanges([range])
+      .build());
+  });
+  sh.setConditionalFormatRules(keep);
+  Logger.log('已在「訂單」分頁第'+col+'欄（人工結案）裝好下拉選單：'+MANUAL_CLOSE_OPTIONS.join('／')+'，範圍第2~1000列。');
+}
+
 // ---------------- 一次性設定用：安裝上面兩組自動排程的時間觸發器 ----------------
 // 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（觸發器的建立需要授權，
 // 透過API用HTTP呼叫可能拿不到，這一步比照之前DriveApp授權的做法，用編輯器手動跑一次比較保險）。
@@ -496,13 +546,14 @@ function healOrderRowIfNeeded_(sh, row){
   const items = safeParse(itemsJson, []);
   const {skuSummary, nameSummary} = summarizeItems(items);
   sh.getRange(row._row, colOf(ORDERS_HEADER,'date')).setNumberFormat('@');
-  sh.getRange(row._row, 1, 1, ORDERS_HEADER.length).setValues([[
-    orderNo, store, date, itemsJson, skuSummary, nameSummary,
-    oldStatus || 'pending', oldClaimedBy || '', oldClaimedAt || '', oldUpdatedAt || '', oldShipMethod || '', oldRoutingStatus || ''
-  ]]);
-  return {_row: row._row, orderNo, store, date, itemsJson, skuSummary, nameSummary,
+  const fixed = {_row: row._row, orderNo, store, date, itemsJson, skuSummary, nameSummary,
     status: oldStatus || 'pending', claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '',
-    updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || ''};
+    updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '',
+    // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
+    // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
+    manualClose: ''};
+  sh.getRange(row._row, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>fixed[h])]);
+  return fixed;
 }
 
 // ---------------- 認領訂單（避免兩人同時掃同一張） ----------------
@@ -513,6 +564,10 @@ function claimOrder(orderNo, staffId, staffName){
   if(!row) return {ok:false, reason:'not_found'};
   row = healOrderRowIfNeeded_(sh, row);
   if(row.status === 'shipped') return {ok:false, reason:'already_shipped'};
+  // 已經人工結案的訂單（別的門市/倉庫出掉、缺貨取消、整張取消）不給認領，
+  // 就算人員手上的清單還沒更新、直接掃到這張訂單的條碼也會被擋下來。
+  const manualClose = String(row.manualClose||'').trim();
+  if(manualClose) return {ok:false, reason:'manually_closed', manualClose: manualClose};
   if(row.status === 'scanning' && row.claimedBy && row.claimedBy !== staffId){
     return {ok:false, reason:'claimed_by_other', claimedBy: row.claimedBy};
   }

@@ -436,6 +436,12 @@ if(!HANDLED_STATUS_MODES[settings.handledStatus] || settings.handledStatus === O
 saveJSON(LS.settings, settings);
 // 這筆訂單的「訂單狀態」是不是本倉要負責出貨的。來源沒填狀態的（空白）一律放行，
 // 維持原本的行為，不要因為來源漏填就整張訂單被擋掉沒人出貨。
+// 主管在後端試算表「訂單」分頁的「人工結案」欄用下拉選單挑了結案原因（出貨完成／缺貨取消／
+// 取消訂單）的訂單，代表這張不是由文山掃描出貨，待出貨清單就不該再顯示、也不該讓人員掃得動。
+function isManuallyClosed(order){
+  return !!String((order && order.manualClose) || '').trim();
+}
+
 function isHandledStatus(status){
   const s = String(status||'').trim();
   if(!s) return true;
@@ -847,7 +853,8 @@ document.getElementById('btnClearOrders').addEventListener('click', ()=>{
 function renderPending(){
   const tbody = document.getElementById('pendingTable');
   const q = (document.getElementById('pendingSearch').value||'').trim().toLowerCase();
-  let pendingList = Object.values(orders).filter(o=>o.status==='pending');
+  // 已經人工結案的（別的門市/倉庫出掉、缺貨取消、取消訂單）不算待出貨，不要讓人員掃到
+  let pendingList = Object.values(orders).filter(o=>o.status==='pending' && !isManuallyClosed(o));
   if(q){
     pendingList = pendingList.filter(o=>
       (o.orderNo||'').toLowerCase().includes(q) ||
@@ -892,6 +899,11 @@ inputOrder.addEventListener('keydown', async e=>{
     flash('err','此訂單已出貨', '請確認是否掃錯訂單', 1300);
     return;
   }
+  if(isManuallyClosed(order)){
+    errorBeep();
+    flash('err','此訂單已人工結案', `結案原因：${order.manualClose}，不需要由文山出貨`, 1800);
+    return;
+  }
 
   if(hasBackend()){
     const staffObj = staff.find(s=>s.id===currentStaffId);
@@ -901,6 +913,7 @@ inputOrder.addEventListener('keydown', async e=>{
         errorBeep();
         if(result.reason === 'claimed_by_other') flash('err','此訂單正在處理中', `已被「${result.claimedBy}」認領，請改處理其他訂單`, 1600);
         else if(result.reason === 'already_shipped') flash('err','此訂單已出貨', '', 1200);
+        else if(result.reason === 'manually_closed') flash('err','此訂單已人工結案', `結案原因：${result.manualClose}，不需要由文山出貨`, 1800);
         else flash('err','認領訂單失敗', result.reason||'', 1300);
         await refreshFromBackend(true);
         renderPending();
@@ -1335,7 +1348,7 @@ document.getElementById('btnResetAll').addEventListener('click', ()=>{
 // 首頁
 // ============================================================
 function renderHome(){
-  const pendingCount = Object.values(orders).filter(o=>o.status==='pending').length;
+  const pendingCount = Object.values(orders).filter(o=>o.status==='pending' && !isManuallyClosed(o)).length;
   document.getElementById('pendingBadge').textContent = `${pendingCount} 張待出貨`;
   document.getElementById('statPending').textContent = pendingCount;
   document.getElementById('statShippedToday').textContent = countShippedToday();
