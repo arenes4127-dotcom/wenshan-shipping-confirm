@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-07.02';
+const BACKEND_VERSION = '2026-08-07.03';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -117,6 +117,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   deleteTestOrders_: () => deleteTestOrders_(),
   fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
   fixScannedCountCheckmark_: () => fixScannedCountCheckmark_(),
+  fixMismatchResolutionNote_: () => fixMismatchResolutionNote_(),
   autoSyncOrders_: () => autoSyncOrders_(),
   backupAndClearShippingLog_: () => backupAndClearShippingLog_(),
   installAutomationTriggers_: () => installAutomationTriggers_(),
@@ -960,11 +961,34 @@ function classifyLogEmoji_(entry, verifyStatus){
   return '🟢';
 }
 
+// 「商品不符」代表掃到不屬於這張訂單的條碼（拿錯商品）。光看這個事件不知道後續有沒有補救，
+// 所以這裡再判斷一次「最後到底有沒有把正確的商品掃進去」，方便事後判斷這張訂單實際出貨對不對。
+// 判斷依據是完成出貨時的需求件數／掃描件數：全部掃滿代表訂單裡每個品項都真的被掃到過，
+// 那個掃錯的條碼只是多掃的、後來有拿對商品重新掃。
+// 但「掃滿」也可能是靠人工修正數量或無條碼手動核對湊出來的，那種情況不能說是「掃入正確商品」，
+// 要分開講清楚，不然這個註記反而會讓人誤判成已經確認過實體商品了。
+function buildMismatchResolution_(entry){
+  const required = Number(entry.requiredCount) || 0;
+  const scanned = Number(entry.scannedCount) || 0;
+  if(required <= 0) return '（無數量資訊可判斷）';
+  if(scanned < required) return '（後續未補齊，短少'+(required-scanned)+'件）';
+  if(entry.hadManualEdit || entry.hadNoBarcodeConfirm){
+    return '（數量已補齊，但含人工介入，非全部實際掃到條碼）';
+  }
+  return '（後續已掃入正確商品，數量已補齊）';
+}
+function hasMismatch_(entry){
+  return String(entry.differenceDetails||'').indexOf('商品不符') >= 0;
+}
+
 // 把「核對狀態」文字＋人工介入註記＋燈號emoji組成最終的「核對結果」欄位內容。
 function buildCheckResult_(entry, verifyStatus){
   let text = verifyStatus;
   if(entry.hadManualEdit) text += '（人工修正數量）';
   if(entry.hadNoBarcodeConfirm) text += '（含無條碼手動核對）';
+  // 商品不符的後續處理結果直接寫在核對結果欄，不用再去翻差異明細那一長串文字才知道有沒有補救。
+  // 燈號維持紅燈不變：確實發生過拿錯商品，這件事本身就該被看見，補救成功也不該當作沒發生過。
+  if(hasMismatch_(entry)) text += buildMismatchResolution_(entry);
   return text + ' ' + classifyLogEmoji_(entry, verifyStatus);
 }
 
@@ -987,7 +1011,10 @@ function appendLogRow(entry){
   // entry.differenceDetails是「跟特定品項無關」的訂單層級事件（目前只有：掃到不屬於這張訂單的條碼），
   // 只會出現在第一列；每個品項「自己」的差異（無條碼手動核對/數量超過/人工修正）由it.itemDifferenceDetails
   // 帶過來，放在那個品項自己的列，不會像以前那樣把整張訂單所有品項的事件混在同一段文字裡重複顯示。
-  const orderLevelText = (entry.differenceDetails && entry.differenceDetails !== '無差異') ? entry.differenceDetails : '';
+  let orderLevelText = (entry.differenceDetails && entry.differenceDetails !== '無差異') ? entry.differenceDetails : '';
+  // 掃到不屬於這張訂單的條碼時，後面接著寫清楚「後來到底有沒有拿對商品掃進去」，
+  // 這樣事後看差異明細就能直接判斷這張訂單實際出的貨對不對，不用再自己去比對件數。
+  if(orderLevelText && hasMismatch_(entry)) orderLevelText += buildMismatchResolution_(entry);
   const rows = items.map((it, idx)=>{
     const rowObj = {
       orderNo: entry.orderNo, orderDate: String(entry.orderDate||''), waybill: entry.waybill||'',
@@ -1037,6 +1064,51 @@ function fixRequiredScannedCountDisplay_(){
     }
   });
   Logger.log('已清空 '+cleared+' 列非該訂單第一列的需求件數／掃描件數重複值。');
+}
+
+// ---------------- 一次性修復用：既有「商品不符」紀錄補上後續處理結果註記 ----------------
+// buildMismatchResolution_() 是這次才加的，之前寫入的紀錄只寫了「掃到不屬於此訂單的條碼」，
+// 沒說後來有沒有補救。這裡依同一組判斷邏輯把註記補上去。
+// 需求件數／掃描件數只存在每組訂單的第一列，其餘品項列要沿用同一組的值才判斷得出來。
+// 已經補過的（文字裡已經有「後續」或「無數量資訊」）會跳過，可以重複執行。
+function fixMismatchResolutionNote_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const checkResultCol = colOf(LOG_HEADER,'checkResult');
+  const differenceCol = colOf(LOG_HEADER,'differenceDetails');
+
+  const groupInfo = {};
+  rows.forEach(r=>{
+    const key = r.orderNo + '||' + r.time;
+    if(!groupInfo[key] && r.requiredCount !== '' && r.requiredCount !== undefined){
+      groupInfo[key] = {requiredCount: r.requiredCount, scannedCount: r.scannedCount};
+    }
+  });
+
+  let fixed = 0;
+  rows.forEach(r=>{
+    const diff = String(r.differenceDetails||'');
+    if(diff.indexOf('商品不符') < 0) return;
+    if(diff.indexOf('後續') >= 0 || diff.indexOf('無數量資訊') >= 0) return; // 補過了
+    const key = r.orderNo + '||' + r.time;
+    const g = groupInfo[key] || {requiredCount: 0, scannedCount: 0};
+    const entryLike = {
+      differenceDetails: diff,
+      hadManualEdit: textToBool(r.hadManualEdit), hadNoBarcodeConfirm: textToBool(r.hadNoBarcodeConfirm),
+      hadIssue: textToBool(r.hadIssue), importedExternal: textToBool(r.importedExternal),
+      // 掃描件數欄位可能長成「20 ✅」，取開頭的數字部分來比較
+      requiredCount: parseInt(g.requiredCount, 10) || 0,
+      scannedCount: parseInt(String(g.scannedCount).replace(/[^\d]/g, ''), 10) || 0
+    };
+    const note = buildMismatchResolution_(entryLike);
+    sh.getRange(r._row, differenceCol).setValue(diff + note);
+    const verifyStatus = classifyVerifyStatus_(entryLike);
+    sh.getRange(r._row, checkResultCol).setValue(buildCheckResult_(entryLike, verifyStatus));
+    fixed++;
+  });
+  Logger.log('已為 '+fixed+' 列「商品不符」紀錄補上後續處理結果註記。');
+  return {已補註記列數: fixed};
 }
 
 // ---------------- 一次性修復用：把既有出貨紀錄的掃描件數補上綠色打勾 ----------------
