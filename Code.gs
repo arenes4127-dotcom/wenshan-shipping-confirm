@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.24';
+const BACKEND_VERSION = '2026-08-06.25';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -116,6 +116,9 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   backupAndClearShippingLog_: () => backupAndClearShippingLog_(),
   installAutomationTriggers_: () => installAutomationTriggers_(),
   setupOrderManualCloseDropdown_: () => setupOrderManualCloseDropdown_(),
+  migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
+  archiveShippedOrders_: () => archiveShippedOrders_(),
+  previewArchiveShippedOrders_: () => previewArchiveShippedOrders_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
   mergeVerifyStatusIntoCheckResult_: () => mergeVerifyStatusIntoCheckResult_(),
@@ -209,7 +212,7 @@ function readRows(name, header){
 
 // ---------------- state (讀取全部資料，給前端初始化/輪詢用) ----------------
 function getState(){
-  const orderRows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const orderRows = readOrderRows();
   const orders = {};
   orderRows.forEach(r=>{
     orders[r.orderNo] = {
@@ -273,6 +276,25 @@ function boolToText(b){ return b ? '是 🟠' : '否 🟢'; }
 // 還是新資料（「是 🟠」/「否 🟢」）都能正確判讀，不用特地跑migration轉換舊資料。
 function textToBool(v){ return v === true || String(v).indexOf('是') === 0; }
 
+// 「狀態」欄比照是非欄位的做法：試算表裡存繁體中文方便直接看，程式內部（含前端APP）
+// 一律還是用英文代碼判斷，兩邊靠這組對照轉換，不用把散在各處的狀態比較全部改掉。
+const STATUS_LABELS = {pending:'待出貨', scanning:'掃描中', shipped:'已出貨'};
+const STATUS_FROM_LABEL = {'待出貨':'pending', '掃描中':'scanning', '已出貨':'shipped'};
+function statusToText(s){ return STATUS_LABELS[s] || s || ''; }
+// 舊資料存的是英文（pending/scanning/shipped），新資料存中文，兩種都要讀得懂——
+// 這樣不跑資料轉換也能正常運作，轉換只是為了讓試算表看起來一致。
+function textToStatus(v){
+  const s = String(v||'').trim();
+  return STATUS_FROM_LABEL[s] || s;
+}
+// 讀「訂單」分頁一律走這個，狀態欄在這裡統一轉成英文代碼，
+// 後面所有 row.status === 'shipped' 之類的判斷就完全不用動。
+function readOrderRows(){
+  const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  rows.forEach(r=>{ r.status = textToStatus(r.status); });
+  return rows;
+}
+
 // 用欄位名稱查1-indexed欄號，不要用寫死的數字——加新欄位時舊的寫死數字會全部錯位
 function colOf(header, name){
   const idx = header.indexOf(name);
@@ -293,7 +315,7 @@ function summarizeItems(items){
 // ---------------- 訂單同步（合併，已出貨的不覆蓋） ----------------
 function mergeOrders(incoming){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
   const byOrderNo = {};
   rows.forEach(r=> byOrderNo[r.orderNo] = r);
 
@@ -319,7 +341,7 @@ function mergeOrders(incoming){
     const rowObj = {
       orderNo: orderNo, store: o.store||'', date: String(o.date||''), itemsJson: itemsJson,
       skuSummary: skuSummary, nameSummary: nameSummary,
-      status: keepClaim ? existing.status : 'pending',
+      status: statusToText(keepClaim ? existing.status : 'pending'),
       claimedBy: keepClaim ? existing.claimedBy : '',
       claimedAt: keepClaim ? existing.claimedAt : '',
       updatedAt: now, shipMethod: o.shipMethod||'', routingStatus: o.routingStatus||'',
@@ -482,6 +504,137 @@ function setupOrderManualCloseDropdown_(){
   Logger.log('已在「訂單」分頁第'+col+'欄（人工結案）裝好下拉選單：'+MANUAL_CLOSE_OPTIONS.join('／')+'，範圍第2~1000列。');
 }
 
+// ---------------- 一次性修復用：把「訂單」分頁既有的英文狀態值換成繁體中文 ----------------
+// 程式本身英文中文都讀得懂（textToStatus兩種都吃），這個只是讓試算表看起來一致，
+// 不跑也不會壞。已經是中文的列會跳過，可以放心重複執行。
+function migrateOrderStatusToChinese_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_ORDERS);
+  if(!sh){ Logger.log('找不到「訂單」分頁'); return; }
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2){ Logger.log('訂單分頁目前沒有資料列'); return; }
+  const col = colOf(ORDERS_HEADER, 'status');
+  const range = sh.getRange(2, col, lastRow-1, 1);
+  const values = range.getValues();
+  let changed = 0;
+  const out = values.map(([v])=>{
+    const s = String(v||'').trim();
+    if(STATUS_LABELS[s]){ changed++; return [STATUS_LABELS[s]]; } // 英文代碼→中文
+    return [v]; // 已經是中文（或空白）就原樣保留
+  });
+  if(changed) range.setValues(out);
+  Logger.log('已把 '+changed+' 列的狀態從英文代碼轉成繁體中文（共'+values.length+'列）。');
+}
+
+// ---------------- 自動排程：已出貨訂單定期歸檔，避免「訂單」分頁無限長大 ----------------
+// 已出貨的訂單原本要一直留著，才能在重新同步時被擋掉（skippedShipped），不然來源資料還在的話
+// 會又被當成新訂單加回待出貨清單造成重複出貨——所以歸檔不能單看「已出貨」就搬走，一定要確認
+// 這張訂單「已經不在來源資料裡了」，搬走之後才不可能被重新匯入。
+// 三道保險，任何一道不過就整個略過不動，寧可晚幾天歸檔也不要誤刪造成重複出貨：
+//   1. 來源鏡像分頁讀不到／沒有資料列 → 直接放棄（IMPORTRANGE載入中或壞掉時整份會是空的，
+//      這時候每一張都會看起來「不在來源」，照做會把所有已出貨訂單一次全搬走）。
+//   2. 訂單編號還出現在來源資料裡 → 留著。
+//   3. 出貨完成時間距今未滿保留天數 → 留著（給來源資料一點延遲時間，也保留近期可查詢的資料）。
+const SHIPPED_ORDER_RETENTION_DAYS = 7;
+const SHIPPED_ORDER_ARCHIVE_FOLDER_ID = '1fC7kFv-6ozYmrY1S_up55R_yslcu2qYE';
+function archiveShippedOrders_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SHEET_ORDERS);
+  if(!sh){ Logger.log('找不到「訂單」分頁'); return; }
+
+  // 保險1：來源鏡像分頁一定要讀得到而且有資料，否則不做任何事
+  const mirror = ss.getSheetByName(MIRROR_ORDER_SHEET_NAME);
+  if(!mirror){ Logger.log('找不到「'+MIRROR_ORDER_SHEET_NAME+'」鏡像分頁，為安全起見略過歸檔'); return; }
+  const mirrorValues = mirror.getDataRange().getValues();
+  if(mirrorValues.length < 2){
+    Logger.log('鏡像分頁目前沒有資料列（可能還在載入或IMPORTRANGE異常），為安全起見略過歸檔');
+    return;
+  }
+  const mirrorHeader = mirrorValues[0];
+  const iOrder = mirrorHeader.indexOf('訂單');
+  if(iOrder < 0){ Logger.log('鏡像分頁找不到「訂單」欄，為安全起見略過歸檔'); return; }
+  const stillInSource = {};
+  for(let i = 1; i < mirrorValues.length; i++){
+    const no = String(mirrorValues[i][iOrder]||'').trim();
+    if(no) stillInSource[no] = true;
+  }
+
+  const cutoff = Date.now() - SHIPPED_ORDER_RETENTION_DAYS * 86400 * 1000;
+  const rows = readOrderRows();
+  const toArchive = rows.filter(r=>{
+    if(r.status !== 'shipped') return false;                    // 只搬已出貨的
+    if(stillInSource[String(r.orderNo||'').trim()]) return false; // 保險2：來源還有就留著
+    const shippedAt = Date.parse(r.updatedAt);                   // 保險3：太新的留著
+    if(isNaN(shippedAt) || shippedAt > cutoff) return false;
+    return true;
+  });
+  if(!toArchive.length){ Logger.log('目前沒有符合歸檔條件的已出貨訂單，不動作。'); return; }
+
+  // 先備份再刪，備份失敗就會直接拋錯中斷，不會發生「刪掉了但沒備份成功」
+  const tz = ss.getSpreadsheetTimeZone();
+  const fileName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_已出貨訂單歸檔';
+  const displayHeader = ORDERS_HEADER.map(h => HEADER_LABELS[h] || h);
+  const archiveRows = toArchive.map(r=>
+    ORDERS_HEADER.map(h=> h==='status' ? statusToText(r[h]) : r[h])
+  );
+  const folder = DriveApp.getFolderById(SHIPPED_ORDER_ARCHIVE_FOLDER_ID);
+  const existing = folder.getFilesByName(fileName);
+  while(existing.hasNext()){ existing.next().setTrashed(true); }
+  const archiveSs = SpreadsheetApp.create(fileName);
+  const archiveSh = archiveSs.getSheets()[0];
+  archiveSh.setName(SHEET_ORDERS);
+  archiveSh.getRange(1, 1, 1, displayHeader.length).setValues([displayHeader]);
+  archiveSh.getRange(2, 1, archiveRows.length, ORDERS_HEADER.length).setValues(archiveRows);
+  const archiveFile = DriveApp.getFileById(archiveSs.getId());
+  folder.addFile(archiveFile);
+  DriveApp.getRootFolder().removeFile(archiveFile);
+
+  // 由下往上刪，不然刪掉一列之後下面的列號會往上跑，會刪錯列
+  toArchive.map(r=>r._row).sort((a,b)=>b-a).forEach(rowNum=> sh.deleteRow(rowNum));
+
+  rebuildOrderDetailSheet_(); // 訂單少了幾張，明細分頁跟著重建才不會對不起來
+  Logger.log('已歸檔 '+toArchive.length+' 張已出貨訂單到「'+fileName+'」並從訂單分頁移除'
+    +'（條件：已出貨＋來源已無此訂單＋出貨滿'+SHIPPED_ORDER_RETENTION_DAYS+'天）。');
+}
+
+// 試跑用：只計算「如果現在跑歸檔會搬走哪些訂單」，不動任何資料，直接把結果回傳成JSON。
+// 正式跑 archiveShippedOrders_() 之前先用這個確認範圍對不對，比較安心。
+function previewArchiveShippedOrders_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mirror = ss.getSheetByName(MIRROR_ORDER_SHEET_NAME);
+  if(!mirror) return {ok:false, reason:'找不到鏡像分頁，正式執行會直接略過不動作'};
+  const mirrorValues = mirror.getDataRange().getValues();
+  if(mirrorValues.length < 2) return {ok:false, reason:'鏡像分頁沒有資料列，正式執行會直接略過不動作'};
+  const iOrder = mirrorValues[0].indexOf('訂單');
+  if(iOrder < 0) return {ok:false, reason:'鏡像分頁找不到「訂單」欄，正式執行會直接略過不動作'};
+  const stillInSource = {};
+  for(let i = 1; i < mirrorValues.length; i++){
+    const no = String(mirrorValues[i][iOrder]||'').trim();
+    if(no) stillInSource[no] = true;
+  }
+  const cutoff = Date.now() - SHIPPED_ORDER_RETENTION_DAYS * 86400 * 1000;
+  const rows = readOrderRows();
+  const shipped = rows.filter(r=>r.status === 'shipped');
+  const wouldArchive = [], keptInSource = [], keptTooNew = [];
+  shipped.forEach(r=>{
+    const no = String(r.orderNo||'').trim();
+    if(stillInSource[no]){ keptInSource.push(no); return; }
+    const shippedAt = Date.parse(r.updatedAt);
+    if(isNaN(shippedAt) || shippedAt > cutoff){ keptTooNew.push(no + '（' + (r.updatedAt||'無出貨時間') + '）'); return; }
+    wouldArchive.push(no);
+  });
+  return {
+    ok: true,
+    保留天數: SHIPPED_ORDER_RETENTION_DAYS,
+    訂單總數: rows.length,
+    已出貨: shipped.length,
+    這次會歸檔: wouldArchive.length,
+    會歸檔的訂單: wouldArchive,
+    留著_來源還有這張: keptInSource.length,
+    留著_出貨未滿保留天數: keptTooNew.length,
+    留著的明細_未滿天數: keptTooNew.slice(0, 20)
+  };
+}
+
 // ---------------- 一次性設定用：安裝上面兩組自動排程的時間觸發器 ----------------
 // 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（觸發器的建立需要授權，
 // 透過API用HTTP呼叫可能拿不到，這一步比照之前DriveApp授權的做法，用編輯器手動跑一次比較保險）。
@@ -491,7 +644,7 @@ function setupOrderManualCloseDropdown_(){
 // 甚至順序調換——但因為mergeOrders()本來就是「同步現況」的概念，同一天重複執行/順序調換
 // 都不會有副作用（只是把「訂單」分頁同步到源頭當下最新的樣子），不影響最終結果只是可能差幾分鐘。
 function installAutomationTriggers_(){
-  const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_'];
+  const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -500,9 +653,12 @@ function installAutomationTriggers_(){
     ScriptApp.newTrigger('autoSyncOrders_').timeBased().atHour(h).nearMinute(m).everyDays(1).create();
   });
   ScriptApp.newTrigger('backupAndClearShippingLog_').timeBased().atHour(20).nearMinute(0).everyDays(1).create();
+  // 已出貨訂單歸檔排在出貨紀錄備份之後，兩件事互相獨立（一邊出問題不影響另一邊），
+  // 而且歸檔本身有保留天數門檻，晚一點跑或某天沒跑到都不影響正確性。
+  ScriptApp.newTrigger('archiveShippedOrders_').timeBased().atHour(20).nearMinute(30).everyDays(1).create();
 
-  Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)，共'
-    +ScriptApp.getProjectTriggers().length+'個觸發器。');
+  Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)'
+    +' + 已出貨訂單歸檔(20:30)，共'+ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
 // ---------------- 「訂單明細」分頁：一列一品項，方便直接在試算表裡肉眼看 ----------------
@@ -519,7 +675,7 @@ function rebuildOrderDetailSheet_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(SHEET_DETAIL);
   if(!sh) sh = ss.insertSheet(SHEET_DETAIL);
-  const orderRows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const orderRows = readOrderRows();
   const out = [];
   orderRows.forEach(r=>{
     const items = safeParse(r.itemsJson, []);
@@ -547,19 +703,21 @@ function healOrderRowIfNeeded_(sh, row){
   const {skuSummary, nameSummary} = summarizeItems(items);
   sh.getRange(row._row, colOf(ORDERS_HEADER,'date')).setNumberFormat('@');
   const fixed = {_row: row._row, orderNo, store, date, itemsJson, skuSummary, nameSummary,
-    status: oldStatus || 'pending', claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '',
+    status: textToStatus(oldStatus) || 'pending', claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '',
     updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '',
     // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
     // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
     manualClose: ''};
-  sh.getRange(row._row, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>fixed[h])]);
+  // 寫回試算表的狀態要轉成中文，回傳給呼叫端的物件維持英文代碼
+  sh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
+    .setValues([ORDERS_HEADER.map(h=> h==='status' ? statusToText(fixed.status) : fixed[h])]);
   return fixed;
 }
 
 // ---------------- 認領訂單（避免兩人同時掃同一張） ----------------
 function claimOrder(orderNo, staffId, staffName){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
   let row = rows.find(r=>r.orderNo===orderNo);
   if(!row) return {ok:false, reason:'not_found'};
   row = healOrderRowIfNeeded_(sh, row);
@@ -575,18 +733,18 @@ function claimOrder(orderNo, staffId, staffName){
   // 同一人重新叫出同一張還在掃描中的訂單（例如中途切到別的畫面又回來），
   // 開始時間要延續原本第一次認領的時間，不要每次重新叫出來就往後跳
   const claimedAt = (row.status === 'scanning' && row.claimedBy === staffId && row.claimedAt) ? row.claimedAt : now;
-  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['scanning', staffId||'', claimedAt, now]]);
+  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([[statusToText('scanning'), staffId||'', claimedAt, now]]);
   return {ok:true, order: {orderNo: row.orderNo, store: row.store, date: cellToText(row.date), items: safeParse(row.itemsJson, []), shipMethod: row.shipMethod||'', routingStatus: row.routingStatus||'', claimedAt}};
 }
 
 function releaseOrder(orderNo){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
   let row = rows.find(r=>r.orderNo===orderNo);
   if(!row) return {ok:false, reason:'not_found'};
   row = healOrderRowIfNeeded_(sh, row);
   if(row.status === 'shipped') return {ok:true}; // 已出貨就不用管了
-  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 3).setValues([['pending', '', '']]);
+  sh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 3).setValues([[statusToText('pending'), '', '']]);
   return {ok:true};
 }
 
@@ -594,7 +752,7 @@ function releaseOrder(orderNo){
 function finalizeShipment(entry){
   if(!entry || !entry.orderNo) return {ok:false, error:'missing orderNo'};
   const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
   let row = rows.find(r=>r.orderNo===entry.orderNo);
   if(row){
     row = healOrderRowIfNeeded_(ordersSh, row);
@@ -604,7 +762,7 @@ function finalizeShipment(entry){
       return {ok:false, reason:'already_shipped'};
     }
     const now = new Date().toISOString();
-    ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['shipped', '', '', now]]);
+    ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([[statusToText('shipped'), '', '', now]]);
   }
   appendLogRow(entry);
   return {ok:true};
@@ -930,7 +1088,7 @@ function fixBooleanColumnEmoji_(){
 // ---------------- 批次匯入已出貨紀錄（指定出貨Excel那個功能用） ----------------
 function importShippedBatch(entries){
   const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
   const byOrderNo = {};
   rows.forEach(r=> byOrderNo[r.orderNo] = r);
 
@@ -941,7 +1099,7 @@ function importShippedBatch(entries){
     if(!row){ skippedNotFound++; return; }
     row = healOrderRowIfNeeded_(ordersSh, row);
     if(row.status === 'shipped'){ skippedAlreadyShipped++; return; }
-    ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([['shipped', '', '', now]]);
+    ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([[statusToText('shipped'), '', '', now]]);
     appendLogRow(entry);
     imported++;
   });
@@ -967,7 +1125,7 @@ function deleteTestOrders_(){
   const ordersSh = ss.getSheetByName(SHEET_ORDERS);
   let deletedOrderRows = 0;
   if(ordersSh){
-    const rows = readRows(SHEET_ORDERS, ORDERS_HEADER);
+    const rows = readOrderRows();
     const rowNums = rows.filter(r=>isTestOrder(r.orderNo)).map(r=>r._row).sort((a,b)=>b-a);
     rowNums.forEach(rowNum=>{ ordersSh.deleteRow(rowNum); deletedOrderRows++; });
   }
@@ -1078,21 +1236,26 @@ function migrateOrdersColumnShift(){
   if(lastRow < 2){ Logger.log('沒有資料列'); return; }
   const numCols = Math.max(sh.getLastColumn(), ORDERS_HEADER.length);
   const values = sh.getRange(2, 1, lastRow-1, numCols).getValues();
-  const VALID_STATUS = {pending:1, scanning:1, shipped:1};
   const dateCol = colOf(ORDERS_HEADER,'date');
   let migrated = 0;
   values.forEach((row, i)=>{
-    if(VALID_STATUS[row[6]]) return; // 第7欄已經是合法狀態值，代表這列已經是新版，跳過
+    // 第7欄已經是合法狀態值（不管是舊的英文代碼還是現在的中文），代表這列已經是新版，跳過
+    if(STATUS_LABELS[textToStatus(row[6])]) return;
     const orderNo=row[0], store=row[1], date=row[2], itemsJson=row[3];
     const oldStatus=row[4], oldClaimedBy=row[5], oldClaimedAt=row[6], oldUpdatedAt=row[7], oldShipMethod=row[8], oldRoutingStatus=row[9];
     const items = safeParse(itemsJson, []);
     const {skuSummary, nameSummary} = summarizeItems(items);
     const targetRow = i + 2;
     sh.getRange(targetRow, dateCol).setNumberFormat('@');
-    sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([[
+    // 依 ORDERS_HEADER 目前的欄位數量組出整列，之後再加欄位這裡不用跟著改
+    // （寫死12個值的話，現在多了「人工結案」欄就會直接噴「欄數不符」的錯）
+    const rowObj = {
       orderNo, store, date, itemsJson, skuSummary, nameSummary,
-      oldStatus || 'pending', oldClaimedBy || '', oldClaimedAt || '', oldUpdatedAt || '', oldShipMethod || '', oldRoutingStatus || ''
-    ]]);
+      status: statusToText(textToStatus(oldStatus) || 'pending'),
+      claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '', updatedAt: oldUpdatedAt || '',
+      shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '', manualClose: ''
+    };
+    sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     migrated++;
   });
   Logger.log('訂單分頁：已還原 '+migrated+' 列舊資料的欄位位移');
