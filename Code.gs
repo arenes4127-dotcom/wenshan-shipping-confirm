@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.22';
+const BACKEND_VERSION = '2026-08-06.23';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -327,7 +327,17 @@ function mergeOrders(incoming){
 // 週六日／國定假日／颱風假不出貨：這裡完全不用特別處理，觸發器照排程執行，
 // 只是那幾天源頭多半沒有「文山」狀態的新資料、同步等於空跑，訂單本身會照樣累積在「訂單」
 // 分頁等到下一個營業日才被掃描出貨，跟平常一模一樣，不需要另外寫假日判斷邏輯。
-const HANDLED_ROUTING_STATUS = '文山';
+// 本倉要負責出貨的「訂單狀態」：文山本身，加上調撥中的訂單（調中華／調OM／調山物／調中華+OM…）——
+// 調撥的最後還是會回到文山出貨，先匯進來不用等來源改狀態才看得到；等來源把狀態改回「文山」也不會
+// 變成兩張訂單（mergeOrders是同一個訂單號就更新既有那一列）。其餘狀態（山物出、1、2、3…）不屬於本倉。
+// 這裡的判斷邏輯要跟 index.html 的 HANDLED_STATUS_MODES['文山+調撥'] 保持一致，
+// 不然手動按同步跟自動排程同步會匯進不一樣的訂單。
+// 來源沒填狀態的（空白）一律放行，跟前端一樣，不要因為來源漏填就整張訂單被擋掉沒人出貨。
+function isHandledRoutingStatus_(status){
+  const s = String(status||'').trim();
+  if(!s) return true;
+  return s === '文山' || s.indexOf('調') === 0;
+}
 const MIRROR_ORDER_SHEET_NAME = '文山出貨V2';
 function autoSyncOrders_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -353,10 +363,7 @@ function autoSyncOrders_(){
     const sku = String(row[iSku]||'').trim();
     const qty = parseInt(row[iQty], 10);
     if(!orderNo || !sku || isNaN(qty)){ skippedRows++; continue; }
-    if(iStatus >= 0){
-      const status = String(row[iStatus]||'').trim();
-      if(status && status !== HANDLED_ROUTING_STATUS){ skippedOtherWarehouse++; continue; }
-    }
+    if(iStatus >= 0 && !isHandledRoutingStatus_(row[iStatus])){ skippedOtherWarehouse++; continue; }
     const spec = iSpec>=0 ? String(row[iSpec]||'').trim() : '';
     const baseName = iName>=0 ? String(row[iName]||'').trim() : sku;
     const name = spec ? `${baseName}（${spec}）` : baseName;
