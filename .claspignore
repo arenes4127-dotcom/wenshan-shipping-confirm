@@ -1,0 +1,9 @@
+# 先全部排除，再逐一放行要推送的檔案——用「白名單」而不是「黑名單」，
+# 這樣以後資料夾裡多了任何檔案都不會意外被推進 Apps Script 專案。
+#
+# 特別注意 index.html：它是 GitHub Pages 的前端網頁，跟這個 Apps Script 專案無關，
+# 但因為放在同一個資料夾，clasp 預設會把它當成 Apps Script 的 HTML 檔一起上傳。
+**/**
+
+!Code.gs
+!appsscript.json

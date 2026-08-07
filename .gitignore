@@ -1,0 +1,4 @@
+# clasp 登入憑證（實際上存在使用者家目錄，這裡再擋一層保險，絕對不能進 git）
+.clasprc.json
+# 語法檢查用的暫存檔
+Code_check.js
