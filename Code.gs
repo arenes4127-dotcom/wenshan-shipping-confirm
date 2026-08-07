@@ -21,13 +21,14 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-06.28';
+const BACKEND_VERSION = '2026-08-07.02';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
 const SHEET_ORDERS = '訂單';
 const SHEET_LOG = '出貨紀錄';
 const SHEET_STAFF = '人員';
+const SHEET_SYSLOG = '系統紀錄';
 
 // 舊分頁名稱（英文版）：第一次執行如果找不到中文分頁、但找得到對應的舊英文分頁，
 // 會自動把舊分頁改名成新的中文名稱，資料原封不動保留，不用手動搬。
@@ -49,6 +50,9 @@ const MANUAL_CLOSE_OPTIONS = ['出貨完成', '缺貨取消', '取消訂單'];
 // （不是純append），既有資料列會跟著位移，需要跑一次migrateLogColumnReorder2_()把舊資料重新對齊。
 const LOG_HEADER = ['store','orderNo','orderDate','waybill','shipMethod','sku','baseName','spec','qty','scanned','staffId','staffName','startTime','time','hadIssue','hadManualEdit','importedExternal','requiredCount','scannedCount','routingStatus','checkResult','hadNoBarcodeConfirm','differenceDetails','note'];
 const STAFF_HEADER = ['id','name'];
+// 系統自動處理掉的事情（目前只有「認領逾時自動釋放」）記在這裡，才不會無聲無息發生。
+// 之後想看「是不是常常掉單、都是哪些人員/哪個時段」直接翻這個分頁就知道。
+const SYSLOG_HEADER = ['logTime','event','orderNo','claimedBy','detail'];
 
 // 內部欄位代碼 → 試算表裡實際顯示的繁體中文標題
 const HEADER_LABELS = {
@@ -61,7 +65,8 @@ const HEADER_LABELS = {
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
-  hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案'
+  hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
+  logTime:'時間', event:'事件', detail:'說明'
 };
 
 function doGet(e){
@@ -117,6 +122,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   installAutomationTriggers_: () => installAutomationTriggers_(),
   setupOrderManualCloseDropdown_: () => setupOrderManualCloseDropdown_(),
   setupOrderSheetColors: () => setupOrderSheetColors(),
+  releaseStaleClaims_: () => releaseStaleClaims_(),
+  testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
   archiveShippedOrders_: () => archiveShippedOrders_(),
   previewArchiveShippedOrders_: () => previewArchiveShippedOrders_(),
@@ -324,6 +331,9 @@ function summarizeItems(items){
 // ---------------- 訂單同步（合併，已出貨的不覆蓋） ----------------
 function mergeOrders(incoming){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  // 先把逾時的認領放回待出貨，再讀資料——順序不能顛倒，不然下面的 keepClaim 會把
+  // 那些其實早就沒人在處理的訂單當成「正在掃描中」保護起來，等於永遠釋放不掉。
+  releaseStaleClaims_();
   const rows = readOrderRows();
   const byOrderNo = {};
   rows.forEach(r=> byOrderNo[r.orderNo] = r);
@@ -768,6 +778,93 @@ function healOrderRowIfNeeded_(sh, row){
   return fixed;
 }
 
+// ---------------- 認領逾時自動釋放 ----------------
+// 訂單認領之後，只有人員在APP按「中止」才會回到待出貨——如果他直接關掉APP、平板休眠斷線、
+// 或掃到一半被叫走沒回來，這張訂單就會永遠停在「掃描中」：它不會出現在待出貨清單裡
+// （清單只撈 pending），別人掃它也會被擋掉（claimed_by_other），等於整張訂單沒有人出得掉，
+// 而且不會有任何人發現。這裡設一個時限，超過就自動放回待出貨。
+//
+// 為什麼是3小時：一張訂單正常掃完只要幾分鐘。誤釋放的代價很小（人員回來繼續掃，完成時
+// finalizeShipment 不檢查認領人照樣能正常記錄，而且有「已出貨就不重複記錄」的防呆擋著）；
+// 但卡住不放的代價是整張訂單當天出不掉、還沒人會發現。兩邊風險不對稱，所以取比較短的時限。
+const STALE_CLAIM_HOURS = 3;
+function isStaleClaim_(claimedAt){
+  const t = Date.parse(claimedAt);
+  if(isNaN(t)) return true; // 認領時間讀不出來（空白/格式壞掉）也視為逾時，不然會永遠卡著沒人能處理
+  return (Date.now() - t) > STALE_CLAIM_HOURS * 3600 * 1000;
+}
+
+function appendSysLog_(event, orderNo, claimedBy, detail){
+  const sh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
+  const row = sh.getLastRow() + 1;
+  sh.getRange(row, colOf(SYSLOG_HEADER,'logTime')).setNumberFormat('@'); // 免得被自動轉成日期型別
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const rowObj = {
+    logTime: Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd HH:mm:ss'),
+    event: event, orderNo: orderNo || '', claimedBy: claimedBy || '', detail: detail || ''
+  };
+  sh.getRange(row, 1, 1, SYSLOG_HEADER.length).setValues([SYSLOG_HEADER.map(h=>rowObj[h])]);
+}
+
+// 把所有逾時的認領一次放回待出貨。每次同步（自動排程4次＋手動按同步）都會跑一次。
+function releaseStaleClaims_(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  let released = 0;
+  rows.forEach(r=>{
+    if(r.status !== 'scanning') return;
+    if(!isStaleClaim_(r.claimedAt)) return;
+    const hours = ((Date.now() - Date.parse(r.claimedAt)) / 3600000).toFixed(1);
+    sh.getRange(r._row, colOf(ORDERS_HEADER,'status'), 1, 3).setValues([[statusToText('pending'), '', '']]);
+    appendSysLog_('認領逾時自動釋放', r.orderNo, r.claimedBy,
+      '認領後 '+(isNaN(Date.parse(r.claimedAt)) ? '（認領時間異常）' : hours+' 小時')
+      +'未完成出貨，已自動放回待出貨清單（時限'+STALE_CLAIM_HOURS+'小時）');
+    released++;
+  });
+  if(released) Logger.log('認領逾時自動釋放：'+released+' 張訂單已放回待出貨清單。');
+  return released;
+}
+
+// 驗證用：自己建一張「5小時前就被認領、之後就沒動作」的測試訂單，跑一次自動釋放看結果對不對，
+// 跑完把測試訂單刪掉。用測試資料驗證才不用去動真實訂單，也不用把時限改成0（那樣在正式環境很危險，
+// 真的有人員正在掃描的話會被立刻釋放掉）。確認功能正常之後這個函式可以刪掉。
+function testStaleClaimRelease_(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const orderNo = 'TEST-STALE-' + Date.now();
+  const staleAt = new Date(Date.now() - 5 * 3600 * 1000).toISOString(); // 5小時前
+  const rowObj = {
+    orderNo: orderNo, store: '測試', date: '2026/8/7',
+    itemsJson: JSON.stringify([{sku:'TEST-SKU', name:'測試品項', baseName:'測試品項', spec:'', qty:1}]),
+    skuSummary: 'TEST-SKU', nameSummary: '測試品項',
+    status: statusToText('scanning'), claimedBy: 'TEST01', claimedAt: staleAt,
+    updatedAt: staleAt, shipMethod: '', routingStatus: '文山', manualClose: ''
+  };
+  const testRow = sh.getLastRow() + 1;
+  sh.getRange(testRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
+
+  const before = readOrderRows().find(r=>r.orderNo === orderNo);
+  const released = releaseStaleClaims_();
+  const after = readOrderRows().find(r=>r.orderNo === orderNo);
+
+  const result = {
+    測試訂單: orderNo,
+    認領時間: staleAt,
+    時限小時: STALE_CLAIM_HOURS,
+    釋放前狀態: before ? before.status : '(找不到)',
+    釋放前認領人: before ? before.claimedBy : '',
+    這次釋放張數: released,
+    釋放後狀態: after ? after.status : '(找不到)',
+    釋放後認領人: after ? (after.claimedBy || '(已清空)') : '',
+    判定: (before && before.status === 'scanning' && after && after.status === 'pending' && !after.claimedBy)
+      ? '通過：逾時認領已正確放回待出貨並清掉認領人' : '不符預期，請檢查'
+  };
+  // 不管上面結果如何都要把測試訂單刪掉，不要留在正式的待出貨清單裡
+  const cleanupRow = readOrderRows().find(r=>r.orderNo === orderNo);
+  if(cleanupRow) sh.deleteRow(cleanupRow._row);
+  result.測試訂單已刪除 = !readOrderRows().some(r=>r.orderNo === orderNo);
+  return result;
+}
+
 // ---------------- 認領訂單（避免兩人同時掃同一張） ----------------
 function claimOrder(orderNo, staffId, staffName){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
@@ -781,7 +878,13 @@ function claimOrder(orderNo, staffId, staffName){
   const manualClose = String(row.manualClose||'').trim();
   if(manualClose) return {ok:false, reason:'manually_closed', manualClose: manualClose};
   if(row.status === 'scanning' && row.claimedBy && row.claimedBy !== staffId){
-    return {ok:false, reason:'claimed_by_other', claimedBy: row.claimedBy};
+    // 認領超過時限就讓後面這個人直接接手，不用等排程同步才釋放——現場遇到「掃不動、說被某某人
+    // 認領了」的當下就能自己解決，這是最需要即時處理的時機點。
+    if(!isStaleClaim_(row.claimedAt)){
+      return {ok:false, reason:'claimed_by_other', claimedBy: row.claimedBy};
+    }
+    appendSysLog_('認領逾時被接手', orderNo, row.claimedBy,
+      '原認領人未完成出貨（超過'+STALE_CLAIM_HOURS+'小時），改由「'+(staffId||'?')+'」接手掃描');
   }
   const now = new Date().toISOString();
   // 同一人重新叫出同一張還在掃描中的訂單（例如中途切到別的畫面又回來），
