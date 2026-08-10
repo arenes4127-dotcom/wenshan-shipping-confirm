@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.08';
+const BACKEND_VERSION = '2026-08-10.09';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -118,6 +118,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   fixRequiredScannedCountDisplay_: () => fixRequiredScannedCountDisplay_(),
   fixScannedCountCheckmark_: () => fixScannedCountCheckmark_(),
   fixMismatchResolutionNote_: () => fixMismatchResolutionNote_(),
+  fixOverScanNote_: () => fixOverScanNote_(),
   autoSyncOrders_: () => autoSyncOrders_(),
   backupAndClearShippingLog_: () => backupAndClearShippingLog_(),
   installAutomationTriggers_: () => installAutomationTriggers_(),
@@ -1013,7 +1014,8 @@ function syncNativeOrderSheet_(){
 // 甚至順序調換——但因為mergeOrders()本來就是「同步現況」的概念，同一天重複執行/順序調換
 // 都不會有副作用（只是把「訂單」分頁同步到源頭當下最新的樣子），不影響最終結果只是可能差幾分鐘。
 function installAutomationTriggers_(){
-  const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_'];
+  const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
+    'syncNativeOrderSheet_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -1025,9 +1027,13 @@ function installAutomationTriggers_(){
   // 已出貨訂單歸檔排在出貨紀錄備份之後，兩件事互相獨立（一邊出問題不影響另一邊），
   // 而且歸檔本身有保留天數門檻，晚一點跑或某天沒跑到都不影響正確性。
   ScriptApp.newTrigger('archiveShippedOrders_').timeBased().atHour(20).nearMinute(30).everyDays(1).create();
+  // 舊核對表單每小時同步一次。刻意不掛在「完成出貨」的流程裡：開啟外部試算表寫入要1~2秒，
+  // 掛上去會直接拖慢人員每掃完一張訂單的反應時間，那是現場最在意的速度。
+  ScriptApp.newTrigger('syncNativeOrderSheet_').timeBased().everyHours(1).create();
 
   Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)'
-    +' + 已出貨訂單歸檔(20:30)，共'+ScriptApp.getProjectTriggers().length+'個觸發器。');
+    +' + 已出貨訂單歸檔(20:30) + 舊核對表單同步(每小時)，共'
+    +ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
 // ---------------- 「訂單明細」分頁：一列一品項，方便直接在試算表裡肉眼看 ----------------
@@ -1416,6 +1422,32 @@ function fixMismatchResolutionNote_(){
     fixed++;
   });
   Logger.log('已為 '+fixed+' 列「商品不符」紀錄補上後續處理結果註記。');
+  return {已補註記列數: fixed};
+}
+
+// ---------------- 一次性修復用：既有「完成」卻亮紅燈的紀錄補上原因 ----------------
+// 掃描超量會把 hadIssue 設成true（跟著亮紅燈），但件數最後是對的、核對狀態判成「完成」，
+// 於是變成「完成 🔴」這種文字跟燈號自相矛盾的顯示。這裡把原因補進文字裡。
+// 已經補過的（含「曾掃描超量」）或本來就是錯誤開頭的都會跳過，可以重複執行。
+function fixOverScanNote_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_LOG);
+  if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
+  const rows = readRows(SHEET_LOG, LOG_HEADER);
+  const checkResultCol = colOf(LOG_HEADER,'checkResult');
+  let fixed = 0;
+  rows.forEach(r=>{
+    if(!textToBool(r.hadIssue)) return;
+    const cur = String(r.checkResult||'');
+    if(!cur || cur.indexOf('錯誤') === 0) return;      // 真的錯誤，本來就該紅燈，不用補
+    if(cur.indexOf('曾掃描超量') >= 0) return;          // 補過了
+    if(cur.indexOf('商品不符') >= 0) return;            // 商品不符另有註記邏輯
+    const idx = cur.lastIndexOf(' ');                   // 燈號前面插入註記，燈號留在最後
+    const body = idx > 0 ? cur.slice(0, idx) : cur;
+    const emoji = idx > 0 ? cur.slice(idx) : '';
+    sh.getRange(r._row, checkResultCol).setValue(body + '（曾掃描超量）' + emoji);
+    fixed++;
+  });
+  Logger.log('已為 '+fixed+' 列「完成卻亮紅燈」的紀錄補上掃描超量原因。');
   return {已補註記列數: fixed};
 }
 
