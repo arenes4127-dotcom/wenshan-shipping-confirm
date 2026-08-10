@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.09';
+const BACKEND_VERSION = '2026-08-10.10';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -88,6 +88,7 @@ function doPost(e){
       case 'setStaffList': result = setStaffList(body.staff || []); break;
       case 'runOneTimeSetup': result = runOneTimeSetup(body.name); break;
       case 'uploadFileToDrive': result = uploadFileToDrive(body.folderId, body.fileName, body.content, body.mimeType); break;
+      case 'logNetFailures': result = logNetFailures(body.entries || []); break;
       default: result = {ok:false, error:'unknown action: '+body.action};
     }
     return respond(result);
@@ -1115,6 +1116,31 @@ function appendSysLog_(event, orderNo, claimedBy, detail){
     event: event, orderNo: orderNo || '', claimedBy: claimedBy || '', detail: detail || ''
   };
   sh.getRange(row, 1, 1, SYSLOG_HEADER.length).setValues([SYSLOG_HEADER.map(h=>rowObj[h])]);
+}
+
+// ---------------- 收集現場的連線失敗紀錄 ----------------
+// 用來量測「倉庫現場到底多久斷線一次」，作為要不要投入做離線佇列的判斷依據。
+// 裝置在斷線當下沒辦法回報（回報本身也要連線），所以是先存在裝置本機，
+// 等下一次任何一個請求成功時才一併補送過來——因此這裡收到的時間會晚於實際發生時間，
+// 「時間」欄位用的是裝置記錄的失敗當下時間，不是收到的時間。
+// 整批一次寫入，不要每筆都各自 getRange 一次（那樣20筆就要來回20次，很慢）。
+function logNetFailures(entries){
+  if(!entries.length) return {ok:true, 收到:0};
+  const sh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
+  const startRow = sh.getLastRow() + 1;
+  sh.getRange(startRow, colOf(SYSLOG_HEADER,'logTime'), entries.length, 1).setNumberFormat('@');
+  const rows = entries.map(e=>{
+    const rowObj = {
+      logTime: String(e.time||''),
+      event: '連線失敗',
+      orderNo: String(e.orderNo||''),
+      claimedBy: String(e.staffId||''),
+      detail: '動作：' + String(e.action||'?') + '　訊息：' + String(e.message||'')
+    };
+    return SYSLOG_HEADER.map(h=>rowObj[h]);
+  });
+  sh.getRange(startRow, 1, rows.length, SYSLOG_HEADER.length).setValues(rows);
+  return {ok:true, 收到: rows.length};
 }
 
 // 把所有逾時的認領一次放回待出貨。每次同步（自動排程4次＋手動按同步）都會跑一次。

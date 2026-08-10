@@ -392,7 +392,8 @@
 // ============================================================
 const LS = {
   orders: 'ssz_orders', log: 'ssz_log', staff: 'ssz_staff',
-  currentStaff: 'ssz_current_staff', settings: 'ssz_settings'
+  currentStaff: 'ssz_current_staff', settings: 'ssz_settings',
+  netFails: 'ssz_net_fails'
 };
 function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
 function saveJSON(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
@@ -462,14 +463,49 @@ let barcodeMap = {};
 // ============================================================
 function hasBackend(){ return !!(settings.backendUrl && settings.backendUrl.trim()); }
 
-async function apiGet(){
+// ---- 連線失敗紀錄 ----
+// 目的是先量出「現場到底多久斷線一次」，再決定值不值得做離線佇列那套工程。
+// 這裡有個先天限制：要記錄連線失敗，本身也需要連線。所以失敗當下先寫進本機，
+// 等下一次有任何一個請求成功時再一併補送到後端的「系統紀錄」分頁。
+// 診斷資料掉幾筆無所謂（跟出貨紀錄不同），所以用最簡單的做法就好，不要為它做重試機制。
+const NET_FAIL_MAX = 200; // 本機最多留這麼多筆，滿了丟掉最舊的，不要無限長大佔用 localStorage
+let flushingNetFails = false;
+function recordNetFailure(action, message){
+  try{
+    const list = loadJSON(LS.netFails, []);
+    list.push({
+      time: new Date().toLocaleString('zh-TW'),
+      action: action,
+      orderNo: current ? current.orderNo : '',
+      staffId: currentStaffId || '',
+      message: String(message||'').slice(0, 200)
+    });
+    saveJSON(LS.netFails, list.slice(-NET_FAIL_MAX));
+  }catch(e){ /* 連記錄都失敗就算了，不要因為診斷功能影響到正常作業 */ }
+}
+function flushNetFailures(){
+  if(flushingNetFails) return;
+  const list = loadJSON(LS.netFails, []);
+  if(!list.length) return;
+  flushingNetFails = true;
+  // 先清掉本機再送：萬一送出失敗，最多就是少了幾筆診斷資料，
+  // 不要因為送不出去就一直卡在這裡重送、把 localStorage 塞爆。
+  saveJSON(LS.netFails, []);
+  rawApiPost('logNetFailures', {entries: list})
+    .catch(()=>{ /* 診斷資料，送不出去就算了 */ })
+    .then(()=>{ flushingNetFails = false; });
+}
+
+// 真正發請求的底層函式，不含失敗記錄邏輯——補送連線失敗紀錄時要用這個，
+// 不然補送失敗又會記一筆新的失敗，變成無限循環。
+async function rawApiGet(){
   const res = await fetch(settings.backendUrl, {method:'GET'});
   if(!res.ok) throw new Error('HTTP '+res.status);
   const data = await res.json();
   if(data && data.ok===false) throw new Error(data.error||'後端回應失敗');
   return data;
 }
-async function apiPost(action, payload){
+async function rawApiPost(action, payload){
   const res = await fetch(settings.backendUrl, {
     method:'POST',
     headers:{'Content-Type':'text/plain;charset=utf-8'}, // 避免觸發CORS preflight，Apps Script用text/plain收再自行JSON.parse
@@ -480,6 +516,21 @@ async function apiPost(action, payload){
   // ok:false 分兩種：帶 error＝後端真的出錯（要丟例外）；帶 reason＝正常的業務判斷結果（如「已被別人認領」），交給呼叫端自己判斷 result.ok/result.reason，不當例外處理
   if(data && data.ok===false && data.error) throw new Error(data.error);
   return data;
+}
+
+async function apiGet(){
+  try{
+    const data = await rawApiGet();
+    flushNetFailures();
+    return data;
+  }catch(err){ recordNetFailure('getState', err.message); throw err; }
+}
+async function apiPost(action, payload){
+  try{
+    const data = await rawApiPost(action, payload);
+    flushNetFailures();
+    return data;
+  }catch(err){ recordNetFailure(action, err.message); throw err; }
 }
 
 function setConnStatus(kind, text){
