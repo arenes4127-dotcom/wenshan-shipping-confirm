@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-07.03';
+const BACKEND_VERSION = '2026-08-10.01';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -123,6 +123,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   installAutomationTriggers_: () => installAutomationTriggers_(),
   setupOrderManualCloseDropdown_: () => setupOrderManualCloseDropdown_(),
   setupOrderSheetColors: () => setupOrderSheetColors(),
+  setupDashboardSheet_: () => setupDashboardSheet_(),
   releaseStaleClaims_: () => releaseStaleClaims_(),
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
@@ -698,6 +699,149 @@ function previewArchiveShippedOrders_(){
     留著_出貨未滿保留天數: keptTooNew.length,
     留著的明細_未滿天數: keptTooNew.slice(0, 20)
   };
+}
+
+// ---------------- 「儀表板」分頁：即時營運概況 ----------------
+// 刻意全部用「公式」而不是用腳本把數字算好寫進去：公式會在來源資料一變動就自動重算，
+// 所以不需要另外排觸發器、也不用按重新整理，打開就是當下的狀況（這才叫即時）。
+// 腳本只負責「把公式擺上去」，跑一次就好，之後不用再跑。
+//
+// 兩個關鍵的資料特性，公式都必須跟著配合，不然數字會錯：
+//   1. 「狀態」欄存的是「待出貨 🔵」這種中文+燈號，所以比對一律用 "待出貨*" 萬用字元或 LEFT()。
+//   2. 「出貨紀錄」是一列一品項，同一張訂單會佔好幾列；但「需求件數(R欄)」只填在該訂單的
+//      第一列。所以要算「出貨了幾張訂單」就數 R 欄有值的列，不能直接數總列數（那是品項數）。
+//
+// 版面配置：會自動長高的區塊（掃描中/包貨人員/需注意紀錄）故意左右並排、都從第14列開始，
+// 各自往下長也不會互相撞到；如果改成上下排，其中一個變長就會蓋掉下面那一區。
+const SHEET_DASHBOARD = '儀表板';
+function setupDashboardSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_DASHBOARD);
+  if(!sh) sh = ss.insertSheet(SHEET_DASHBOARD, 0); // 放在最前面，打開試算表第一眼就看到
+  sh.clear();
+  sh.clearConditionalFormatRules();
+
+  const O = "'訂單'";   // 來源分頁名稱有中文，公式裡要加單引號
+  const G = "'出貨紀錄'";
+
+  // ---- 標題 ----
+  sh.getRange('A1').setValue('文山出貨　即時儀表板');
+  sh.getRange('A1:N1').merge().setFontSize(18).setFontWeight('bold')
+    .setBackground('#1c4587').setFontColor('#ffffff').setHorizontalAlignment('center');
+  sh.getRange('A2').setFormula(
+    '="資料即時連動，開啟或來源異動時自動更新　｜　本頁最後計算時間："&TEXT(NOW(),"yyyy/MM/dd HH:mm:ss")'
+  );
+  sh.getRange('A2:N2').merge().setFontColor('#666666').setHorizontalAlignment('center');
+
+  // ---- 區塊標題樣式 ----
+  const sectionTitle = (a1, text)=>{
+    sh.getRange(a1).setValue(text).setFontWeight('bold')
+      .setBackground('#cfe2f3').setFontColor('#1c4587');
+  };
+
+  // ---- 1. 訂單即時概況（A4:B9）----
+  // 四個狀態刻意做成「互斥」的（已出貨也要排除掉人工結案的，不然一張訂單會被算兩次），
+  // 這樣四個數字加起來剛好等於訂單總數，看到不一致就知道是資料有問題，而不是統計方式的錯。
+  sectionTitle('A4:B4', '📦 訂單即時概況');
+  const orderStats = [
+    ['待出貨', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")`],
+    ['掃描中', `=COUNTIFS(${O}!$G$2:$G,"掃描中*",${O}!$M$2:$M,"")`],
+    ['已出貨', `=COUNTIFS(${O}!$G$2:$G,"已出貨*",${O}!$M$2:$M,"")`],
+    ['人工結案', `=COUNTA(${O}!$M$2:$M)`],
+    ['訂單總數', `=COUNTA(${O}!$A$2:$A)`]
+  ];
+  orderStats.forEach((r, i)=>{
+    sh.getRange(5+i, 1).setValue(r[0]);
+    sh.getRange(5+i, 2).setFormula(r[1]);
+  });
+
+  // ---- 2. 出貨品質（D4:E9）----
+  // 都加上「R欄有值」的條件，才是以「訂單張數」為單位，不是品項列數
+  // 出貨紀錄每晚20:00備份後會清空，所以這一區永遠是「今天累積到現在」的量，不是歷史總計。
+  // 標題要寫清楚，不然早上看到一片0會以為是壞掉了。
+  sectionTitle('D4:E4', '✅ 本日出貨品質');
+  const qualityStats = [
+    ['完成 🟢', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"完成*")`],
+    ['錯誤 🔴', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"錯誤*")`],
+    ['待核對 🔵', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"待核對*")`],
+    ['人工修正數量', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$P$2:$P,"是*")`],
+    ['出貨總張數', `=COUNTIF(${G}!$R$2:$R,">0")`]
+  ];
+  qualityStats.forEach((r, i)=>{
+    sh.getRange(5+i, 4).setValue(r[0]);
+    sh.getRange(5+i, 5).setFormula(r[1]);
+  });
+
+  // ---- 3. 各賣場待出貨（G4:H）----
+  // 用 UNIQUE+FILTER 抓出目前實際有待出貨訂單的賣場，不寫死賣場名稱，
+  // 之後多了新品牌也會自己出現，不用回頭改公式。
+  sectionTitle('G4:H4', '🏪 各賣場待出貨');
+  sh.getRange('G5').setFormula(
+    `=IFERROR(UNIQUE(FILTER(${O}!$B$2:$B,LEFT(${O}!$G$2:$G,3)="待出貨",${O}!$M$2:$M="")),"（無）")`
+  );
+  sh.getRange('H5').setFormula(
+    `=ARRAYFORMULA(IF(G5:G12="","",COUNTIFS(${O}!$B$2:$B,G5:G12,${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")))`
+  );
+
+  // ---- 4. 目前掃描中（A13 起，往下長）----
+  sectionTitle('A13:E13', '🟠 目前掃描中（誰正在處理哪張）');
+  sh.getRange('A14:E14').setValues([['訂單號','賣場','認領人','認領時間','已經過(小時)']])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange('A15').setFormula(
+    `=IFERROR(FILTER({${O}!$A$2:$A,${O}!$B$2:$B,${O}!$H$2:$H,${O}!$I$2:$I},LEFT(${O}!$G$2:$G,3)="掃描中"),"目前沒有人在掃描")`
+  );
+  // 認領時間存的是 ISO 字串（2026-08-07T04:58:45.545Z），拆出日期跟時間再組回來，
+  // 加 8/24 換成台灣時間，跟 NOW() 相減得到已經過幾小時。格式不合就顯示空白不要噴錯。
+  sh.getRange('E15').setFormula(
+    '=ARRAYFORMULA(IF(D15:D30="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D15:D30,10))+TIMEVALUE(MID(D15:D30,12,8))+8/24))*24,1),"")))'
+  );
+
+  // ---- 5. 今日包貨人員（G13 起，往下長）----
+  sectionTitle('G13:H13', '👤 本日包貨人員出貨張數');
+  sh.getRange('G14:H14').setValues([['包貨人員','出貨張數']])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange('G15').setFormula(
+    `=IFERROR(UNIQUE(FILTER(${G}!$L$2:$L,${G}!$R$2:$R>0)),"（尚無出貨）")`
+  );
+  sh.getRange('H15').setFormula(
+    `=ARRAYFORMULA(IF(G15:G30="","",COUNTIFS(${G}!$L$2:$L,G15:G30,${G}!$R$2:$R,">0")))`
+  );
+
+  // ---- 6. 需要注意的出貨紀錄（J13 起，往下長）----
+  // 直接用核對結果裡的燈號來篩：紅燈(錯誤)或橘燈(有人工介入)的才列出來，
+  // 不用再自己組一堆條件，燈號本身就是既有的分類結果。
+  sectionTitle('J13:N13', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
+  sh.getRange('J14:M14').setValues([['訂單號','包貨人員','核對結果','差異明細']])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange('J15').setFormula(
+    `=IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
+    + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄")`
+  );
+
+  // ---- 版面 ----
+  sh.setColumnWidth(1, 130); sh.setColumnWidth(2, 90);
+  sh.setColumnWidth(3, 24);
+  sh.setColumnWidth(4, 130); sh.setColumnWidth(5, 100);
+  sh.setColumnWidth(6, 24);
+  sh.setColumnWidth(7, 130); sh.setColumnWidth(8, 90);
+  sh.setColumnWidth(9, 24);
+  sh.setColumnWidth(10, 140); sh.setColumnWidth(11, 100);
+  sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
+  sh.getRange('B5:B9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('E5:E9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.setFrozenRows(2);
+
+  // 待出貨數字上色：0張是綠的（都出完了），越多越要注意
+  sh.setConditionalFormatRules([
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('B5')]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberEqualTo(0).setBackground('#d9ead3').setRanges([sh.getRange('B5')]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(0).setBackground('#f4cccc').setRanges([sh.getRange('E6')]).build()
+  ]);
+
+  Logger.log('「儀表板」分頁已建立（公式驅動，資料異動自動重算，不需要排程）。');
 }
 
 // ---------------- 一次性設定用：安裝上面兩組自動排程的時間觸發器 ----------------
