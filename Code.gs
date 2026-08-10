@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.26';
+const BACKEND_VERSION = '2026-08-10.28';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -41,7 +41,12 @@ const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'
 // logisticsConfirmed／logisticsTime 一樣加在最後面，既有資料列不會位移，不用跑migration。
 // 這兩欄記的是「包裝完成之後，有沒有真的被掃進物流籃」——來源是人員本來就在用的
 // 「統計V2」分頁（他們在那裡掃訂單號確認上籃），我們只讀不寫。
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime'];
+// pickedJson：這張訂單「哪些品號已經揀好了」，存成 {"品號":{"by":"工號","at":"時間"}} 的JSON。
+// 放在訂單列上而不是另開一張表，是為了讓 getState 不用多讀一張表——揀貨畫面要能秒開，
+// 而 getState 本來就已經要讀「訂單」分頁了。稽核用的逐筆紀錄另外寫「揀貨紀錄」分頁。
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson'];
+const SHEET_PICKLOG = '揀貨紀錄';
+const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action'];
 // 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
 const MANUAL_CLOSE_OPTIONS = ['出貨完成', '缺貨取消', '取消訂單'];
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
@@ -70,7 +75,8 @@ const HEADER_LABELS = {
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
   logTime:'時間', event:'事件', detail:'說明',
-  logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間'
+  logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
+  pickedJson:'已揀品項(JSON)', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作'
 };
 
 function doGet(e){
@@ -93,6 +99,7 @@ function doPost(e){
       case 'runOneTimeSetup': result = runOneTimeSetup(body.name, body.arg); break;
       case 'uploadFileToDrive': result = uploadFileToDrive(body.folderId, body.fileName, body.content, body.mimeType); break;
       case 'logNetFailures': result = logNetFailures(body.entries || []); break;
+      case 'markPickedBatch': result = markPickedBatch(body.ops || []); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -254,6 +261,12 @@ function getState(){
       logisticsConfirmed: String(r.logisticsConfirmed || '').trim(),
       logisticsTime: String(r.logisticsTime || '').trim()
     };
+    // 把「已揀」狀態掛回各品項上，前端就不用自己再對一次
+    const picked = safeParse(r.pickedJson, {});
+    orders[r.orderNo].items.forEach(it=>{
+      const hit = picked[it.sku];
+      if(hit){ it.picked = true; it.pickedBy = hit.by || ''; it.pickedAt = hit.at || ''; }
+    });
   });
   // 出貨紀錄現在存的是「一列一品項」，同一次出貨的N個品項會連續寫N列（訂單層級欄位重複），
   // 這裡依「訂單號+完成時間」把同一次出貨的品項列重新組回一筆帶items陣列的紀錄，
@@ -393,7 +406,9 @@ function mergeOrders(incoming){
       manualClose: existing ? (existing.manualClose||'') : '',
       // 物流籃確認同理：那是人員實際掃出來的結果，同步只更新訂單內容，不能覆蓋掉
       logisticsConfirmed: existing ? (existing.logisticsConfirmed||'') : '',
-      logisticsTime: existing ? (existing.logisticsTime||'') : ''
+      logisticsTime: existing ? (existing.logisticsTime||'') : '',
+      // 揀貨狀態是人員實際揀出來的，同步只更新訂單內容，不能洗掉
+      pickedJson: existing ? (existing.pickedJson||'') : ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     if(existing) updated++; else added++;
@@ -436,7 +451,9 @@ function autoSyncOrders_(){
   const idx = name => header.indexOf(name);
   const iOrder = idx('訂單'), iSku = idx('品號'), iName = idx('品名'), iSpec = idx('規格'),
         iQty = idx('數量'), iStore = idx('賣場'), iDate = idx('日期'), iStatus = idx('訂單狀態'),
-        iShipMethod = idx('寄送方式');
+        iShipMethod = idx('寄送方式'),
+        // 揀貨用：儲位決定走動路線，庫存讓人員當場判斷是不是真的缺貨
+        iLocation = idx('文山儲位'), iStockWs = idx('文山'), iStockMain = idx('總倉');
   if(iOrder < 0 || iSku < 0 || iQty < 0){
     Logger.log('鏡像分頁欄位格式不符（找不到訂單/品號/數量欄），無法自動同步');
     return;
@@ -458,10 +475,13 @@ function autoSyncOrders_(){
     const date = iDate>=0 ? parseOrderDate_(row[iDate]) : '';
     const shipMethod = iShipMethod>=0 ? String(row[iShipMethod]||'').trim() : '';
     const routingStatus = iStatus>=0 ? String(row[iStatus]||'').trim() : '';
+    const location = iLocation>=0 ? String(row[iLocation]||'').trim() : '';
+    const stockWs = iStockWs>=0 ? String(row[iStockWs]||'').trim() : '';
+    const stockMain = iStockMain>=0 ? String(row[iStockMain]||'').trim() : '';
     if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, routingStatus, items:[]};
     const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
     if(existingItem) existingItem.qty += qty;
-    else parsed[orderNo].items.push({sku, name, baseName, spec, qty});
+    else parsed[orderNo].items.push({sku, name, baseName, spec, qty, location, stockWs, stockMain});
   }
 
   const result = mergeOrders(parsed);
@@ -1129,7 +1149,7 @@ function healOrderRowIfNeeded_(sh, row){
     updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '',
     // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
     // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
-    manualClose: '', logisticsConfirmed: '', logisticsTime: ''};
+    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: ''};
   // 寫回試算表的狀態要轉成中文，回傳給呼叫端的物件維持英文代碼
   sh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
     .setValues([ORDERS_HEADER.map(h=> h==='status' ? statusToText(fixed.status) : fixed[h])]);
@@ -1187,6 +1207,105 @@ function logNetFailures(entries){
   });
   sh.getRange(startRow, 1, rows.length, SYSLOG_HEADER.length).setValues(rows);
   return {ok:true, 收到: rows.length};
+}
+
+// ---------------- 揀貨：批次記錄「已揀 / 取消揀」 ----------------
+// 刻意做成批次：揀貨是連續動作，一件一件送出的話每件都要等後端 1.2 秒以上，現場根本沒辦法用。
+// 前端點下去先本機更新畫面（樂觀），累積幾筆再一起送過來，這裡一次寫完。
+// 同一張訂單的多個品項會合併成一次儲存格寫入，不會每個品項各寫一次。
+function markPickedBatch(ops){
+  if(!ops || !ops.length) return {ok:true, 處理筆數:0};
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const byOrderNo = {};
+  rows.forEach(r=> byOrderNo[r.orderNo] = r);
+
+  const pickedCol = colOf(ORDERS_HEADER, 'pickedJson');
+  const touched = {};   // orderNo -> 這張訂單最新的 picked 物件
+  const logRows = [];
+  let applied = 0, notFound = 0;
+
+  ops.forEach(op=>{
+    const orderNo = String(op.orderNo||'').trim();
+    const sku = String(op.sku||'').trim();
+    const row = byOrderNo[orderNo];
+    if(!row || !sku){ notFound++; return; }
+    if(!touched[orderNo]) touched[orderNo] = safeParse(row.pickedJson, {});
+    if(op.action === 'unpick'){
+      delete touched[orderNo][sku];
+    } else {
+      touched[orderNo][sku] = {by: op.pickerId||'', at: op.time||''};
+    }
+    applied++;
+    logRows.push({
+      logTime: op.time || '', orderNo: orderNo, sku: sku,
+      baseName: op.baseName || '', location: op.location || '', qty: op.qty || '',
+      pickerId: op.pickerId || '', pickerName: op.pickerName || '',
+      action: op.action === 'unpick' ? '取消揀貨' : '揀貨'
+    });
+  });
+
+  Object.keys(touched).forEach(orderNo=>{
+    const r = byOrderNo[orderNo];
+    sh.getRange(r._row, pickedCol).setValue(JSON.stringify(touched[orderNo]));
+  });
+
+  if(logRows.length){
+    const logSh = getSheet(SHEET_PICKLOG, PICKLOG_HEADER);
+    const start = logSh.getLastRow() + 1;
+    logSh.getRange(start, colOf(PICKLOG_HEADER,'logTime'), logRows.length, 1).setNumberFormat('@');
+    logSh.getRange(start, 1, logRows.length, PICKLOG_HEADER.length)
+         .setValues(logRows.map(o=> PICKLOG_HEADER.map(h=> o[h])));
+  }
+  return {ok:true, 處理筆數: applied, 找不到訂單: notFound};
+}
+
+// ---------------- 揀貨路線：把儲位換算成「走動順序」 ----------------
+// 依據倉庫地圖（儲位主檔的「儲位類品(地圖)」分頁）：排的實體排列是
+//   L K J I H G F E D C B A   ← 由左到右，不是字母順序，所以不能直接用字串排序
+// 每一排有 1~12 座，儲位寫成「M55-3」＝ M排 55座 3層。
+//
+// 走蛇行（boustrophedon）：第一排由小座號往大走，下一排由大往小走，
+// 這樣走完一排就直接接著走下一排，不用再走回起點——這是揀貨路線最基本也最有效的優化。
+//
+// 實測 7122 個有儲位的品項：非標準格式（「鐵門前」「架上」「前排展示」）只佔 639 項（9%），
+// 一律排在最後——它們多半是散裝／展示區，順路最後帶走，而且沒有座標可以排。
+//
+// 注意：地圖上只畫了 A~L，但實際資料裡還有 M 排（1624 項，佔23%，是最大的一區，座號12~66）
+// 以及 P/Q/R/S/T/U（各數十項，座號3~5）。這些不在地圖上的排，我們不知道它們的實體位置，
+// 所以「不能亂猜順序」——猜錯會讓路線比不排序還糟。目前的處理是：地圖上的排照地圖走完之後，
+// 地圖外的排依字母集中排在一起（至少同一排的貨會被收在一起拿，不會散在整趟路線裡）。
+// 等使用者確認 M 排等實際位置之後，把它們加進 AISLE_ORDER 就能一併納入蛇行路線。
+const AISLE_ORDER = ['L','K','J','I','H','G','F','E','D','C','B','A'];
+
+function parseLocation_(loc){
+  const s = String(loc||'').trim();
+  if(!s) return null;
+  // 一個品項可能寫多個儲位（「B09-1、B10-2」），取第一個當作路線依據
+  const first = s.split(/[、,，\s]/)[0];
+  const m = first.match(/^([A-Za-z])\s*(\d{1,3})\s*-\s*(\d{1,2})/);
+  if(!m) return null;
+  const aisle = m[1].toUpperCase();
+  return {
+    aisle: aisle,
+    aisleIndex: AISLE_ORDER.indexOf(aisle), // -1 = 不在地圖上
+    bay: parseInt(m[2], 10),
+    level: parseInt(m[3], 10)
+  };
+}
+
+// 回傳可直接排序的字串鍵。分三層：
+//   0 = 地圖上的排（照地圖順序走蛇行）
+//   1 = 有座標但不在地圖上的排（M/P/Q/R/S/T/U，依字母集中）
+//   2 = 描述性位置（鐵門前／架上／前排展示…）
+function locationSortKey_(loc){
+  const pad = n => String(n).padStart(3, '0');
+  const p = parseLocation_(loc);
+  if(!p) return '2|ZZZ|999|999|' + String(loc||'');
+  if(p.aisleIndex < 0) return '1|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  // 蛇行：奇數排反向走，座號用 (999 - bay) 讓它由大往小排
+  const bay = (p.aisleIndex % 2 === 1) ? (999 - p.bay) : p.bay;
+  return '0|' + pad(p.aisleIndex) + '|' + pad(bay) + '|' + pad(p.level) + '|' + String(loc||'');
 }
 
 // ---------------- 物流籃確認：讀「統計V2」人員掃上籃的紀錄，回填到我們的訂單分頁 ----------------
@@ -2103,7 +2222,7 @@ function migrateOrdersColumnShift(){
       status: statusToText(textToStatus(oldStatus) || 'pending'),
       claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '', updatedAt: oldUpdatedAt || '',
       shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '', manualClose: '',
-      logisticsConfirmed: '', logisticsTime: ''
+      logisticsConfirmed: '', logisticsTime: '', pickedJson: ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     migrated++;
@@ -2265,7 +2384,12 @@ function setupImportedMirrorSheets(){
   let orderSh = ss.getSheetByName('文山出貨V2');
   if(!orderSh) orderSh = ss.insertSheet('文山出貨V2');
   orderSh.getRange('A1').setFormula(
-    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,31)'
+    // 欄位：1日期 2賣場 3下單時間 4寄送方式 5訂單 6品名 7規格 8品號 9數量
+    //       12文山儲位 13總倉 14文山（揀貨要用：儲位決定走動路線，庫存讓人員判斷缺不缺）
+    //       31訂單狀態
+    // 這裡多抓的三欄不影響既有邏輯——autoSyncOrders_ 是用表頭名稱找欄位（header.indexOf），
+    // 不是用寫死的欄號，所以欄位順序變動不會讓它讀錯。
+    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,12,13,14,31)'
   );
 
   // 條碼轉品號：「國際碼」分頁本身也是IMPORTRANGE鏡像，直接接到它指向的真正來源

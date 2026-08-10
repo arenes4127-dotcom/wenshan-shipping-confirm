@@ -226,6 +226,30 @@
     </section>
 
     <!-- ============ 訂單資料 ============ -->
+    <!-- ============ 揀貨 ============ -->
+    <section id="view-pick" class="view">
+      <div class="section-label">揀貨路線</div>
+      <div class="card">
+        <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap;">
+          <select id="pickStaffSelect" style="flex:1;min-width:150px;"></select>
+          <button class="btn gray sm" id="btnPickRefresh">重新整理</button>
+        </div>
+        <p class="hint" id="pickSummary">載入中…</p>
+        <label class="field" style="margin-top:8px;margin-bottom:0;">
+          <span>只看某個賣場／寄送方式（留空＝全部）</span>
+          <input id="pickFilter" type="text" placeholder="例如：蝦皮店到店" autocomplete="off">
+        </label>
+        <div class="row" style="margin-top:10px;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">
+            <input type="checkbox" id="pickHideDone" checked style="width:auto;"> 隱藏已揀
+          </label>
+        </div>
+      </div>
+
+      <div class="section-label">依走動順序排列</div>
+      <div id="pickList"></div>
+    </section>
+
     <section id="view-orders" class="view">
       <div class="section-label">從雲端同步</div>
       <div class="card">
@@ -365,6 +389,10 @@
       <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 7V4h3M21 7V4h-3M3 17v3h3M21 17v3h-3M4 12h16"/></svg></span>
       掃描出貨
     </button>
+    <button data-goto="pick">
+      <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 6h13l-1.5 8H5.5z"/><circle cx="7" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/><path d="M3 6L2 3"/></svg></span>
+      揀貨
+    </button>
     <button data-goto="orders">
       <span class="ic"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></svg></span>
       訂單資料
@@ -393,7 +421,7 @@
 const LS = {
   orders: 'ssz_orders', log: 'ssz_log', staff: 'ssz_staff',
   currentStaff: 'ssz_current_staff', settings: 'ssz_settings',
-  netFails: 'ssz_net_fails'
+  netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue'
 };
 function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
 function saveJSON(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
@@ -585,10 +613,11 @@ async function gotoView(name){
   document.querySelectorAll('nav.tabbar button').forEach(b=>b.classList.toggle('active', b.dataset.goto===name));
   if(name==='home') renderHome();
   if(name==='orders') renderPending();
+  if(name==='pick') renderPickList();
   if(name==='log') renderLog();
   if(name==='settings') renderSettings();
   if(name==='scan') setTimeout(()=>inputOrder && inputOrder.focus(), 30);
-  if((name==='home' || name==='orders' || name==='log') && hasBackend() && !current){
+  if((name==='home' || name==='orders' || name==='log' || name==='pick') && hasBackend() && !current){
     const ok = await refreshFromBackend(true);
     if(ok){ renderPending(); renderLog(); renderHome(); }
   }
@@ -903,6 +932,141 @@ document.getElementById('btnClearOrders').addEventListener('click', ()=>{
   saveJSON(LS.orders, orders);
   renderPending(); renderHome();
 });
+
+// ============================================================
+// 揀貨
+// ============================================================
+// 走動順序完全跟後端 locationSortKey_() 同一套規則（倉庫地圖 L→A 蛇行）。
+// 兩邊都要有是因為：後端負責寫入與稽核，前端要能離線排序、點下去立刻重排，不能每次都問後端。
+const AISLE_ORDER = ['L','K','J','I','H','G','F','E','D','C','B','A'];
+function parseLocation(loc){
+  const s = String(loc||'').trim();
+  if(!s) return null;
+  const first = s.split(/[、,，\s]/)[0];
+  const m = first.match(/^([A-Za-z])\s*(\d{1,3})\s*-\s*(\d{1,2})/);
+  if(!m) return null;
+  const aisle = m[1].toUpperCase();
+  return {aisle, aisleIndex: AISLE_ORDER.indexOf(aisle), bay: parseInt(m[2],10), level: parseInt(m[3],10)};
+}
+function locationSortKey(loc){
+  const pad = n => String(n).padStart(3,'0');
+  const p = parseLocation(loc);
+  if(!p) return '2|ZZZ|999|999|' + String(loc||'');
+  if(p.aisleIndex < 0) return '1|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  const bay = (p.aisleIndex % 2 === 1) ? (999 - p.bay) : p.bay;
+  return '0|' + pad(p.aisleIndex) + '|' + pad(bay) + '|' + pad(p.level) + '|' + String(loc||'');
+}
+
+// 待送出的揀貨動作。跟出貨那邊一樣走樂觀更新：點下去畫面立刻反應，
+// 累積起來批次送後端——揀貨是連續動作，每點一件就等一次網路的話現場沒辦法用。
+let pickQueue = [];
+let pickFlushTimer = null;
+const PICK_FLUSH_MS = 2500;
+
+function pickableOrders(){
+  return Object.values(orders).filter(o=>o.status === 'pending' && !isManuallyClosed(o));
+}
+
+function renderPickList(){
+  renderStaffSelects();
+  const container = document.getElementById('pickList');
+  const kw = (document.getElementById('pickFilter').value||'').trim().toLowerCase();
+  const hideDone = document.getElementById('pickHideDone').checked;
+
+  // 把所有待出貨訂單的品項攤平成一條清單，再依走動順序排序。
+  // 同一個儲位可能有多張訂單的貨，攤平之後才能一次拿完，不用為了每張訂單各走一趟。
+  let rows = [];
+  pickableOrders().forEach(o=>{
+    if(kw && !((o.store||'')+' '+(o.shipMethod||'')+' '+o.orderNo).toLowerCase().includes(kw)) return;
+    (o.items||[]).forEach(it=>{
+      rows.push({orderNo:o.orderNo, store:o.store||'', shipMethod:o.shipMethod||'',
+        sku:it.sku, baseName:it.baseName||it.name||'', spec:it.spec||'', qty:it.qty||0,
+        location:it.location||'', stockWs:it.stockWs||'', picked:!!it.picked, pickedBy:it.pickedBy||''});
+    });
+  });
+  const total = rows.length, done = rows.filter(r=>r.picked).length;
+  if(hideDone) rows = rows.filter(r=>!r.picked);
+  rows.sort((a,b)=> locationSortKey(a.location) < locationSortKey(b.location) ? -1 : 1);
+
+  document.getElementById('pickSummary').textContent =
+    total ? `共 ${total} 項，已揀 ${done} 項，剩 ${total-done} 項` + (pickQueue.length? `（${pickQueue.length} 筆待同步）`:'')
+          : '目前沒有待揀的品項';
+
+  if(!rows.length){
+    container.innerHTML = `<div class="card"><p class="hint">${total? '全部揀完了 🎉' : '沒有符合條件的品項'}</p></div>`;
+    return;
+  }
+
+  // 依儲位分組顯示：同一個儲位的東西擺在一起，人員走到那一格就能一次拿完
+  let html = '', lastLoc = null;
+  rows.forEach(r=>{
+    if(r.location !== lastLoc){
+      lastLoc = r.location;
+      html += `<div class="section-label" style="margin-top:14px;">${escapeHtml(r.location||'（無儲位）')}</div>`;
+    }
+    html += `<div class="card" style="padding:12px;margin-bottom:8px;${r.picked?'opacity:.5;':''}"
+        onclick="togglePick('${escapeHtml(r.orderNo)}','${escapeHtml(r.sku)}')">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+          <div style="flex:1;min-width:0;">
+            <div style="font-weight:700;${r.picked?'text-decoration:line-through;':''}">${escapeHtml(r.baseName)}${r.spec?`（${escapeHtml(r.spec)}）`:''}</div>
+            <div class="hint" style="margin-top:2px;">${escapeHtml(r.sku)}　${escapeHtml(r.store)}　${escapeHtml(r.orderNo)}</div>
+          </div>
+          <div style="text-align:right;white-space:nowrap;">
+            <div style="font-size:22px;font-weight:800;">×${r.qty}</div>
+            <div class="hint">文山 ${escapeHtml(String(r.stockWs||'-'))}</div>
+          </div>
+        </div>
+      </div>`;
+  });
+  container.innerHTML = html;
+}
+
+function togglePick(orderNo, sku){
+  const staffSel = document.getElementById('pickStaffSelect');
+  const pickerId = staffSel ? staffSel.value : '';
+  if(!pickerId){ errorBeep(); flash('err','請先選擇揀貨人員','上方選單選好人才能開始揀貨',1600); return; }
+  const o = orders[orderNo];
+  if(!o) return;
+  const it = (o.items||[]).find(i=>i.sku===sku);
+  if(!it) return;
+
+  const staffObj = staff.find(s=>s.id===pickerId);
+  const nowIso = new Date().toLocaleString('zh-TW');
+  it.picked = !it.picked;                 // 本機先反應，不等後端
+  it.pickedBy = it.picked ? pickerId : '';
+  saveJSON(LS.orders, orders);
+  okBeep();
+
+  pickQueue.push({orderNo, sku, action: it.picked ? 'pick' : 'unpick',
+    pickerId, pickerName: staffObj?staffObj.name:'', time: nowIso,
+    baseName: it.baseName||it.name||'', location: it.location||'', qty: it.qty||0});
+  saveJSON(LS.pickQueue, pickQueue);
+  schedulePickFlush();
+  renderPickList();
+}
+
+function schedulePickFlush(){
+  if(pickFlushTimer) clearTimeout(pickFlushTimer);
+  pickFlushTimer = setTimeout(flushPickQueue, PICK_FLUSH_MS);
+}
+function flushPickQueue(){
+  pickFlushTimer = null;
+  if(!pickQueue.length || !hasBackend()) return;
+  const batch = pickQueue.slice();
+  apiPost('markPickedBatch', {ops: batch})
+    .then(()=>{
+      // 只移除這次送出的那幾筆——期間人員可能又點了新的，不能整個清空
+      pickQueue = pickQueue.slice(batch.length);
+      saveJSON(LS.pickQueue, pickQueue);
+      const v = document.getElementById('view-pick');
+      if(v && v.classList.contains('active')) renderPickList();
+    })
+    .catch(()=>{ schedulePickFlush(); }); // 送不出去就等下一輪再試，資料留在佇列裡
+}
+
+function escapeHtml(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 function renderPending(){
   const tbody = document.getElementById('pendingTable');
@@ -1389,6 +1553,13 @@ function renderStaffSelects(){
     sel.innerHTML = optionsHtml;
     sel.value = currentStaffId;
   });
+  // 揀貨人員獨立選單：揀貨跟包貨常常不是同一個人，不要跟首頁的「目前包貨人員」綁在一起
+  const pickSel = document.getElementById('pickStaffSelect');
+  if(pickSel){
+    const keep = pickSel.value;
+    pickSel.innerHTML = optionsHtml;
+    pickSel.value = (keep && staff.find(s=>s.id===keep)) ? keep : currentStaffId;
+  }
   const staffObj = staff.find(s=>s.id===currentStaffId);
   document.getElementById('headerStaffName').textContent = staffObj ? staffObj.name : '未選擇';
 }
@@ -1550,6 +1721,18 @@ function countShippedToday(){
 // 初始化
 // ============================================================
 renderHome();
+// ---- 揀貨初始化 ----
+pickQueue = loadJSON(LS.pickQueue, []);
+if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就繼續送
+['pickFilter','pickHideDone'].forEach(id=>{
+  const el = document.getElementById(id);
+  if(el) el.addEventListener(el.type==='checkbox'?'change':'input', renderPickList);
+});
+const btnPickRefresh = document.getElementById('btnPickRefresh');
+if(btnPickRefresh) btnPickRefresh.addEventListener('click', ()=>{
+  refreshFromBackend(true).then(()=>renderPickList());
+});
+
 renderPending();
 renderLog();
 renderStaffList();
