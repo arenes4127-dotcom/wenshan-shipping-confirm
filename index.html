@@ -75,6 +75,7 @@
   .pill.wait{background:var(--panel3);color:var(--muted);}
   .pill.scan{background:var(--blue-dim);color:var(--blue);}
   .pill.done{background:var(--accent-dim);color:var(--accent);}
+  .pill.warn{background:rgba(230,145,56,.18);color:#e69138;}
   .pill::before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor;}
 
   /* ---- tables ---- */
@@ -982,11 +983,62 @@ inputOrder.addEventListener('keydown', async e=>{
       })
       .catch(err=>{
         if(mySession !== scanSession) return;
-        // 連線失敗時無法確認別人有沒有在處理同一張，維持原本的保守做法：退出這張訂單。
-        rollbackClaim(code, '連線失敗', err.message + '，請確認網路後重新掃描這張訂單');
+        // 連線失敗不把人踢出去：網路只是斷一下的話，讓人員繼續掃比較實際，
+        // 真的有兩個人同時處理同一張，最後「完成出貨」那一步的重複防呆會擋下來
+        // （後端看到訂單已經是已出貨就回 already_shipped，不會寫出第二筆紀錄）。
+        // 但要讓人員知道現在這張沒拿到認領鎖，並且持續在背景重試。
+        markClaimUnverified(code, mySession, err.message);
       });
   }
 });
+
+// ---- 離線容錯：認領沒拿到也讓人員繼續掃，背景持續重試 ----
+// 網路斷線時無法確認別人有沒有在處理同一張。這裡選擇讓人員繼續作業（現場斷線多半只是一下下），
+// 風險由「完成出貨」那一步的重複防呆承接：後端看到訂單已經是已出貨就回 already_shipped，
+// 不會產生第二筆出貨紀錄。代價是萬一真的撞單，後完成的那個人會白包一次。
+// 為了把這個代價壓到最小，這裡會持續在背景重試認領——一旦網路回來就補拿到鎖；
+// 如果重試發現這張真的已經被別人處理掉了，就立刻大聲告知，不要等到最後才發現白做工。
+let claimRetryTimer = null;
+function stopClaimRetry(){
+  if(claimRetryTimer){ clearInterval(claimRetryTimer); claimRetryTimer = null; }
+}
+function markClaimUnverified(orderNo, mySession, errMsg){
+  if(!current) return;
+  current.claimUnverified = true;
+  setPill('warn', `訂單 ${orderNo} 掃描中（離線作業，尚未取得認領鎖）`);
+  flash('err','目前連線不到伺服器', (errMsg||'') + '　可以繼續掃描，完成出貨時會再確認一次；若同時有人處理同一張，後完成的那一方會被擋下', 3200);
+  stopClaimRetry();
+  claimRetryTimer = setInterval(()=>{
+    // 人員已經離開這張訂單（中止／換單／完成出貨）就不用再重試了
+    if(!current || mySession !== scanSession){ stopClaimRetry(); return; }
+    const staffObj = staff.find(s=>s.id===currentStaffId);
+    apiPost('claimOrder', {orderNo, staffId: currentStaffId, staffName: staffObj?staffObj.name:''})
+      .then(result=>{
+        if(!current || mySession !== scanSession){ stopClaimRetry(); return; }
+        if(result.ok){
+          stopClaimRetry();
+          current.claimUnverified = false;
+          if(result.order && result.order.claimedAt){
+            current.claimedAt = result.order.claimedAt;
+            if(orders[orderNo]) orders[orderNo].claimedAt = result.order.claimedAt;
+            saveJSON(LS.orders, orders);
+          }
+          setPill('scan', `訂單 ${orderNo} 掃描中`);
+          flash('ok','已連線並取得認領鎖', '可以放心繼續，這張訂單已經鎖定在你名下', 1800);
+          return;
+        }
+        // 連得上、但這張已經被別人處理了——立刻講清楚，讓人員自己決定要不要繼續包
+        stopClaimRetry();
+        const who = result.reason === 'claimed_by_other' ? `已被「${result.claimedBy}」認領` :
+                    result.reason === 'already_shipped' ? '已經有人完成出貨' :
+                    result.reason === 'manually_closed' ? `已人工結案（${result.manualClose}）` : (result.reason||'無法認領');
+        setPill('warn', `訂單 ${orderNo} ${who}`);
+        errorBeep();
+        flash('err','這張訂單已經有人處理', who + '，建議先停下來確認，繼續包可能會白做工（完成出貨時會被擋下）', 4000);
+      })
+      .catch(()=>{ /* 還是連不上，等下一輪再試 */ });
+  }, 15000);
+}
 
 // 品項內容的比較用簽章：只看貨號跟應出數量，順序不影響（後端重組時順序可能不同）
 function itemsSignature(items){
@@ -1010,6 +1062,7 @@ function rollbackClaim(orderNo, title, detail){
 }
 
 function closeScanScreen(){
+  stopClaimRetry(); // 離開這張訂單就不要再背景重試認領了
   current = null;
   document.getElementById('stage-items').style.display='none';
   document.getElementById('stage-order').style.display='block';
