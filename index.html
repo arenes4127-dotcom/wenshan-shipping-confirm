@@ -876,6 +876,9 @@ document.getElementById('pendingSearch').addEventListener('input', renderPending
 // 掃描出貨流程
 // ============================================================
 let current = null;
+// 掃描階段編號：每進入一次掃描畫面就 +1。背景的認領請求回來時要比對它還是不是同一個，
+// 用來丟掉「使用者已經中止或已經換掃別張訂單」之後才姍姍來遲的過期回應。
+let scanSession = 0;
 const inputOrder = document.getElementById('inputOrder');
 const inputBarcode = document.getElementById('inputBarcode');
 const inputFinalWaybill = document.getElementById('inputFinalWaybill');
@@ -907,32 +910,20 @@ inputOrder.addEventListener('keydown', async e=>{
     return;
   }
 
-  if(hasBackend()){
-    const staffObj = staff.find(s=>s.id===currentStaffId);
-    try{
-      const result = await apiPost('claimOrder', {orderNo: code, staffId: currentStaffId, staffName: staffObj?staffObj.name:''});
-      if(!result.ok){
-        errorBeep();
-        if(result.reason === 'claimed_by_other') flash('err','此訂單正在處理中', `已被「${result.claimedBy}」認領，請改處理其他訂單`, 1600);
-        else if(result.reason === 'already_shipped') flash('err','此訂單已出貨', '', 1200);
-        else if(result.reason === 'manually_closed') flash('err','此訂單已人工結案', `結案原因：${result.manualClose}，不需要由文山出貨`, 1800);
-        else flash('err','認領訂單失敗', result.reason||'', 1300);
-        await refreshFromBackend(true);
-        renderPending();
-        return;
-      }
-      order = Object.assign({}, order, result.order, {status:'scanning'});
-    }catch(err){
-      errorBeep();
-      flash('err','連線失敗', err.message, 1500);
-      return;
-    }
-  } else {
-    order.status = 'scanning';
-    if(!order.claimedAt) order.claimedAt = new Date().toISOString(); // 本機模式沒有後端幫忙記，自己記一份開始時間
-  }
+  // 樂觀渲染：商品明細本來就已經在本機的 orders[code].items 裡了，等後端那 1.2 秒以上的
+  // 來回其實不是在「載入商品」，而是在等多人共用的認領鎖。所以先立刻把畫面畫出來讓人員可以開始掃，
+  // 認領請求丟到背景跑，回來再對帳——認領失敗就整個退回去。
+  // 這個取捨划算的原因：人員掃完訂單號、拿起第一件商品再掃本來就要兩秒以上，認領結果幾乎一定
+  // 在他掃到第一件之前就回來了；而認領衝突要兩個人同時掃同一張才會發生，極罕見。
+  order = Object.assign({}, order, {status:'scanning'});
+  if(!order.claimedAt) order.claimedAt = new Date().toISOString(); // 先暫記，後端回來會用它的權威值覆蓋
   orders[code] = order;
   saveJSON(LS.orders, orders);
+
+  // 每進入一次掃描畫面就換一個新的 session 編號。背景的認領回應回來時要先確認
+  // session 還是同一個，否則就是「使用者已經中止、或已經換掃另一張訂單」，這個回應已經過期，
+  // 不能拿去改到現在這一張（不然會把別張訂單的認領結果套到當下這張上面）。
+  const mySession = ++scanSession;
 
   current = order;
   // scanned/noBarcodeCount/overScanCount/manualEditHistory 都是「這個品項自己」的紀錄，
@@ -955,7 +946,78 @@ inputOrder.addEventListener('keydown', async e=>{
   renderPending(); renderHome();
   okBeep();
   setTimeout(()=>inputBarcode.focus(), 50);
+
+  // ---- 背景認領（不擋畫面）----
+  if(hasBackend()){
+    const staffObj = staff.find(s=>s.id===currentStaffId);
+    apiPost('claimOrder', {orderNo: code, staffId: currentStaffId, staffName: staffObj?staffObj.name:''})
+      .then(result=>{
+        if(mySession !== scanSession) return; // 回應過期了（已中止或已換別張），不要動現在的畫面
+        if(!result.ok){
+          if(result.reason === 'claimed_by_other') rollbackClaim(code, '此訂單正在處理中', `已被「${result.claimedBy}」認領，請改處理其他訂單`);
+          else if(result.reason === 'already_shipped') rollbackClaim(code, '此訂單已出貨', '這張訂單已經有人出貨完成了');
+          else if(result.reason === 'manually_closed') rollbackClaim(code, '此訂單已人工結案', `結案原因：${result.manualClose}，不需要由文山出貨`);
+          else rollbackClaim(code, '認領訂單失敗', result.reason||'');
+          return;
+        }
+        // 認領成功：把後端的權威值補上。開始時間要用後端那份，才不會因為裝置時間不準
+        // 讓出貨紀錄的「確認訂單開始時間」跟其他人對不起來。
+        if(result.order && result.order.claimedAt){
+          current.claimedAt = result.order.claimedAt;
+          if(orders[code]) orders[code].claimedAt = result.order.claimedAt;
+          saveJSON(LS.orders, orders);
+        }
+        // 本機的品項資料有可能在上次同步之後就過期了（例如來源改了數量又剛好重新同步過）。
+        // 後端回來的才是準的，內容有出入就以它為準重畫，並且明確告知人員重新掃這一張，
+        // 不要讓人繼續照著錯的數量掃完出貨。
+        const serverItems = (result.order && result.order.items) || [];
+        if(serverItems.length && itemsSignature(serverItems) !== itemsSignature(current.items)){
+          current.items = serverItems.map(i=>Object.assign({}, i, {scanned:0, noBarcodeCount:0, overScanCount:0, manualEditHistory:[]}));
+          if(orders[code]) orders[code].items = serverItems;
+          saveJSON(LS.orders, orders);
+          renderItemTable();
+          errorBeep();
+          flash('err','商品內容已更新', '這張訂單的品項在雲端有變動，畫面已更新為最新內容，請重新確認並重掃', 2600);
+        }
+      })
+      .catch(err=>{
+        if(mySession !== scanSession) return;
+        // 連線失敗時無法確認別人有沒有在處理同一張，維持原本的保守做法：退出這張訂單。
+        rollbackClaim(code, '連線失敗', err.message + '，請確認網路後重新掃描這張訂單');
+      });
+  }
 });
+
+// 品項內容的比較用簽章：只看貨號跟應出數量，順序不影響（後端重組時順序可能不同）
+function itemsSignature(items){
+  return (items||[]).map(i=>`${i.sku}x${i.qty}`).sort().join('|');
+}
+
+// 認領失敗時把畫面退回「等待掃描訂單號」，並把本機狀態改回待出貨。
+// 這裡不呼叫 releaseOrder：我們根本沒有拿到這張訂單的認領權，呼叫它反而可能把
+// 「真正持有這張訂單的那個人」的認領狀態清掉。
+function rollbackClaim(orderNo, title, detail){
+  scanSession++; // 讓後續任何還在路上的回應一律失效
+  if(orders[orderNo]){
+    orders[orderNo].status = 'pending';
+    orders[orderNo].claimedAt = '';
+    saveJSON(LS.orders, orders);
+  }
+  closeScanScreen();
+  errorBeep();
+  flash('err', title, detail, 2400);
+  refreshFromBackend(true).then(()=>{ renderPending(); renderHome(); });
+}
+
+function closeScanScreen(){
+  current = null;
+  document.getElementById('stage-items').style.display='none';
+  document.getElementById('stage-order').style.display='block';
+  document.getElementById('completeBox').style.display='none';
+  setPill('wait','等待掃描訂單號');
+  renderPending(); renderHome();
+  setTimeout(()=>inputOrder.focus(), 50);
+}
 
 inputBarcode.addEventListener('keydown', e=>{
   if(e.key !== 'Enter' || !current) return;
@@ -1082,20 +1144,16 @@ function setPill(kind, text){
 
 document.getElementById('btnAbort').addEventListener('click', async ()=>{
   const orderNo = current ? current.orderNo : null;
+  scanSession++; // 讓還在路上的認領回應失效，不要在人員已經退出這張之後又把畫面切回去
+  closeScanScreen();
   if(orderNo){
-    if(orders[orderNo]) orders[orderNo].status = 'pending';
+    if(orders[orderNo]){ orders[orderNo].status = 'pending'; orders[orderNo].claimedAt = ''; }
     saveJSON(LS.orders, orders);
+    renderPending(); renderHome();
     if(hasBackend()){
       try{ await apiPost('releaseOrder', {orderNo}); }catch(err){ /* 網路失敗就算了，下次同步會校正 */ }
     }
   }
-  current = null;
-  document.getElementById('stage-items').style.display='none';
-  document.getElementById('stage-order').style.display='block';
-  document.getElementById('completeBox').style.display='none';
-  setPill('wait','等待掃描訂單號');
-  renderPending(); renderHome();
-  inputOrder.focus();
 });
 
 async function finalizeShipment(){
@@ -1172,14 +1230,10 @@ async function finalizeShipment(){
     flash('err', '這張訂單已經出貨過了', '系統偵測到重複，不會再記錄一次（可能剛剛已經在其他裝置完成）', 1800);
   }
 
-  current = null;
+  scanSession++; // 這張已經結案，任何還在路上的認領回應都不該再動畫面
   inputFinalWaybill.value = '';
-  document.getElementById('stage-items').style.display='none';
-  document.getElementById('stage-order').style.display='block';
-  document.getElementById('completeBox').style.display='none';
-  setPill('wait','等待掃描訂單號');
-  renderPending(); renderLog(); renderHome();
-  inputOrder.focus();
+  closeScanScreen();
+  renderLog();
 }
 document.getElementById('btnConfirm').addEventListener('click', finalizeShipment);
 inputFinalWaybill.addEventListener('keydown', e=>{ if(e.key==='Enter') finalizeShipment(); });
