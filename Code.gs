@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.25';
+const BACKEND_VERSION = '2026-08-10.26';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1067,15 +1067,19 @@ function installAutomationTriggers_(){
     ScriptApp.newTrigger('autoSyncOrders_').timeBased().atHour(h).nearMinute(m).everyDays(1).create();
   });
   ScriptApp.newTrigger('backupAndClearShippingLog_').timeBased().atHour(20).nearMinute(0).everyDays(1).create();
-  // 已出貨訂單歸檔排在出貨紀錄備份之後，兩件事互相獨立（一邊出問題不影響另一邊），
-  // 而且歸檔本身有保留天數門檻，晚一點跑或某天沒跑到都不影響正確性。
-  ScriptApp.newTrigger('archiveShippedOrders_').timeBased().atHour(20).nearMinute(30).everyDays(1).create();
+  // 已出貨訂單歸檔刻意排在 19:30，不能排在 20:30——
+  // 「文山出貨 工作區」自己也有一個 20:30 的觸發器（dailyArchiveAndResetAuto），
+  // 它會把「文山出貨V2」從模板還原、也就是清空當天的訂單資料。我們的歸檔要讀那份鏡像
+  // 來判斷「這張訂單是不是已經從來源消失了」，如果撞在一起跑，鏡像可能已經被清空，
+  // 歸檔函式的安全檢查（來源沒有資料列就整個略過）就會被觸發，導致歸檔永遠不會真的執行。
+  // 排在來源被清空之前，來源資料還在，判斷才有意義。
+  ScriptApp.newTrigger('archiveShippedOrders_').timeBased().atHour(19).nearMinute(30).everyDays(1).create();
   // 舊核對表單每小時同步一次。刻意不掛在「完成出貨」的流程裡：開啟外部試算表寫入要1~2秒，
   // 掛上去會直接拖慢人員每掃完一張訂單的反應時間，那是現場最在意的速度。
   ScriptApp.newTrigger('hourlySync_').timeBased().everyHours(1).create();
 
   Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)'
-    +' + 已出貨訂單歸檔(20:30) + 舊核對表單與物流確認同步(每小時)，共'
+    +' + 已出貨訂單歸檔(19:30) + 舊核對表單與物流確認同步(每小時)，共'
     +ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
