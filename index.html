@@ -151,6 +151,8 @@
       <div class="section-label">今日概況</div>
       <div class="stat-grid">
         <div class="stat-tile"><div class="num" id="statPending">0</div><div class="lbl">待出貨訂單</div></div>
+        <div class="stat-tile"><div class="num" id="statBacklog">0</div><div class="lbl">上期未出貨</div></div>
+        <div class="stat-tile"><div class="num" id="statNewToday">0</div><div class="lbl">今日新增訂單</div></div>
         <div class="stat-tile"><div class="num" id="statShippedToday">0</div><div class="lbl">今日已出貨</div></div>
         <div class="stat-tile"><div class="num" id="statIssue">0</div><div class="lbl">曾觸發警示</div></div>
         <div class="stat-tile"><div class="num" id="statLastSync">-</div><div class="lbl">最後同步</div></div>
@@ -1348,14 +1350,33 @@ document.getElementById('btnResetAll').addEventListener('click', ()=>{
 // 首頁
 // ============================================================
 function renderHome(){
-  const pendingCount = Object.values(orders).filter(o=>o.status==='pending' && !isManuallyClosed(o)).length;
+  const all = Object.values(orders);
+  const pending = all.filter(o=>o.status==='pending' && !isManuallyClosed(o));
+  const pendingCount = pending.length;
+  // 待出貨拆成「今天才進來的」跟「之前就進來、到現在還沒出掉的」兩塊：
+  // 週末/國定假日/颱風假不出貨，訂單會一路累積到下一個營業日，所以早上一看就知道
+  // 今天要消化的量裡有多少是積下來的舊單（那些通常是要優先處理的）。
+  const backlogCount = pending.filter(o=>!isTodayOrderDate(o)).length;
   document.getElementById('pendingBadge').textContent = `${pendingCount} 張待出貨`;
   document.getElementById('statPending').textContent = pendingCount;
+  document.getElementById('statBacklog').textContent = backlogCount;
+  document.getElementById('statNewToday').textContent = all.filter(isTodayOrderDate).length;
   document.getElementById('statShippedToday').textContent = countShippedToday();
   document.getElementById('statIssue').textContent = log.filter(l=>l.hadIssue).length;
   document.getElementById('statLastSync').textContent = settings.lastSyncAt ? settings.lastSyncAt.split(' ')[0] : '尚未同步';
   renderStaffSelects();
 }
+// 訂單日期是「2026/8/10」這種字串，但來源有時候會給零填補的「2026/08/10」，
+// 直接比字串會把同一天判成不同天，所以拆成數字比對。
+function isTodayOrderDate(order){
+  const raw = String((order && order.date) || '').trim();
+  if(!raw) return false;
+  const [y, m, d] = raw.split(' ')[0].split('/').map(Number);
+  if(!y || !m || !d) return false;
+  const now = new Date();
+  return y === now.getFullYear() && m === (now.getMonth()+1) && d === now.getDate();
+}
+
 function countShippedToday(){
   const now = new Date();
   return log.filter(l=>{
