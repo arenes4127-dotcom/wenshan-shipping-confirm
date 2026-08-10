@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.01';
+const BACKEND_VERSION = '2026-08-10.03';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -124,6 +124,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupOrderManualCloseDropdown_: () => setupOrderManualCloseDropdown_(),
   setupOrderSheetColors: () => setupOrderSheetColors(),
   setupDashboardSheet_: () => setupDashboardSheet_(),
+  debugReadDashboard_: () => debugReadDashboard_(),
   releaseStaleClaims_: () => releaseStaleClaims_(),
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
@@ -783,6 +784,26 @@ function setupDashboardSheet_(){
     `=ARRAYFORMULA(IF(G5:G12="","",COUNTIFS(${O}!$B$2:$B,G5:G12,${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")))`
   );
 
+  // ---- 3b. 當日數據（J4:K9）----
+  // 「今日已出貨」不能直接拿更新時間的前10碼比對日期：那個欄位存的是UTC的ISO字串
+  // （2026-08-10T03:00:00Z），台灣是UTC+8，所以台灣時間早上8點前完成的出貨，
+  // UTC日期還停在前一天，直接比字串會少算。這裡先把ISO拆成日期+時間、加8小時換成台灣時間再比。
+  // 出貨紀錄每晚清空，所以那幾項直接統計整張表就等於當日數字，不用再另外篩日期。
+  sectionTitle('J4:K4', '📅 當日數據');
+  const todayStats = [
+    ['今日新進訂單', `=COUNTIF(${O}!$C$2:$C,TEXT(TODAY(),"yyyy/M/d"))`],
+    ['今日已出貨（張）',
+      `=SUMPRODUCT((LEFT(${O}!$G$2:$G,3)="已出貨")*(IFERROR(INT(DATEVALUE(LEFT(${O}!$J$2:$J,10))`
+      + `+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0)))`],
+    ['今日出貨（張）', `=COUNTIF(${G}!$R$2:$R,">0")`],
+    ['今日出貨（件）', `=SUM(${G}!$J$2:$J)`],
+    ['今日掃描品項列數', `=COUNTA(${G}!$B$2:$B)`]
+  ];
+  todayStats.forEach((r, i)=>{
+    sh.getRange(5+i, 10).setValue(r[0]);
+    sh.getRange(5+i, 11).setFormula(r[1]);
+  });
+
   // ---- 4. 目前掃描中（A13 起，往下長）----
   sectionTitle('A13:E13', '🟠 目前掃描中（誰正在處理哪張）');
   sh.getRange('A14:E14').setValues([['訂單號','賣場','認領人','認領時間','已經過(小時)']])
@@ -829,6 +850,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('K5:K9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
 
   // 待出貨數字上色：0張是綠的（都出完了），越多越要注意
@@ -842,6 +864,24 @@ function setupDashboardSheet_(){
   ]);
 
   Logger.log('「儀表板」分頁已建立（公式驅動，資料異動自動重算，不需要排程）。');
+}
+
+// 驗證用：把儀表板算完的實際顯示值原封不動回傳，用來確認公式有沒有算錯／標題有沒有掉。
+// （用試算表的CSV匯出檢查會踩到型別推斷的坑：整欄是數字時，同一欄的文字標題會被匯出成空白，
+// 看起來像標題不見了，其實只是匯出格式的問題——所以要直接讀儲存格才算數。）
+function debugReadDashboard_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_DASHBOARD);
+  if(!sh) return {error:'找不到儀表板分頁'};
+  const values = sh.getRange(1, 1, 20, 14).getDisplayValues();
+  const out = [];
+  values.forEach((row, i)=>{
+    const cells = [];
+    row.forEach((v, j)=>{
+      if(String(v).trim()) cells.push(String.fromCharCode(65+j) + (i+1) + '=' + v);
+    });
+    if(cells.length) out.push(cells.join('  |  '));
+  });
+  return out;
 }
 
 // ---------------- 一次性設定用：安裝上面兩組自動排程的時間觸發器 ----------------
