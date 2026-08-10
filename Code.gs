@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.19';
+const BACKEND_VERSION = '2026-08-10.20';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -139,6 +139,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   releaseStaleClaims_: () => releaseStaleClaims_(),
   syncNativeOrderSheet_: () => syncNativeOrderSheet_(),
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
+  findScriptProjects_: () => findScriptProjects_(),
   hourlySync_: () => hourlySync_(),
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
@@ -1272,6 +1273,21 @@ function syncLogisticsConfirm_(){
 function hourlySync_(){
   syncNativeOrderSheet_();
   syncLogisticsConfirm_();
+}
+
+// 唯讀診斷用：在雲端硬碟裡找 Apps Script 專案（clasp 的授權範圍只看得到它自己建立的檔案，
+// 列不出既有專案；我們這邊有完整 drive 權限所以找得到）。用完可以刪掉。
+function findScriptProjects_(keyword){
+  const files = DriveApp.getFilesByType('application/vnd.google-apps.script');
+  const out = [];
+  while(files.hasNext() && out.length < 50){
+    const f = files.next();
+    const name = f.getName();
+    if(keyword && name.indexOf(keyword) < 0) continue;
+    out.push({名稱: name, id: f.getId(), 最後修改: Utilities.formatDate(f.getLastUpdated(),
+      SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy/MM/dd HH:mm')});
+  }
+  return out;
 }
 
 // 唯讀診斷用：看「蝦proV2」的過刷欄實際存了什麼值（已過刷 vs 未過刷分別長怎樣）。
