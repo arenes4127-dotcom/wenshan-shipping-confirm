@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.17';
+const BACKEND_VERSION = '2026-08-10.19';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -93,6 +93,11 @@ function doPost(e){
       case 'runOneTimeSetup': result = runOneTimeSetup(body.name); break;
       case 'uploadFileToDrive': result = uploadFileToDrive(body.folderId, body.fileName, body.content, body.mimeType); break;
       case 'logNetFailures': result = logNetFailures(body.entries || []); break;
+      // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
+      // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
+      // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
+      // 用到舊邏輯，而且不會報錯，很難發現。
+      case '__versioncheck__': result = {ok:true, version: BACKEND_VERSION}; break;
       default: result = {ok:false, error:'unknown action: '+body.action};
     }
     return respond(result);
