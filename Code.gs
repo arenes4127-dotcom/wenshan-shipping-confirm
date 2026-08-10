@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.06';
+const BACKEND_VERSION = '2026-08-10.08';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -126,6 +126,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupDashboardSheet_: () => setupDashboardSheet_(),
   debugReadDashboard_: () => debugReadDashboard_(),
   releaseStaleClaims_: () => releaseStaleClaims_(),
+  syncNativeOrderSheet_: () => syncNativeOrderSheet_(),
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
   archiveShippedOrders_: () => archiveShippedOrders_(),
@@ -441,6 +442,7 @@ function autoSyncOrders_(){
   }
 
   const result = mergeOrders(parsed);
+  syncNativeOrderSheet_(); // 順便把核對結果同步回舊的核對表單
   Logger.log('自動同步完成：新增'+result.added+'／更新'+result.updated+'／已出貨略過'+result.skippedShipped
     +'，非本倉略過'+skippedOtherWarehouse+'，資料欄位不全略過'+skippedRows+'。');
 }
@@ -895,6 +897,113 @@ function debugReadDashboard_(){
   return out;
 }
 
+// ---------------- 同步回舊的「文山核對 工作區－訂單」核對表單 ----------------
+// 這份是使用者原本在用的舊核對表單，裡面還有出貨核對A/B、國際碼、包貨人員名單等
+// 別人在用的工作表，所以這裡的寫入範圍刻意壓到最小，規則如下（不要為了方便就放寬）：
+//   1. 只開「訂單」這一個分頁，其他分頁一律不碰。
+//   2. 只寫「核對狀態(F欄)」跟右半部的結果區(I~R欄)。左半部 A~E（訂單號/賣場/寄送方式/
+//      需求件數/訂單狀態）是他們自己的來源資料，絕對不寫。
+//   3. 一律用「訂單號」比對後寫回該列，不用列號對應——對方的排序隨時可能變，
+//      用列號會整批寫到錯的訂單上。
+//   4. 不新增列、不刪除列、不排序。對方有幾列就處理幾列。
+const NATIVE_SHEET_ID = '1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU';
+const NATIVE_ORDER_TAB = '訂單';
+
+// 我們的出貨紀錄每晚清空，所以只有「今天」出的貨查得到完整核對結果與差異明細。
+// 先前出貨的訂單明細已經進了雲端硬碟備份檔，線上查不到 —— 那種情況據實寫成
+// 「已出貨（明細已歸檔）」，不要假裝有完整核對結果，也不要留著「待核對」讓人以為還沒處理。
+function buildNativeStatusMap_(){
+  const map = {};
+  // 1) 先鋪底：訂單分頁的狀態（涵蓋所有訂單，包含明細已歸檔的）
+  readOrderRows().forEach(r=>{
+    const no = String(r.orderNo||'').trim();
+    if(!no) return;
+    const closed = String(r.manualClose||'').trim();
+    if(closed){ map[no] = {status: '人工結案：'+closed}; return; }
+    if(r.status === 'shipped') map[no] = {status: '已出貨（明細已歸檔）'};
+    else if(r.status === 'scanning') map[no] = {status: '掃描中'};
+    // pending 不寫，讓對方維持原本的「待核對」
+  });
+  // 2) 再用出貨紀錄覆蓋：有當日明細的，換成完整的核對結果
+  const logRows = readRows(SHEET_LOG, LOG_HEADER);
+  logRows.forEach(r=>{
+    if(!(Number(r.requiredCount) > 0)) return; // 只取每張訂單的第一列（需求件數只填在第一列）
+    const no = String(r.orderNo||'').trim();
+    if(!no) return;
+    map[no] = {
+      status: String(r.checkResult||'').trim(),
+      time: String(r.time||''), store: String(r.store||''),
+      shipMethod: String(r.shipMethod||''),
+      required: r.requiredCount, scanned: r.scannedCount,
+      detail: String(r.differenceDetails||'')
+    };
+  });
+  return map;
+}
+
+function syncNativeOrderSheet_(){
+  const map = buildNativeStatusMap_();
+  const ss = SpreadsheetApp.openById(NATIVE_SHEET_ID);
+  const sh = ss.getSheetByName(NATIVE_ORDER_TAB);
+  if(!sh){ Logger.log('舊核對表單找不到「'+NATIVE_ORDER_TAB+'」分頁，略過'); return {ok:false, reason:'找不到分頁'}; }
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2){ Logger.log('舊核對表單沒有資料列，略過'); return {ok:false, reason:'沒有資料列'}; }
+
+  const orderNos = sh.getRange(2, 1, lastRow-1, 1).getValues();      // A欄：目前訂單
+  const statusCol = sh.getRange(2, 6, lastRow-1, 1).getValues();     // F欄：核對狀態
+
+  // 右半部先把「已經在表上的明細」讀回來，用訂單編號(K欄)當key保留。
+  // 這一步是必要的：我們的出貨紀錄每晚清空，隔天再同步時對前幾天的訂單已經拿不出明細了，
+  // 如果直接整塊清掉重寫，等於把先前好不容易回填上去的結果洗掉——備份檔裡雖然還有，
+  // 但這張表上就消失了。所以改成「有新資料才覆蓋，沒有就保留原樣」。
+  const existing = sh.getRange(2, 9, lastRow-1, 10).getValues();
+  const detailMap = {}, detailOrder = [];
+  existing.forEach(r=>{
+    const no = String(r[2]||'').trim(); // I=0, J=1, K=2（訂單編號）
+    if(!no) return;
+    if(!detailMap[no]) detailOrder.push(no);
+    detailMap[no] = r;
+  });
+  Object.keys(map).forEach(no=>{
+    const hit = map[no];
+    if(!hit.time) return; // 只有粗略狀態、沒有當日明細的，不要動右半部
+    if(!detailMap[no]) detailOrder.push(no);
+    // 「序號」「寄送分類」跟第二個「差異明細」不確定原本的用途，寧可留白也不要自己猜著填，
+    // 填錯比空白更難發現。
+    detailMap[no] = ['', hit.time, no, '', hit.shipMethod, hit.store, hit.required, hit.scanned, hit.detail, ''];
+  });
+
+  let updated = 0, kept = 0, noData = 0;
+  const newStatus = orderNos.map((row, i)=>{
+    const no = String(row[0]||'').trim();
+    const current = statusCol[i][0];
+    const hit = no ? map[no] : null;
+    if(!hit){ if(no) noData++; return [current]; } // 我們沒有這張訂單的資料，原樣保留
+    if(hit.time){ updated++; return [hit.status]; } // 有當日完整明細，這是最新最完整的，直接覆蓋
+    // 只有粗略狀態（已出貨但明細已歸檔／人工結案／掃描中）：只在對方還沒有結果時才填。
+    // 已經回填過完整核對結果的不要降級成粗略描述，那是資訊倒退。
+    const cur = String(current||'').trim();
+    if(!cur || cur === '待核對'){ updated++; return [hit.status]; }
+    kept++;
+    return [current];
+  });
+
+  sh.getRange(2, 6, newStatus.length, 1).setValues(newStatus);
+  // 右半部可寫的列數受限於對方現有的列數——不新增列是這次同步的原則之一，
+  // 真的放不下就先寫得下的部分並記錄下來，不要自己去動對方表格的結構。
+  const capacity = lastRow - 1;
+  const detailRows = detailOrder.slice(0, capacity).map(no=>detailMap[no]);
+  const overflow = Math.max(detailOrder.length - capacity, 0);
+  sh.getRange(2, 9, capacity, 10).clearContent();
+  if(detailRows.length){
+    sh.getRange(2, 9, detailRows.length, 10).setValues(detailRows);
+  }
+  const result = {已回填核對狀態: updated, 保留既有結果不降級: kept,
+    我方無資料保留原樣: noData, 明細列數: detailRows.length, 放不下的明細列: overflow};
+  Logger.log('舊核對表單同步完成：'+JSON.stringify(result));
+  return result;
+}
+
 // ---------------- 一次性設定用：安裝上面兩組自動排程的時間觸發器 ----------------
 // 在 Apps Script 編輯器裡選這個函式、按「執行」跑一次即可（觸發器的建立需要授權，
 // 透過API用HTTP呼叫可能拿不到，這一步比照之前DriveApp授權的做法，用編輯器手動跑一次比較保險）。
@@ -1184,6 +1293,10 @@ function buildCheckResult_(entry, verifyStatus){
   // 商品不符的後續處理結果直接寫在核對結果欄，不用再去翻差異明細那一長串文字才知道有沒有補救。
   // 燈號維持紅燈不變：確實發生過拿錯商品，這件事本身就該被看見，補救成功也不該當作沒發生過。
   if(hasMismatch_(entry)) text += buildMismatchResolution_(entry);
+  // 掃描超量（同一個品項掃超過應出數量）也會把 hadIssue 設成true、跟著亮紅燈，
+  // 但件數最後是對的，核對狀態會判成「完成」——只寫「完成」配紅燈看起來自相矛盾，
+  // 會讓人以為是系統出錯。這裡把紅燈的原因補進文字裡，文字跟燈號才對得起來。
+  else if(entry.hadIssue && String(verifyStatus).indexOf('錯誤') !== 0) text += '（曾掃描超量）';
   return text + ' ' + classifyLogEmoji_(entry, verifyStatus);
 }
 
