@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.10';
+const BACKEND_VERSION = '2026-08-10.15';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -38,7 +38,10 @@ const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'
 // 這一欄是給主管直接在試算表裡用下拉選單處理「不是由文山實際掃描出貨」的訂單用的：
 // 別的門市／倉庫已經出掉的、缺貨取消的、整張取消的，選一個結案原因，APP待出貨清單就不會再顯示，
 // 但資料列本身留著（有紀錄可追），不是直接把訂單刪掉。
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose'];
+// logisticsConfirmed／logisticsTime 一樣加在最後面，既有資料列不會位移，不用跑migration。
+// 這兩欄記的是「包裝完成之後，有沒有真的被掃進物流籃」——來源是人員本來就在用的
+// 「統計V2」分頁（他們在那裡掃訂單號確認上籃），我們只讀不寫。
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime'];
 // 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
 const MANUAL_CLOSE_OPTIONS = ['出貨完成', '缺貨取消', '取消訂單'];
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
@@ -66,7 +69,8 @@ const HEADER_LABELS = {
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
-  logTime:'時間', event:'事件', detail:'說明'
+  logTime:'時間', event:'事件', detail:'說明',
+  logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間'
 };
 
 function doGet(e){
@@ -129,6 +133,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   debugReadDashboard_: () => debugReadDashboard_(),
   releaseStaleClaims_: () => releaseStaleClaims_(),
   syncNativeOrderSheet_: () => syncNativeOrderSheet_(),
+  syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
+  hourlySync_: () => hourlySync_(),
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
   archiveShippedOrders_: () => archiveShippedOrders_(),
@@ -234,7 +240,9 @@ function getState(){
       items: safeParse(r.itemsJson, []), status: r.status,
       claimedBy: r.claimedBy || '', claimedAt: r.claimedAt || '',
       shipMethod: r.shipMethod || '', routingStatus: r.routingStatus || '',
-      manualClose: String(r.manualClose || '').trim()
+      manualClose: String(r.manualClose || '').trim(),
+      logisticsConfirmed: String(r.logisticsConfirmed || '').trim(),
+      logisticsTime: String(r.logisticsTime || '').trim()
     };
   });
   // 出貨紀錄現在存的是「一列一品項」，同一次出貨的N個品項會連續寫N列（訂單層級欄位重複），
@@ -372,7 +380,10 @@ function mergeOrders(incoming){
       updatedAt: now, shipMethod: o.shipMethod||'', routingStatus: o.routingStatus||'',
       // 人工結案是主管在試算表裡自己填的，同步只是更新訂單內容，絕對不能把它洗掉——
       // 不然結案完的訂單下一輪自動同步就又跳回待出貨清單，等於白結。
-      manualClose: existing ? (existing.manualClose||'') : ''
+      manualClose: existing ? (existing.manualClose||'') : '',
+      // 物流籃確認同理：那是人員實際掃出來的結果，同步只更新訂單內容，不能覆蓋掉
+      logisticsConfirmed: existing ? (existing.logisticsConfirmed||'') : '',
+      logisticsTime: existing ? (existing.logisticsTime||'') : ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     if(existing) updated++; else added++;
@@ -445,6 +456,7 @@ function autoSyncOrders_(){
 
   const result = mergeOrders(parsed);
   syncNativeOrderSheet_(); // 順便把核對結果同步回舊的核對表單
+  syncLogisticsConfirm_(); // 以及物流籃確認狀態
   Logger.log('自動同步完成：新增'+result.added+'／更新'+result.updated+'／已出貨略過'+result.skippedShipped
     +'，非本倉略過'+skippedOtherWarehouse+'，資料欄位不全略過'+skippedRows+'。');
 }
@@ -811,7 +823,10 @@ function setupDashboardSheet_(){
       + `+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0)))`],
     ['今日出貨（張）', `=COUNTIF(${G}!$R$2:$R,">0")`],
     ['今日出貨（件）', `=SUM(${G}!$J$2:$J)`],
-    ['今日掃描品項列數', `=COUNTA(${G}!$B$2:$B)`]
+    ['今日掃描品項列數', `=COUNTA(${G}!$B$2:$B)`],
+    // 包裝完成之後還要掃進物流籃才算真的出得去。這一格就是「今天包好了、但還沒進籃子」的數量，
+    // 是最容易漏掉又最沒人看得到的一段——不為0就代表有貨還躺在包裝區。
+    ['今日未進物流籃', `=COUNTIF(${O}!$N$2:$N,"未進物流籃*")`]
   ];
   todayStats.forEach((r, i)=>{
     sh.getRange(5+i, 4).setValue(r[0]);
@@ -863,7 +878,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
-  sh.getRange('E5:E9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('E5:E10').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
 
@@ -875,7 +890,10 @@ function setupDashboardSheet_(){
     SpreadsheetApp.newConditionalFormatRule()
       .whenNumberEqualTo(0).setBackground('#d9ead3').setRanges([sh.getRange('B5')]).build(),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenNumberGreaterThan(0).setBackground('#f4cccc').setRanges([sh.getRange('H6')]).build()
+      .whenNumberGreaterThan(0).setBackground('#f4cccc').setRanges([sh.getRange('H6')]).build(),
+    // 今日未進物流籃只要不是0就標橘：有貨包好了還沒送出去，要有人去處理
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E10')]).build()
   ]);
 
   Logger.log('「儀表板」分頁已建立（公式驅動，資料異動自動重算，不需要排程）。');
@@ -1016,7 +1034,7 @@ function syncNativeOrderSheet_(){
 // 都不會有副作用（只是把「訂單」分頁同步到源頭當下最新的樣子），不影響最終結果只是可能差幾分鐘。
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
-    'syncNativeOrderSheet_'];
+    'syncNativeOrderSheet_', 'hourlySync_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -1030,10 +1048,10 @@ function installAutomationTriggers_(){
   ScriptApp.newTrigger('archiveShippedOrders_').timeBased().atHour(20).nearMinute(30).everyDays(1).create();
   // 舊核對表單每小時同步一次。刻意不掛在「完成出貨」的流程裡：開啟外部試算表寫入要1~2秒，
   // 掛上去會直接拖慢人員每掃完一張訂單的反應時間，那是現場最在意的速度。
-  ScriptApp.newTrigger('syncNativeOrderSheet_').timeBased().everyHours(1).create();
+  ScriptApp.newTrigger('hourlySync_').timeBased().everyHours(1).create();
 
   Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)'
-    +' + 已出貨訂單歸檔(20:30) + 舊核對表單同步(每小時)，共'
+    +' + 已出貨訂單歸檔(20:30) + 舊核對表單與物流確認同步(每小時)，共'
     +ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
@@ -1083,7 +1101,7 @@ function healOrderRowIfNeeded_(sh, row){
     updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '',
     // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
     // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
-    manualClose: ''};
+    manualClose: '', logisticsConfirmed: '', logisticsTime: ''};
   // 寫回試算表的狀態要轉成中文，回傳給呼叫端的物件維持英文代碼
   sh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
     .setValues([ORDERS_HEADER.map(h=> h==='status' ? statusToText(fixed.status) : fixed[h])]);
@@ -1141,6 +1159,145 @@ function logNetFailures(entries){
   });
   sh.getRange(startRow, 1, rows.length, SYSLOG_HEADER.length).setValues(rows);
   return {ok:true, 收到: rows.length};
+}
+
+// ---------------- 物流籃確認：讀「統計V2」人員掃上籃的紀錄，回填到我們的訂單分頁 ----------------
+// 人員包裝完成後，會在來源試算表的「統計V2」分頁掃訂單號，確認這張已經放進物流籃。
+// 那個分頁的結構：第8列是表頭（掃描／時間／賣場／查重／運送方式），第9列開始才是掃描紀錄，
+// 上面第1~7列是依賣場×寄送方式的統計摘要，讀的時候要跳過。
+// 我們只讀不寫——那份是所有資料的源頭（文山出貨V2/統計/各賣場分頁都從它來），寫入風險太高。
+const LOGISTICS_SOURCE_ID = '1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ';
+const LOGISTICS_TAB = '統計V2';
+const LOGISTICS_FIRST_DATA_ROW = 9;
+function readLogisticsScans_(){
+  const ss = SpreadsheetApp.openById(LOGISTICS_SOURCE_ID);
+  const sh = ss.getSheetByName(LOGISTICS_TAB);
+  if(!sh) return null; // 讀不到就回傳null，讓呼叫端知道要整個略過，不要當成「大家都沒掃」
+  const lastRow = sh.getLastRow();
+  if(lastRow < LOGISTICS_FIRST_DATA_ROW) return {};
+  const rows = sh.getRange(LOGISTICS_FIRST_DATA_ROW, 1, lastRow - LOGISTICS_FIRST_DATA_ROW + 1, 2)
+                 .getDisplayValues(); // 用顯示值，時間欄才會是「上午 11:28:40」這種可讀格式
+  const map = {};
+  rows.forEach(r=>{
+    const no = String(r[0]||'').trim();
+    if(!no) return;
+    map[no] = String(r[1]||'').trim();
+  });
+  return map;
+}
+
+// 出貨完成時間存的是UTC的ISO字串，要換算成台灣時間再比對日期，
+// 不然台灣時間早上8點前完成的出貨，UTC日期還停在前一天，會被誤判成「不是今天出的」。
+function isShippedToday_(updatedAt){
+  const t = Date.parse(updatedAt);
+  if(isNaN(t)) return false;
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  return Utilities.formatDate(new Date(t), tz, 'yyyy-MM-dd')
+      === Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+}
+
+function syncLogisticsConfirm_(){
+  const scans = readLogisticsScans_();
+  if(scans === null){
+    Logger.log('讀不到「'+LOGISTICS_TAB+'」分頁，為安全起見略過物流確認同步');
+    return {ok:false, reason:'找不到來源分頁'};
+  }
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  if(!rows.length) return {ok:true, 已確認:0};
+
+  const confirmCol = colOf(ORDERS_HEADER,'logisticsConfirmed');
+  const timeCol = colOf(ORDERS_HEADER,'logisticsTime');
+  const confirmVals = [], timeVals = [];
+  let confirmed = 0, waiting = 0, kept = 0;
+  rows.forEach(r=>{
+    const no = String(r.orderNo||'').trim();
+    const hit = scans[no];
+    if(hit !== undefined){
+      confirmVals.push(['已進物流籃 🟢']);
+      timeVals.push([hit]);
+      confirmed++;
+      return;
+    }
+    // 來源分頁可能每天清空重來（統計摘要看起來是當日的量）。已經確認過的不要因為
+    // 來源清掉了就退回「未進物流籃」——那會讓昨天明明出掉的貨看起來像漏掉的。
+    if(String(r.logisticsConfirmed||'').indexOf('已進') === 0){
+      confirmVals.push([r.logisticsConfirmed]);
+      timeVals.push([r.logisticsTime]);
+      kept++;
+      return;
+    }
+    // 只有「今天出貨、卻還沒被掃進物流籃」才提醒。這個「今天」的限制是必要的：
+    // 來源的統計V2只留當日的掃描紀錄（筆數大約就是當天的出貨量，不是累積的），
+    // 所以前幾天出的貨在這裡一定查不到——但那不代表當時沒掃，只是紀錄已經被清掉了。
+    // 不加這個限制的話，會把一大批其實正常出掉的舊訂單標成「未進物流籃」，變成假警報，
+    // 真正需要處理的今日漏籃反而被淹沒在裡面。
+    if(r.status === 'shipped' && !String(r.manualClose||'').trim() && isShippedToday_(r.updatedAt)){
+      confirmVals.push(['未進物流籃 🟠']);
+      timeVals.push(['']);
+      waiting++;
+    } else {
+      confirmVals.push(['']);
+      timeVals.push(['']);
+    }
+  });
+
+  sh.getRange(2, confirmCol, confirmVals.length, 1).setValues(confirmVals);
+  sh.getRange(2, timeCol, timeVals.length, 1).setNumberFormat('@').setValues(timeVals);
+  const result = {已進物流籃: confirmed, 已出貨但未進物流籃: waiting, 沿用先前確認: kept, 來源掃描筆數: Object.keys(scans).length};
+  Logger.log('物流確認同步完成：'+JSON.stringify(result));
+  return result;
+}
+
+// 每小時跑的維護工作合併在這裡，一個觸發器做完兩件事，不用裝兩個。
+function hourlySync_(){
+  syncNativeOrderSheet_();
+  syncLogisticsConfirm_();
+}
+
+// 唯讀診斷用：看「蝦proV2」的過刷欄實際存了什麼值（已過刷 vs 未過刷分別長怎樣）。
+function inspectScanTab_(){
+  const ss = SpreadsheetApp.openById('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
+  const sh = ss.getSheetByName('蝦proV2');
+  if(!sh) return {error:'找不到蝦proV2'};
+  const lastRow = sh.getLastRow();
+  const values = sh.getRange(1, 1, Math.min(lastRow, 400), 16).getValues();
+  const header = values[0];
+  const iOrder = 5, iStatus = 6, iScan = 13; // F=訂單編號(5), G=狀態(6), N=文山過刷(13)
+  const dist = {};
+  const samples = [];
+  let withOrder = 0;
+  for(let i = 1; i < values.length; i++){
+    const no = String(values[i][iOrder]||'').trim();
+    if(!no) continue;
+    withOrder++;
+    const raw = values[i][iScan];
+    const key = raw === '' || raw === null ? '(空白)' : JSON.stringify(String(raw)).slice(0, 40);
+    dist[key] = (dist[key]||0) + 1;
+    if(samples.length < 8 && String(raw||'').trim() && String(raw).trim() !== '-'){
+      samples.push({列: i+1, 訂單: no, 狀態: String(values[i][iStatus]||''), 過刷值: String(raw)});
+    }
+  }
+  return {
+    N欄表頭: String(header[iScan]||''),
+    有訂單編號的列數: withOrder,
+    過刷欄值分布: dist,
+    已過刷範例: samples
+  };
+}
+
+// 唯讀診斷用：列出來源試算表有哪些分頁、各自的表頭跟資料量，用來確認要接哪一個分頁。
+// 只讀不寫。確認完之後這個函式可以刪掉。
+function inspectSourceSpreadsheet_(){
+  const ss = SpreadsheetApp.openById('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
+  return ss.getSheets().map(sh=>{
+    const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+    let header = [];
+    if(lastRow >= 1 && lastCol >= 1){
+      header = sh.getRange(1, 1, 1, Math.min(lastCol, 20)).getValues()[0].filter(String);
+    }
+    return {分頁: sh.getName(), 列數: lastRow, 欄數: lastCol, 表頭: header};
+  });
 }
 
 // 把所有逾時的認領一次放回待出貨。每次同步（自動排程4次＋手動按同步）都會跑一次。
@@ -1848,7 +2005,8 @@ function migrateOrdersColumnShift(){
       orderNo, store, date, itemsJson, skuSummary, nameSummary,
       status: statusToText(textToStatus(oldStatus) || 'pending'),
       claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '', updatedAt: oldUpdatedAt || '',
-      shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '', manualClose: ''
+      shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '', manualClose: '',
+      logisticsConfirmed: '', logisticsTime: ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     migrated++;
