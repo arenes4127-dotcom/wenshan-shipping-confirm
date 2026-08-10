@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.03';
+const BACKEND_VERSION = '2026-08-10.06';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -721,6 +721,9 @@ function setupDashboardSheet_(){
   if(!sh) sh = ss.insertSheet(SHEET_DASHBOARD, 0); // 放在最前面，打開試算表第一眼就看到
   sh.clear();
   sh.clearConditionalFormatRules();
+  // clear() 不會解除儲存格合併，一定要另外拆掉：不然改版面時（例如某個區塊從 J 欄搬到 G 欄）
+  // 舊的合併會留在原地，跟新的合併範圍打架，畫面會亂掉。
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
 
   const O = "'訂單'";   // 來源分頁名稱有中文，公式裡要加單引號
   const G = "'出貨紀錄'";
@@ -735,8 +738,12 @@ function setupDashboardSheet_(){
   sh.getRange('A2:N2').merge().setFontColor('#666666').setHorizontalAlignment('center');
 
   // ---- 區塊標題樣式 ----
+  // 一定要用 merge()，不能只 setValue：對多格範圍呼叫 setValue 會把同一段文字
+  // 塞進範圍內「每一個」儲存格，標題就會重複顯示好幾次（J13:N13 會變成連續5個一樣的標題）。
   const sectionTitle = (a1, text)=>{
-    sh.getRange(a1).setValue(text).setFontWeight('bold')
+    const range = sh.getRange(a1);
+    range.merge();
+    range.setValue(text).setFontWeight('bold')
       .setBackground('#cfe2f3').setFontColor('#1c4587');
   };
 
@@ -756,11 +763,11 @@ function setupDashboardSheet_(){
     sh.getRange(5+i, 2).setFormula(r[1]);
   });
 
-  // ---- 2. 出貨品質（D4:E9）----
+  // ---- 2. 出貨品質（J4:K9）----
   // 都加上「R欄有值」的條件，才是以「訂單張數」為單位，不是品項列數
   // 出貨紀錄每晚20:00備份後會清空，所以這一區永遠是「今天累積到現在」的量，不是歷史總計。
   // 標題要寫清楚，不然早上看到一片0會以為是壞掉了。
-  sectionTitle('D4:E4', '✅ 本日出貨品質');
+  sectionTitle('G4:H4', '✅ 本日出貨品質');
   const qualityStats = [
     ['完成 🟢', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"完成*")`],
     ['錯誤 🔴', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"錯誤*")`],
@@ -769,19 +776,22 @@ function setupDashboardSheet_(){
     ['出貨總張數', `=COUNTIF(${G}!$R$2:$R,">0")`]
   ];
   qualityStats.forEach((r, i)=>{
-    sh.getRange(5+i, 4).setValue(r[0]);
-    sh.getRange(5+i, 5).setFormula(r[1]);
+    sh.getRange(5+i, 7).setValue(r[0]);
+    sh.getRange(5+i, 8).setFormula(r[1]);
   });
 
   // ---- 3. 各賣場待出貨（G4:H）----
   // 用 UNIQUE+FILTER 抓出目前實際有待出貨訂單的賣場，不寫死賣場名稱，
   // 之後多了新品牌也會自己出現，不用回頭改公式。
-  sectionTitle('G4:H4', '🏪 各賣場待出貨');
-  sh.getRange('G5').setFormula(
-    `=IFERROR(UNIQUE(FILTER(${O}!$B$2:$B,LEFT(${O}!$G$2:$G,3)="待出貨",${O}!$M$2:$M="")),"（無）")`
+  sectionTitle('J4:K4', '🏪 各賣場待出貨');
+  // 這一區的長度取決於實際有幾個賣場，會往下長。下面第13列就是「需注意紀錄」的區塊標題，
+  // 萬一哪天賣場變多、清單長到撞上去，整個公式會變成 #REF! 連數字都不見。
+  // 用 ARRAY_CONSTRAIN 限制最多8列（第5~12列），確保不管賣場增加到幾個都不會溢出撞到下一區。
+  sh.getRange('J5').setFormula(
+    `=ARRAY_CONSTRAIN(IFERROR(UNIQUE(FILTER(${O}!$B$2:$B,LEFT(${O}!$G$2:$G,3)="待出貨",${O}!$M$2:$M="")),"（無）"),8,1)`
   );
-  sh.getRange('H5').setFormula(
-    `=ARRAYFORMULA(IF(G5:G12="","",COUNTIFS(${O}!$B$2:$B,G5:G12,${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")))`
+  sh.getRange('K5').setFormula(
+    `=ARRAYFORMULA(IF(J5:J12="","",COUNTIFS(${O}!$B$2:$B,J5:J12,${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")))`
   );
 
   // ---- 3b. 當日數據（J4:K9）----
@@ -789,7 +799,7 @@ function setupDashboardSheet_(){
   // （2026-08-10T03:00:00Z），台灣是UTC+8，所以台灣時間早上8點前完成的出貨，
   // UTC日期還停在前一天，直接比字串會少算。這裡先把ISO拆成日期+時間、加8小時換成台灣時間再比。
   // 出貨紀錄每晚清空，所以那幾項直接統計整張表就等於當日數字，不用再另外篩日期。
-  sectionTitle('J4:K4', '📅 當日數據');
+  sectionTitle('D4:E4', '📅 當日數據');
   const todayStats = [
     ['今日新進訂單', `=COUNTIF(${O}!$C$2:$C,TEXT(TODAY(),"yyyy/M/d"))`],
     ['今日已出貨（張）',
@@ -800,8 +810,8 @@ function setupDashboardSheet_(){
     ['今日掃描品項列數', `=COUNTA(${G}!$B$2:$B)`]
   ];
   todayStats.forEach((r, i)=>{
-    sh.getRange(5+i, 10).setValue(r[0]);
-    sh.getRange(5+i, 11).setFormula(r[1]);
+    sh.getRange(5+i, 4).setValue(r[0]);
+    sh.getRange(5+i, 5).setFormula(r[1]);
   });
 
   // ---- 4. 目前掃描中（A13 起，往下長）----
@@ -842,25 +852,26 @@ function setupDashboardSheet_(){
   // ---- 版面 ----
   sh.setColumnWidth(1, 130); sh.setColumnWidth(2, 90);
   sh.setColumnWidth(3, 24);
-  sh.setColumnWidth(4, 130); sh.setColumnWidth(5, 100);
+  sh.setColumnWidth(4, 155); sh.setColumnWidth(5, 100); // D欄放當日數據的標籤，字比較長
   sh.setColumnWidth(6, 24);
-  sh.setColumnWidth(7, 130); sh.setColumnWidth(8, 90);
+  sh.setColumnWidth(7, 145); sh.setColumnWidth(8, 100); // G欄放出貨品質標籤
   sh.setColumnWidth(9, 24);
-  sh.setColumnWidth(10, 140); sh.setColumnWidth(11, 100);
+  sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
-  sh.getRange('K5:K9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
 
-  // 待出貨數字上色：0張是綠的（都出完了），越多越要注意
+  // 待出貨數字上色：0張是綠的（都出完了），越多越要注意。
+  // 錯誤筆數在「本日出貨品質」區的第2列（H6），只要不是0就標紅。
   sh.setConditionalFormatRules([
     SpreadsheetApp.newConditionalFormatRule()
       .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('B5')]).build(),
     SpreadsheetApp.newConditionalFormatRule()
       .whenNumberEqualTo(0).setBackground('#d9ead3').setRanges([sh.getRange('B5')]).build(),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenNumberGreaterThan(0).setBackground('#f4cccc').setRanges([sh.getRange('E6')]).build()
+      .whenNumberGreaterThan(0).setBackground('#f4cccc').setRanges([sh.getRange('H6')]).build()
   ]);
 
   Logger.log('「儀表板」分頁已建立（公式驅動，資料異動自動重算，不需要排程）。');
