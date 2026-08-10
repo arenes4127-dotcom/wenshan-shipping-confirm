@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.20';
+const BACKEND_VERSION = '2026-08-10.23';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -90,7 +90,7 @@ function doPost(e){
       case 'finalizeShipment': result = finalizeShipment(body.entry); break;
       case 'importShippedBatch': result = importShippedBatch(body.entries || []); break;
       case 'setStaffList': result = setStaffList(body.staff || []); break;
-      case 'runOneTimeSetup': result = runOneTimeSetup(body.name); break;
+      case 'runOneTimeSetup': result = runOneTimeSetup(body.name, body.arg); break;
       case 'uploadFileToDrive': result = uploadFileToDrive(body.folderId, body.fileName, body.content, body.mimeType); break;
       case 'logNetFailures': result = logNetFailures(body.entries || []); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
@@ -140,6 +140,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   syncNativeOrderSheet_: () => syncNativeOrderSheet_(),
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
   findScriptProjects_: () => findScriptProjects_(),
+  inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
+  inspectSheetFormulas_: (arg) => inspectSheetFormulas_(arg),
   hourlySync_: () => hourlySync_(),
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
@@ -153,10 +155,10 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   debugConditionalFormatRules_: () => debugConditionalFormatRules_(),
   authorizeDriveAccess_: () => authorizeDriveAccess_()
 };
-function runOneTimeSetup(name){
+function runOneTimeSetup(name, arg){
   const fn = ONE_TIME_SETUP_FUNCTIONS[name];
   if(!fn) return {ok:false, error:'unknown setup function: '+name};
-  const result = fn();
+  const result = fn(arg);
   return {ok:true, ran:name, result: result===undefined ? null : result};
 }
 
@@ -1275,6 +1277,28 @@ function hourlySync_(){
   syncLogisticsConfirm_();
 }
 
+// 唯讀診斷用：看某個分頁的資料列是靜態值還是公式（公式才看得出資料是從哪裡串過來的）。
+// arg 格式：'試算表ID|分頁名稱'
+function inspectSheetFormulas_(arg){
+  const parts = String(arg||'').split('|');
+  const ss = SpreadsheetApp.openById(parts[0]);
+  const sh = ss.getSheetByName(parts[1]);
+  if(!sh) return {error:'找不到分頁 '+parts[1]};
+  const lastCol = Math.min(sh.getLastColumn(), 40);
+  const out = {};
+  // 第2列（第一筆資料）跟第3列各看一次，有些表第2列是說明列
+  [2,3].forEach(r=>{
+    if(sh.getLastRow() < r) return;
+    const f = sh.getRange(r, 1, 1, lastCol).getFormulas()[0];
+    f.forEach((v, i)=>{
+      if(!v) return;
+      const key = '第'+r+'列 第'+(i+1)+'欄';
+      if(!out[key]) out[key] = String(v).slice(0, 200);
+    });
+  });
+  return Object.keys(out).length ? out : {結論:'這個分頁的資料列是靜態值，沒有公式（由腳本或人工寫入）'};
+}
+
 // 唯讀診斷用：在雲端硬碟裡找 Apps Script 專案（clasp 的授權範圍只看得到它自己建立的檔案，
 // 列不出既有專案；我們這邊有完整 drive 權限所以找得到）。用完可以刪掉。
 function findScriptProjects_(keyword){
@@ -1323,15 +1347,18 @@ function inspectScanTab_(){
 
 // 唯讀診斷用：列出來源試算表有哪些分頁、各自的表頭跟資料量，用來確認要接哪一個分頁。
 // 只讀不寫。確認完之後這個函式可以刪掉。
-function inspectSourceSpreadsheet_(){
-  const ss = SpreadsheetApp.openById('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
+function inspectSourceSpreadsheet_(ssId){
+  const ss = SpreadsheetApp.openById(ssId || '1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
   return ss.getSheets().map(sh=>{
     const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
     let header = [];
     if(lastRow >= 1 && lastCol >= 1){
       header = sh.getRange(1, 1, 1, Math.min(lastCol, 20)).getValues()[0].filter(String);
     }
-    return {分頁: sh.getName(), 列數: lastRow, 欄數: lastCol, 表頭: header};
+    // A1的公式最能看出這個分頁的資料是自己來的、還是IMPORTRANGE別份試算表過來的
+    let a1 = '';
+    try{ a1 = String(sh.getRange('A1').getFormula()||''); }catch(e){}
+    return {分頁: sh.getName(), 列數: lastRow, 欄數: lastCol, 表頭: header, A1公式: a1.slice(0, 220)};
   });
 }
 
