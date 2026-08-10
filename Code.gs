@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.23';
+const BACKEND_VERSION = '2026-08-10.25';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -142,6 +142,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
   inspectSheetFormulas_: (arg) => inspectSheetFormulas_(arg),
+  listFolder_: (arg) => listFolder_(arg),
+  findSheetOwner_: (arg) => findSheetOwner_(arg),
   hourlySync_: () => hourlySync_(),
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
@@ -1299,6 +1301,35 @@ function inspectSheetFormulas_(arg){
   return Object.keys(out).length ? out : {結論:'這個分頁的資料列是靜態值，沒有公式（由腳本或人工寫入）'};
 }
 
+// 唯讀診斷用：列出某個雲端硬碟資料夾裡的檔案；arg = 資料夾ID
+function listFolder_(folderId){
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFiles();
+  const out = [];
+  while(files.hasNext() && out.length < 30){
+    const f = files.next();
+    out.push({名稱: f.getName(), id: f.getId(), 類型: f.getMimeType().split('.').pop()});
+  }
+  return {資料夾: folder.getName(), 檔案: out};
+}
+
+// 唯讀診斷用：找出「含有指定分頁名稱」的試算表（用來反查綁定式腳本掛在哪份表上）。
+// arg = 分頁名稱。只掃使用者雲端硬碟裡的試算表，找到就停。
+function findSheetOwner_(tabName){
+  const files = DriveApp.getFilesByType(MimeType.GOOGLE_SHEETS);
+  const hits = [], checked = [];
+  let n = 0;
+  while(files.hasNext() && n < 60 && hits.length < 3){
+    const f = files.next(); n++;
+    checked.push(f.getName());
+    try{
+      const ss = SpreadsheetApp.openById(f.getId());
+      if(ss.getSheetByName(tabName)) hits.push({名稱: f.getName(), id: f.getId()});
+    }catch(e){}
+  }
+  return {找到: hits, 已檢查數量: n, 檢查過的檔名: checked.slice(0, 30)};
+}
+
 // 唯讀診斷用：在雲端硬碟裡找 Apps Script 專案（clasp 的授權範圍只看得到它自己建立的檔案，
 // 列不出既有專案；我們這邊有完整 drive 權限所以找得到）。用完可以刪掉。
 function findScriptProjects_(keyword){
@@ -1358,7 +1389,7 @@ function inspectSourceSpreadsheet_(ssId){
     // A1的公式最能看出這個分頁的資料是自己來的、還是IMPORTRANGE別份試算表過來的
     let a1 = '';
     try{ a1 = String(sh.getRange('A1').getFormula()||''); }catch(e){}
-    return {分頁: sh.getName(), 列數: lastRow, 欄數: lastCol, 表頭: header, A1公式: a1.slice(0, 220)};
+    return {分頁: sh.getName(), gid: sh.getSheetId(), 列數: lastRow, 欄數: lastCol, 表頭: header, A1公式: a1.slice(0, 220)};
   });
 }
 
