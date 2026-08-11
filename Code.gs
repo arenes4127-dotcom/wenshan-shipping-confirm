@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.34';
+const BACKEND_VERSION = '2026-08-10.36';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -44,7 +44,7 @@ const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'
 // pickedJson：這張訂單「哪些品號已經揀好了」，存成 {"品號":{"by":"工號","at":"時間"}} 的JSON。
 // 放在訂單列上而不是另開一張表，是為了讓 getState 不用多讀一張表——揀貨畫面要能秒開，
 // 而 getState 本來就已經要讀「訂單」分頁了。稽核用的逐筆紀錄另外寫「揀貨紀錄」分頁。
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson'];
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote'];
 const SHEET_PICKLOG = '揀貨紀錄';
 const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action'];
 // 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
@@ -76,7 +76,7 @@ const HEADER_LABELS = {
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
   logTime:'時間', event:'事件', detail:'說明',
   logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
-  pickedJson:'已揀品項(JSON)', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作'
+  pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作'
 };
 
 function doGet(e){
@@ -146,6 +146,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   releaseStaleClaims_: () => releaseStaleClaims_(),
   syncNativeOrderSheet_: () => syncNativeOrderSheet_(),
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
+  syncSpecialNotes_: () => syncSpecialNotes_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
   inspectSheetFormulas_: (arg) => inspectSheetFormulas_(arg),
@@ -259,7 +260,8 @@ function getState(){
       shipMethod: r.shipMethod || '', routingStatus: r.routingStatus || '',
       manualClose: String(r.manualClose || '').trim(),
       logisticsConfirmed: String(r.logisticsConfirmed || '').trim(),
-      logisticsTime: String(r.logisticsTime || '').trim()
+      logisticsTime: String(r.logisticsTime || '').trim(),
+      specialNote: String(r.specialNote || '').trim()
     };
     // 把「已揀」狀態掛回各品項上，前端就不用自己再對一次
     const picked = safeParse(r.pickedJson, {});
@@ -408,7 +410,9 @@ function mergeOrders(incoming){
       logisticsConfirmed: existing ? (existing.logisticsConfirmed||'') : '',
       logisticsTime: existing ? (existing.logisticsTime||'') : '',
       // 揀貨狀態是人員實際揀出來的，同步只更新訂單內容，不能洗掉
-      pickedJson: existing ? (existing.pickedJson||'') : ''
+      pickedJson: existing ? (existing.pickedJson||'') : '',
+      // 特殊註記是客服寫的，由 syncSpecialNotes_ 專門更新，一般同步不要動它
+      specialNote: existing ? (existing.specialNote||'') : ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     if(existing) updated++; else added++;
@@ -500,6 +504,7 @@ function autoSyncOrders_(){
   const result = mergeOrders(parsed);
   syncNativeOrderSheet_(); // 順便把核對結果同步回舊的核對表單
   syncLogisticsConfirm_(); // 以及物流籃確認狀態
+  syncSpecialNotes_();     // 以及客服寫的特殊註記
   Logger.log('自動同步完成：新增'+result.added+'／更新'+result.updated+'／已出貨略過'+result.skippedShipped
     +'，非本倉略過'+skippedOtherWarehouse+'，資料欄位不全略過'+skippedRows+'。');
 }
@@ -1168,7 +1173,7 @@ function healOrderRowIfNeeded_(sh, row){
     updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '',
     // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
     // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
-    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: ''};
+    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: ''};
   // 寫回試算表的狀態要轉成中文，回傳給呼叫端的物件維持英文代碼
   sh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
     .setValues([ORDERS_HEADER.map(h=> h==='status' ? statusToText(fixed.status) : fixed[h])]);
@@ -1277,6 +1282,42 @@ function markPickedBatch(ops){
          .setValues(logRows.map(o=> PICKLOG_HEADER.map(h=> o[h])));
   }
   return {ok:true, 處理筆數: applied, 找不到訂單: notFound};
+}
+
+// ---------------- 特殊註記：把客服寫的缺貨／換貨備註帶到包貨人員眼前 ----------------
+// 註記是客服在白天陸續寫的，所以要比訂單同步更常更新——掛在每小時的維護排程裡。
+// 只更新有註記的訂單；沒註記的不動，避免把先前抓到的註記洗掉（來源那一格可能被清空重寫）。
+const NOTE_MIRROR_SHEET = '蝦proV2註記';
+function syncSpecialNotes_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(NOTE_MIRROR_SHEET);
+  if(!sh){ Logger.log('找不到「'+NOTE_MIRROR_SHEET+'」鏡像分頁，略過特殊註記同步'); return {ok:false}; }
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return {ok:true, 來源筆數:0, 已更新:0};
+
+  const values = sh.getRange(1, 1, lastRow, 2).getValues();
+  const notes = {};
+  for(let i = 1; i < values.length; i++){
+    const no = String(values[i][0]||'').trim();
+    const note = String(values[i][1]||'').trim();
+    if(no && note) notes[no] = note;
+  }
+  const sourceCount = Object.keys(notes).length;
+  if(!sourceCount) return {ok:true, 來源筆數:0, 已更新:0};
+
+  const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const col = colOf(ORDERS_HEADER, 'specialNote');
+  let updated = 0;
+  rows.forEach(r=>{
+    const hit = notes[String(r.orderNo||'').trim()];
+    if(hit === undefined) return;
+    if(String(r.specialNote||'').trim() === hit) return;   // 沒變就不要白寫
+    ordersSh.getRange(r._row, col).setValue(hit);
+    updated++;
+  });
+  Logger.log('特殊註記同步：來源'+sourceCount+'筆，更新'+updated+'張訂單。');
+  return {ok:true, 來源筆數:sourceCount, 已更新:updated};
 }
 
 // ---------------- 揀貨路線：把儲位換算成「走動順序」 ----------------
@@ -1427,6 +1468,7 @@ function syncLogisticsConfirm_(){
 function hourlySync_(){
   syncNativeOrderSheet_();
   syncLogisticsConfirm_();
+  syncSpecialNotes_();
 }
 
 // 唯讀診斷用：看某個分頁的資料列是靜態值還是公式（公式才看得出資料是從哪裡串過來的）。
@@ -1493,6 +1535,32 @@ function findScriptProjects_(keyword){
       SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy/MM/dd HH:mm')});
   }
   return out;
+}
+
+// 唯讀診斷用：評估「特殊註記」值不值得接進來——看多少訂單真的有註記、內容長什麼樣。
+function inspectSpecialNotes_(){
+  const ss = SpreadsheetApp.openById('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
+  const sh = ss.getSheetByName('蝦proV2');
+  if(!sh) return {error:'找不到蝦proV2'};
+  const lastRow = sh.getLastRow();
+  const v = sh.getRange(1, 1, Math.min(lastRow, 400), 16).getValues();
+  const iOrder = 5, iStatus = 6, iNote = 10; // F=訂單編號, G=狀態, K=特殊註記
+  let withOrder = 0, withNote = 0;
+  const samples = [], byStatus = {};
+  for(let i = 1; i < v.length; i++){
+    const no = String(v[i][iOrder]||'').trim();
+    if(!no) continue;
+    withOrder++;
+    const note = String(v[i][iNote]||'').trim();
+    if(!note) continue;
+    withNote++;
+    const st = String(v[i][iStatus]||'').trim() || '(空白)';
+    byStatus[st] = (byStatus[st]||0) + 1;
+    if(samples.length < 12) samples.push({訂單: no, 狀態: st, 註記: note.slice(0, 60)});
+  }
+  return {有訂單編號的列: withOrder, 有特殊註記的列: withNote,
+          比例: withOrder ? (withNote/withOrder*100).toFixed(1)+'%' : '-',
+          有註記者的訂單狀態分布: byStatus, 範例: samples};
 }
 
 // 唯讀診斷用：看「蝦proV2」的過刷欄實際存了什麼值（已過刷 vs 未過刷分別長怎樣）。
@@ -2270,7 +2338,7 @@ function migrateOrdersColumnShift(){
       status: statusToText(textToStatus(oldStatus) || 'pending'),
       claimedBy: oldClaimedBy || '', claimedAt: oldClaimedAt || '', updatedAt: oldUpdatedAt || '',
       shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '', manualClose: '',
-      logisticsConfirmed: '', logisticsTime: '', pickedJson: ''
+      logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     migrated++;
@@ -2441,6 +2509,16 @@ function setupImportedMirrorSheets(){
     // 多抓欄位不影響既有邏輯——autoSyncOrders_ 是用表頭名稱找欄位（header.indexOf），
     // 不是用寫死的欄號，所以欄位順序變動不會讓它讀錯。
     '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,12,13,14,18,19,20,21,22,31)'
+  );
+
+  // 蝦proV2 的「特殊註記」：客服處理缺貨／盤差時寫的備註，例如
+  //   「客取消 3076213KA4007A 缺1 直幫換 3076213KA4007C 已通知」
+  // 包貨人員掃到缺貨時最需要這一行——沒有它就得停下來去問客服聯絡了沒、要換什麼。
+  // 只取 F欄(訂單編號) 跟 K欄(特殊註記) 兩欄，其他欄位跟我們無關。
+  let noteSh = ss.getSheetByName('蝦proV2註記');
+  if(!noteSh) noteSh = ss.insertSheet('蝦proV2註記');
+  noteSh.getRange('A1').setFormula(
+    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'蝦proV2\'!A:P"),6,11)'
   );
 
   // 條碼轉品號：「國際碼」分頁本身也是IMPORTRANGE鏡像，直接接到它指向的真正來源

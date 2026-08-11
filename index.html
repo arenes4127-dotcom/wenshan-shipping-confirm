@@ -197,6 +197,11 @@
             </div>
             <div class="progress-num"><span id="progressDone">0</span><span>/<span id="progressTotal">0</span></span></div>
           </div>
+          <!-- 客服寫的特殊註記。缺貨／盤差／已跟顧客談好換什麼，都寫在這裡。
+               放在最上面而且用橘色，是因為人員通常掃到一半才發現缺貨，
+               那時候才去問客服等於整張單停下來——這行字要在他開始掃之前就看到。 -->
+          <div id="curSpecialNote" style="display:none;margin-top:10px;padding:12px 14px;border-radius:var(--radius-sm);
+               background:rgba(230,145,56,.15);border:1px solid #e69138;color:#e69138;font-weight:600;line-height:1.5;"></div>
 
           <div class="tbl-wrap" style="margin-top:14px;">
             <table id="itemTable">
@@ -1116,6 +1121,7 @@ function renderPickList(){
   const total = rows.length, done = rows.filter(r=>r.picked).length;
   if(hideDone && !pickSortView) rows = rows.filter(r=>!r.picked);
 
+  const noteOrders = scope.filter(function(o){ return String(o.specialNote||'').trim(); });
   summary.textContent = (pickMode==='single'
       ? '訂單 ' + scope[0].orderNo + '　' + (scope[0].store||'') + '　' + (scope[0].shipMethod||'')
       : '本批 ' + scope.length + ' 張訂單')
@@ -1123,12 +1129,21 @@ function renderPickList(){
     + (transferRows.length ? '　⚠ ' + transferRows.length + ' 件需調撥' : '')
     + (pickQueue.length ? '（' + pickQueue.length + ' 筆待同步）' : '');
 
-  if(pickSortView){ container.innerHTML = renderSortView(scope); return; }
+  // 有客服註記的訂單，在揀貨階段就標出來——那些通常就是會缺貨的單
+  let noteHtml = '';
+  noteOrders.forEach(function(o){
+    noteHtml += '<div class="card" style="border-color:#e69138;background:rgba(230,145,56,.08);">' +
+      '<div style="color:#e69138;font-weight:600;">⚠ ' + escapeHtml(o.orderNo) + '　客服註記</div>' +
+      '<div class="hint" style="margin-top:4px;color:#e69138;">' + escapeHtml(o.specialNote) + '</div></div>';
+  });
+
+  if(pickSortView){ container.innerHTML = noteHtml + renderSortView(scope); return; }
 
   if(!rows.length){
     container.innerHTML = '<div class="card"><p class="hint">' +
       (total ? '文山的部分都揀完了 🎉' + (pickMode==='single' ? '' : '　可以按「分揀檢視」開始分裝') : '文山沒有要揀的品項') +
       '</p></div>' + renderTransferSection(transferRows, scope);
+    container.innerHTML = noteHtml + container.innerHTML;
     return;
   }
 
@@ -1155,7 +1170,7 @@ function renderPickList(){
         '</div>' +
       '</div></div>';
   });
-  container.innerHTML = html + renderTransferSection(transferRows, scope);
+  container.innerHTML = noteHtml + html + renderTransferSection(transferRows, scope);
 }
 
 // 需要從其他門店調撥的品項單獨一區。這些貨不在文山，揀貨員找不到也不該去找；
@@ -1275,7 +1290,8 @@ function renderPending(){
   if(!pendingList.length){ tbody.innerHTML = `<tr><td colspan="6" class="empty-row">${q?'沒有符合搜尋條件的訂單':'目前沒有待出貨訂單'}</td></tr>`; return; }
   tbody.innerHTML = pendingList.map(o=>{
     const totalQty = o.items.reduce((s,i)=>s+i.qty,0);
-    return `<tr><td>${o.orderNo}</td><td>${o.date||'-'}</td><td>${o.store||'-'}</td><td>${o.shipMethod||'-'}</td><td>${o.items.length}</td><td>${totalQty}</td></tr>`;
+    const noteFlag = String(o.specialNote||'').trim() ? ' <span class="tag warn">註記</span>' : '';
+    return `<tr><td>${o.orderNo}${noteFlag}</td><td>${o.date||'-'}</td><td>${o.store||'-'}</td><td>${o.shipMethod||'-'}</td><td>${o.items.length}</td><td>${totalQty}</td></tr>`;
   }).join('');
 }
 document.getElementById('pendingSearch').addEventListener('input', renderPending);
@@ -1348,6 +1364,15 @@ inputOrder.addEventListener('keydown', async e=>{
   document.getElementById('curDate').textContent = current.date || '-';
   document.getElementById('curStore').textContent = current.store || '-';
   document.getElementById('curShipMethod').textContent = current.shipMethod || '-';
+  const noteBox = document.getElementById('curSpecialNote');
+  const note = String(current.specialNote||'').trim();
+  if(note){
+    noteBox.textContent = '⚠ 客服註記：' + note;
+    noteBox.style.display = 'block';
+  } else {
+    noteBox.textContent = '';
+    noteBox.style.display = 'none';
+  }
   document.getElementById('completeBox').style.display='none';
   document.getElementById('finalMsg').textContent='';
   setPill('scan', `訂單 ${current.orderNo} 掃描中`);
