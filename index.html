@@ -1008,6 +1008,33 @@ let pickCurrentOrder = localStorage.getItem('ssz_pick_order') || '';
 let pickBatch = loadJSON('ssz_pick_batch', []);
 let pickSortView = false;
 
+// 文山出貨V2 已經依各倉庫／門市的庫存判定好每一件要由誰出：
+//   文山分配 > 0 → 這幾件文山自己揀得到
+//   山物/中華/OM 分配 > 0 → 這幾件要從那個門店調撥過來，揀貨員在文山怎麼找都找不到
+// 所以要在畫面上分開：揀得到的才進走動路線，調撥的另外列出來，不要讓人白找。
+// 舊訂單（分配欄位還沒接進來時同步的）四個欄位都是0，這種一律當成「文山全揀」照舊處理，
+// 不然它們會整批被誤判成要調撥。
+function itemAlloc(it){
+  const ws = it.allocWs||0, sp = it.allocSp||0, zh = it.allocZh||0, om = it.allocOm||0;
+  const transfer = sp + zh + om;
+  const hasData = (ws + transfer + (it.shortQty||0)) > 0;
+  const froms = [];
+  if(sp) froms.push('調山物' + (sp>1?' '+sp:''));
+  if(zh) froms.push('調中華' + (zh>1?' '+zh:''));
+  if(om) froms.push('調OM' + (om>1?' '+om:''));
+  return {
+    hasData: hasData,
+    pickQty: hasData ? ws : (it.qty||0),   // 文山實際要揀的數量
+    transferQty: transfer,
+    shortQty: it.shortQty||0,
+    fromText: froms.join('、')
+  };
+}
+// 這張訂單有沒有任何一件要調撥——有的話揀貨盒要放待調區，不能直接進包貨區
+function orderNeedsTransfer(o){
+  return (o.items||[]).some(function(it){ return itemAlloc(it).transferQty > 0; });
+}
+
 function pickableOrders(){
   return Object.values(orders).filter(o=>o.status === 'pending' && !isManuallyClosed(o));
 }
@@ -1073,13 +1100,17 @@ function renderPickList(){
     return;
   }
 
-  let rows = [];
+  let rows = [], transferRows = [];
   scope.forEach(o=>{
     (o.items||[]).forEach(it=>{
-      rows.push({orderNo:o.orderNo, store:o.store||'', shipMethod:o.shipMethod||'',
+      const a = itemAlloc(it);
+      const base = {orderNo:o.orderNo, store:o.store||'', shipMethod:o.shipMethod||'',
         sku:it.sku, baseName:it.baseName||it.name||'', spec:it.spec||'', qty:it.qty||0,
         location:it.location||'', stockWs:it.stockWs||'', stockMain:it.stockMain||'',
-        picked:!!it.picked});
+        picked:!!it.picked, alloc:a};
+      // 文山一件都揀不到的（全部要調撥）就不要放進走動路線，免得人員照著儲位去找空架
+      if(a.pickQty > 0 || a.transferQty === 0) rows.push(base);
+      if(a.transferQty > 0) transferRows.push(base);
     });
   });
   const total = rows.length, done = rows.filter(r=>r.picked).length;
@@ -1089,14 +1120,15 @@ function renderPickList(){
       ? '訂單 ' + scope[0].orderNo + '　' + (scope[0].store||'') + '　' + (scope[0].shipMethod||'')
       : '本批 ' + scope.length + ' 張訂單')
     + '　共 ' + total + ' 項，已揀 ' + done + '，剩 ' + (total-done)
+    + (transferRows.length ? '　⚠ ' + transferRows.length + ' 件需調撥' : '')
     + (pickQueue.length ? '（' + pickQueue.length + ' 筆待同步）' : '');
 
   if(pickSortView){ container.innerHTML = renderSortView(scope); return; }
 
   if(!rows.length){
     container.innerHTML = '<div class="card"><p class="hint">' +
-      (total ? '這一批都揀完了 🎉' + (pickMode==='single' ? '　可以直接包這張了' : '　可以按「分揀檢視」開始分裝') : '沒有品項') +
-      '</p></div>';
+      (total ? '文山的部分都揀完了 🎉' + (pickMode==='single' ? '' : '　可以按「分揀檢視」開始分裝') : '文山沒有要揀的品項') +
+      '</p></div>' + renderTransferSection(transferRows, scope);
     return;
   }
 
@@ -1123,7 +1155,34 @@ function renderPickList(){
         '</div>' +
       '</div></div>';
   });
-  container.innerHTML = html;
+  container.innerHTML = html + renderTransferSection(transferRows, scope);
+}
+
+// 需要從其他門店調撥的品項單獨一區。這些貨不在文山，揀貨員找不到也不該去找；
+// 列出來是為了讓他知道「這張單還缺這幾件、要等調撥回來」，揀貨盒才會放對地方。
+function renderTransferSection(transferRows, scope){
+  if(!transferRows.length) return '';
+  const needBoxes = scope.filter(orderNeedsTransfer).map(function(o){ return o.orderNo; });
+  let html = '<div class="section-label" style="margin-top:22px;color:#e69138;">⚠ 需調撥（文山揀不到）</div>' +
+    '<div class="card" style="border-color:#e69138;"><p class="hint">' +
+    '這些品項要從其他門店調撥過來，<b>不要在文山找</b>。' +
+    '受影響的揀貨盒共 <b>' + needBoxes.length + '</b> 張，揀完請放<b>待調區</b>，等貨到齊再分裝：<br>' +
+    needBoxes.map(function(n){ return escapeHtml(n); }).join('、') +
+    '</p></div>';
+  transferRows.forEach(function(r){
+    html += '<div class="card" style="padding:12px;margin-bottom:8px;opacity:.85;">' +
+      '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="font-weight:700;">' + escapeHtml(r.baseName) + (r.spec?'（'+escapeHtml(r.spec)+'）':'') + '</div>' +
+          '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.sku) + '　<b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b></div>' +
+        '</div>' +
+        '<div style="text-align:right;white-space:nowrap;">' +
+          '<div style="font-size:15px;font-weight:800;color:#e69138;">' + escapeHtml(r.alloc.fromText) + '</div>' +
+          '<div class="hint">應出 ' + r.qty + (r.alloc.pickQty>0 ? '，文山先揀 '+r.alloc.pickQty : '') + '</div>' +
+        '</div>' +
+      '</div></div>';
+  });
+  return html;
 }
 
 // 分揀檢視：把本批的貨按「訂單」重新分組，回到分揀台照這個分裝。
@@ -1133,8 +1192,9 @@ function renderSortView(scope){
   scope.forEach(function(o){
     const its = o.items||[];
     const doneCount = its.filter(function(i){ return i.picked; }).length;
+    const waitTag = orderNeedsTransfer(o) ? '　<span style="color:#e69138;">⚠ 待調撥・放待調區</span>' : '';
     html += '<div class="section-label" style="margin-top:14px;">' + escapeHtml(o.orderNo) + '　' +
-      escapeHtml(o.store||'') + '　' + escapeHtml(o.shipMethod||'') + '　(' + doneCount + '/' + its.length + ')</div>';
+      escapeHtml(o.store||'') + '　' + escapeHtml(o.shipMethod||'') + '　(' + doneCount + '/' + its.length + ')' + waitTag + '</div>';
     its.forEach(function(it){
       html += '<div class="card" style="padding:10px;margin-bottom:6px;' + (it.picked?'':'border-color:var(--danger);') + '"' +
         ' onclick="togglePick(\'' + escapeHtml(o.orderNo) + '\',\'' + escapeHtml(it.sku) + '\')">' +

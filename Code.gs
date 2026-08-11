@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.31';
+const BACKEND_VERSION = '2026-08-10.32';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -453,7 +453,10 @@ function autoSyncOrders_(){
         iQty = idx('數量'), iStore = idx('賣場'), iDate = idx('日期'), iStatus = idx('訂單狀態'),
         iShipMethod = idx('寄送方式'),
         // 揀貨用：儲位決定走動路線，庫存讓人員當場判斷是不是真的缺貨
-        iLocation = idx('文山儲位'), iStockWs = idx('文山'), iStockMain = idx('總倉');
+        iLocation = idx('文山儲位'), iStockWs = idx('文山'), iStockMain = idx('總倉'),
+        // 分配欄位：決定這件是文山自己揀，還是要從別的門店調撥過來
+        iShort = idx('缺貨量'), iAllocWs = idx('文山分配'), iAllocSp = idx('山物分配'),
+        iAllocZh = idx('中華分配'), iAllocOm = idx('OM分配');
   if(iOrder < 0 || iSku < 0 || iQty < 0){
     Logger.log('鏡像分頁欄位格式不符（找不到訂單/品號/數量欄），無法自動同步');
     return;
@@ -478,10 +481,20 @@ function autoSyncOrders_(){
     const location = iLocation>=0 ? String(row[iLocation]||'').trim() : '';
     const stockWs = iStockWs>=0 ? String(row[iStockWs]||'').trim() : '';
     const stockMain = iStockMain>=0 ? String(row[iStockMain]||'').trim() : '';
+    const num = i => { const v = i>=0 ? parseInt(row[i], 10) : 0; return isNaN(v) ? 0 : v; };
+    const allocWs = num(iAllocWs), allocSp = num(iAllocSp), allocZh = num(iAllocZh),
+          allocOm = num(iAllocOm), shortQty = num(iShort);
     if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, routingStatus, items:[]};
     const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
-    if(existingItem) existingItem.qty += qty;
-    else parsed[orderNo].items.push({sku, name, baseName, spec, qty, location, stockWs, stockMain});
+    if(existingItem){
+      existingItem.qty += qty;
+      existingItem.allocWs += allocWs; existingItem.allocSp += allocSp;
+      existingItem.allocZh += allocZh; existingItem.allocOm += allocOm;
+      existingItem.shortQty += shortQty;
+    } else {
+      parsed[orderNo].items.push({sku, name, baseName, spec, qty, location, stockWs, stockMain,
+        allocWs, allocSp, allocZh, allocOm, shortQty});
+    }
   }
 
   const result = mergeOrders(parsed);
@@ -2394,10 +2407,13 @@ function setupImportedMirrorSheets(){
   orderSh.getRange('A1').setFormula(
     // 欄位：1日期 2賣場 3下單時間 4寄送方式 5訂單 6品名 7規格 8品號 9數量
     //       12文山儲位 13總倉 14文山（揀貨要用：儲位決定走動路線，庫存讓人員判斷缺不缺）
+    //       18缺貨量 19文山分配 20山物分配 21中華分配 22OM分配
+    //         （這五欄決定「這件在文山揀得到嗎」——分配到別的門店的要走調撥，
+    //           揀貨員在文山怎麼找都找不到，一定要標示出來，不然就是白找）
     //       31訂單狀態
-    // 這裡多抓的三欄不影響既有邏輯——autoSyncOrders_ 是用表頭名稱找欄位（header.indexOf），
+    // 多抓欄位不影響既有邏輯——autoSyncOrders_ 是用表頭名稱找欄位（header.indexOf），
     // 不是用寫死的欄號，所以欄位順序變動不會讓它讀錯。
-    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,12,13,14,31)'
+    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,12,13,14,18,19,20,21,22,31)'
   );
 
   // 條碼轉品號：「國際碼」分頁本身也是IMPORTRANGE鏡像，直接接到它指向的真正來源
