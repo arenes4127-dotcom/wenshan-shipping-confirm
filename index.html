@@ -938,8 +938,10 @@ document.getElementById('btnClearOrders').addEventListener('click', ()=>{
 // ============================================================
 // 走動順序完全跟後端 locationSortKey_() 同一套規則（倉庫地圖 L→A 蛇行）。
 // 兩邊都要有是因為：後端負責寫入與稽核，前端要能離線排序、點下去立刻重排，不能每次都問後端。
-// 跟後端同一份順序。M＝前方展售區貨架，所以路線從它開始；A~L 是貨架編號，實體由右至左。
-const AISLE_ORDER = ['M','L','K','J','I','H','G','F','E','D','C','B','A'];
+// 跟後端同一份順序（使用者實地確認）：
+// M 前方展售區 → A~L 貨架區（蛇行）→ P/Q/R/T/U → S(二樓)／未建立／描述性位置
+const AISLE_ORDER = ['M','A','B','C','D','E','F','G','H','I','J','K','L'];
+const SECONDARY_AISLE_ORDER = ['P','Q','R','T','U'];
 function parseLocation(loc){
   const s = String(loc||'').trim();
   if(!s) return null;
@@ -953,9 +955,14 @@ function locationSortKey(loc){
   const pad = n => String(n).padStart(3,'0');
   const p = parseLocation(loc);
   if(!p) return '2|ZZZ|999|999|' + String(loc||'');
-  if(p.aisleIndex < 0) return '1|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
-  const bay = (p.aisleIndex % 2 === 1) ? (999 - p.bay) : p.bay;
-  return '0|' + pad(p.aisleIndex) + '|' + pad(bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  const i0 = AISLE_ORDER.indexOf(p.aisle);
+  if(i0 >= 0){
+    const bay = (i0 % 2 === 1) ? (999 - p.bay) : p.bay;
+    return '0|' + pad(i0) + '|' + pad(bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  }
+  const i1 = SECONDARY_AISLE_ORDER.indexOf(p.aisle);
+  if(i1 >= 0) return '1|' + pad(i1) + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  return '2|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
 }
 
 // 待送出的揀貨動作。跟出貨那邊一樣走樂觀更新：點下去畫面立刻反應，

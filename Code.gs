@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.30';
+const BACKEND_VERSION = '2026-08-10.31';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1271,19 +1271,14 @@ function markPickedBatch(ops){
 // 實測 7122 個有儲位的品項：非標準格式（「鐵門前」「架上」「前排展示」）只佔 639 項（9%），
 // 一律排在最後——它們多半是散裝／展示區，順路最後帶走，而且沒有座標可以排。
 //
-// M 是文山倉「前方展售區」的貨架，有自己的一套編號（座號 12~66，比一般貨架的 1~12 長很多）。
-// 位置在最前面，所以路線從它開始——人員進門先把展售區的貨收一收，再往裡面走貨架區，
-// 不用先走到底再回頭。M 佔庫存品項的 23%，是最大的一區。
-//
-// A~L 是貨架編號，實體上由右至左排列（A 最右、L 最左），跟倉庫地圖那張表的欄位順序一致。
-//
-// P/Q/R/S/T/U 這幾個字母開頭的儲位（各數十項，座號3~5，其中 S 的值寫著「(二樓)」）
-// 實際位置尚未確認，先不放進 AISLE_ORDER——不知道位置就不要亂猜順序，
-// 猜錯會讓人員照著儲位去找、找不到、再花時間問，比沒有排序還糟。
-// 它們會落到「位置未確認」那一層，依字母集中排在一起，至少同一區的貨會被一次收完。
-// 確認之後把字母插進 AISLE_ORDER 的正確位置即可，其他程式碼都不用動。
-const OFFSITE_LOCATIONS = {};
-const AISLE_ORDER = ['M','L','K','J','I','H','G','F','E','D','C','B','A'];
+// 揀貨走動順序（使用者實地確認）：
+//   M 前方展售區 → A~L 貨架區（蛇行）→ P/Q/R/T/U → S(二樓)／未建立／描述性位置
+// A~L 是貨架編號、實體由右至左排列；走的方向是 A 走到 L。
+// 每一排走完接著走下一排時方向相反（蛇行），不用回到起點。
+const AISLE_ORDER = ['M','A','B','C','D','E','F','G','H','I','J','K','L'];
+// 貨架區走完之後才去的區域，順序照使用者給的
+const SECONDARY_AISLE_ORDER = ['P','Q','R','T','U'];
+// S 在二樓，跟「未建立」「鐵門前」「架上」這類一起排最後——上樓是另外一趟，順路帶不到
 
 function parseLocation_(loc){
   const s = String(loc||'').trim();
@@ -1309,12 +1304,16 @@ function parseLocation_(loc){
 function locationSortKey_(loc){
   const pad = n => String(n).padStart(3, '0');
   const p = parseLocation_(loc);
-  if(!p) return '3|ZZZ|999|999|' + String(loc||'');
-  if(OFFSITE_LOCATIONS[p.aisle]) return '2|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
-  if(p.aisleIndex < 0) return '1|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
-  // 蛇行：奇數排反向走，座號用 (999 - bay) 讓它由大往小排
-  const bay = (p.aisleIndex % 2 === 1) ? (999 - p.bay) : p.bay;
-  return '0|' + pad(p.aisleIndex) + '|' + pad(bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  if(!p) return '2|ZZZ|999|999|' + String(loc||'');
+  const i0 = AISLE_ORDER.indexOf(p.aisle);
+  if(i0 >= 0){
+    // 蛇行：奇數順位的排反向走，座號用 (999 - bay) 讓它由大往小排
+    const bay = (i0 % 2 === 1) ? (999 - p.bay) : p.bay;
+    return '0|' + pad(i0) + '|' + pad(bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  }
+  const i1 = SECONDARY_AISLE_ORDER.indexOf(p.aisle);
+  if(i1 >= 0) return '1|' + pad(i1) + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
+  return '2|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
 }
 
 // ---------------- 物流籃確認：讀「統計V2」人員掃上籃的紀錄，回填到我們的訂單分頁 ----------------
