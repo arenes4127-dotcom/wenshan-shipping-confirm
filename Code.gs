@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.61';
+const BACKEND_VERSION = '2026-08-11.63';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -157,6 +157,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupAmendSheet_: () => setupAmendSheet_(),
   testApplyItemOps_: () => testApplyItemOps_(),
   testAmendFlow_: () => testAmendFlow_(),
+  testOnEditWiring_: () => testOnEditWiring_(),
   dailyMaintenance_: () => dailyMaintenance_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
@@ -1664,6 +1665,14 @@ function testAmendFlow_(){
       && !resynced.some(function(i){ return i.sku==='TSKU-A'; })
       && resynced.some(function(i){ return i.sku==='TSKU-Z' && i.qty===3; });
     steps.push((okResync ? '✅ ' : '❌ ') + '同步後修改仍在（不會被來源蓋回去）');
+
+    // APP 拿到的是不是改過的內容——直接呼叫 APP 實際會呼叫的那支函式，不用推論。
+    const state = getState();
+    const appOrder = state.orders[orderNo];
+    const appOk = appOrder && appOrder.items.length===2
+      && !appOrder.items.some(function(i){ return i.sku==='TSKU-A'; })
+      && appOrder.items.some(function(i){ return i.sku==='TSKU-Z' && i.qty===3; });
+    steps.push((appOk ? '✅ ' : '❌ ') + 'getState（APP的資料來源）回傳的就是改過的品項');
   }catch(err){
     steps.push('❌ 例外：' + err);
   }finally{
@@ -1671,6 +1680,80 @@ function testAmendFlow_(){
     sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).clearContent();
     sh.getRange('B2').clearContent();
     sh.getRange('D2:D3').clearContent();
+  }
+  return {全部通過: steps.every(function(s){ return s.indexOf('✅')===0; }), 明細: steps};
+}
+
+// 測 onEdit 這條路徑本身。傳進去的是真的 Range 物件，所以 onEdit 裡面的
+// getSheet()/getA1Notation()/getValue() 都是真的在跑，跟真人編輯的差別只剩「誰觸發」。
+// Google 到底會不會在真人編輯時呼叫 onEdit，這裡測不出來——那是平台行為，只能實際敲一次。
+// 但如果 onEdit 內部有寫錯（欄位判斷、例外、勾選框沒彈回來），這個測試會抓到。
+function testOnEditWiring_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const sh = ss.getSheetByName(SHEET_AMEND);
+  if(!sh) return {error:'請先執行 setupAmendSheet_'};
+  const orderNo = 'TEST-ONEDIT-' + Date.now();
+  const srcItems = [
+    {sku:'TSKU-A', name:'測試甲', baseName:'測試甲', spec:'', qty:2, location:'A-01-1'},
+    {sku:'TSKU-B', name:'測試乙', baseName:'測試乙', spec:'', qty:4, location:'B-02-3'}
+  ];
+  const sum = summarizeItems(srcItems);
+  const rowObj = {
+    orderNo: orderNo, store: '測試', date: '2026/8/11', itemsJson: JSON.stringify(srcItems),
+    skuSummary: sum.skuSummary, nameSummary: sum.nameSummary,
+    status: statusToText('pending'), claimedBy: '', claimedAt: '', updatedAt: new Date().toISOString(),
+    shipMethod: '', routingStatus: '文山', manualClose: '', logisticsConfirmed: '', logisticsTime: '',
+    pickedJson: '', specialNote: '', itemsOverrideJson: ''
+  };
+  const testRow = ordersSh.getLastRow() + 1;
+  ordersSh.getRange(testRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(function(h){ return rowObj[h]; })]);
+
+  const steps = [];
+  try{
+    // 1) 模擬「在B2貼上訂單號」
+    sh.getRange('B2').setValue(orderNo);
+    onEdit({range: sh.getRange('B2')});
+    const loaded = sh.getRange(AMEND_FIRST_ROW, 1, 2, 3).getValues();
+    const d2 = String(sh.getRange('D2').getValue()||'');
+    steps.push((loaded[0][0]==='TSKU-A' && loaded[1][2]===4 ? '✅ ' : '❌ ')
+      + 'B2 貼訂單號 → 自動帶出品項（狀態訊息：'+d2+'）');
+
+    // 2) 模擬「填好修改內容後勾選套用」
+    sh.getRange(AMEND_FIRST_ROW, 5).setValue(1);        // 甲 2→1 件
+    sh.getRange(AMEND_FIRST_ROW + 1, 4).setValue('TSKU-Y'); // 乙 換成 Y
+    sh.getRange('B3').setValue(true);
+    onEdit({range: sh.getRange('B3')});
+    const d3 = String(sh.getRange('D3').getValue()||'');
+    const checkbox = sh.getRange('B3').getValue();
+    steps.push((d3.indexOf('✅')===0 ? '✅ ' : '❌ ') + '勾選套用 → '+d3);
+    steps.push((checkbox === false ? '✅ ' : '❌ ') + '勾選框已自動彈回未勾選');
+
+    const after = readOrderRows().find(function(r){ return r.orderNo === orderNo; });
+    const items = safeParse(after.itemsJson, []);
+    const a = items.find(function(i){ return i.sku==='TSKU-A'; });
+    const y = items.find(function(i){ return i.sku==='TSKU-Y'; });
+    steps.push((a && a.qty===1 ? '✅ ' : '❌ ') + '數量已改為1');
+    steps.push((y && y.qty===4 && y.location==='' ? '✅ ' : '❌ ') + '貨號已換且沿用原數量4、儲位已清空');
+
+    // 3) 套用後工作區應該已經重新帶出改後內容、輸入欄清空（避免手滑重複套用）
+    const regrid = sh.getRange(AMEND_FIRST_ROW, 1, 2, 5).getValues();
+    const inputsCleared = !String(regrid[0][3]||'').trim() && !String(regrid[0][4]||'').trim()
+                       && !String(regrid[1][3]||'').trim() && !String(regrid[1][4]||'').trim();
+    steps.push((inputsCleared ? '✅ ' : '❌ ') + '套用後輸入欄已清空，不會被重複套用');
+
+    // 4) 已出貨的訂單要擋下來
+    ordersSh.getRange(testRow, colOf(ORDERS_HEADER,'status')).setValue(statusToText('shipped'));
+    const blocked = applyAmendSheet_(sh, orderNo);
+    steps.push((blocked.indexOf('❌')===0 ? '✅ ' : '❌ ') + '已出貨的訂單被擋下：'+blocked);
+  }catch(err){
+    steps.push('❌ 例外：' + err);
+  }finally{
+    ordersSh.deleteRow(testRow);
+    sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).clearContent();
+    sh.getRange('B2').clearContent();
+    sh.getRange('D2:D3').clearContent();
+    sh.getRange('B3').setValue(false);
   }
   return {全部通過: steps.every(function(s){ return s.indexOf('✅')===0; }), 明細: steps};
 }
