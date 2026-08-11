@@ -781,11 +781,19 @@ async function loadBarcodeMap(silent){
     const header = table[0];
     const iBarcode = header.indexOf('條碼'), iSku = header.indexOf('品號');
     if(iBarcode<0 || iSku<0) throw new Error('找不到條碼/品號欄');
+    // 一個國際碼可能對到多個品號，所以存成陣列而不是覆蓋。
+    // 原因有二：(1)同一個實體商品在系統裡有新舊兩組品號（例如停產的「停-」前綴、
+    // 或 PC/PK 這種拼法不同的雙胞胎），(2)福袋類商品好幾個顏色共用同一個外包裝條碼。
+    // 原本寫 map[bc]=sku 是後蓋前，只留得住最後一筆——訂單上如果是被蓋掉的那個品號，
+    // 掃實體條碼就會判成「商品不符」，逼包貨人員人工介入，紀錄還會被標成🔴錯誤。
+    // 對照表裡目前有28個條碼是一碼多品號的狀態。
     const map = {};
     table.slice(1).forEach(row=>{
       const bc = (row[iBarcode]||'').trim();
       const sku = (row[iSku]||'').trim();
-      if(bc && sku) map[bc] = sku;
+      if(!bc || !sku) return;
+      if(!map[bc]) map[bc] = [];
+      if(map[bc].indexOf(sku) < 0) map[bc].push(sku);
     });
     barcodeMap = map;
     settings.barcodeMapLoadedAt = new Date().toLocaleString('zh-TW');
@@ -1527,7 +1535,9 @@ inputBarcode.addEventListener('keydown', e=>{
   // 先直接比對品號，比對不到再查條碼對照表轉換成品號後重試（掃到外包裝條碼時用）
   let item = current.items.find(i=>i.sku===code);
   if(!item && barcodeMap[code]){
-    item = current.items.find(i=>i.sku===barcodeMap[code]);
+    // 一個條碼可能對到多個品號，只要其中一個是這張訂單上的就算掃到
+    const skus = barcodeMap[code];
+    item = current.items.find(i=>skus.indexOf(i.sku) >= 0);
   }
   if(!item){
     current.hadIssue = true;
@@ -1652,8 +1662,10 @@ function confirmSubstitute(sku){
   if(code === null) return;
   const raw = String(code).trim();
   if(!raw) return;
-  // 跟掃描出貨同一套解析：先當品號，比對不到再查條碼對照表
-  const subSku = barcodeMap[raw] || raw;
+  // 跟掃描出貨同一套解析：先當品號，比對不到再查條碼對照表。
+  // 這裡沒有訂單品項可以拿來判斷該挑哪一個（替換商品本來就不在訂單上），
+  // 一碼多品號時取第一個；下一個 prompt 會把解析出來的品號顯示出來讓人確認。
+  const subSku = (barcodeMap[raw] && barcodeMap[raw][0]) || raw;
   if(subSku === item.sku){
     errorBeep();
     flash('err','替換商品不能跟原商品相同', '', 1800);
