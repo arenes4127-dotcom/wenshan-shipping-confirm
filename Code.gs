@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.63';
+const BACKEND_VERSION = '2026-08-11.65';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -158,6 +158,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   testApplyItemOps_: () => testApplyItemOps_(),
   testAmendFlow_: () => testAmendFlow_(),
   testOnEditWiring_: () => testOnEditWiring_(),
+  cleanupTestSysLogRows_: () => cleanupTestSysLogRows_(),
   dailyMaintenance_: () => dailyMaintenance_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
@@ -824,6 +825,7 @@ function setupDashboardSheet_(){
   const O = "'訂單'";   // 來源分頁名稱有中文，公式裡要加單引號
   const G = "'出貨紀錄'";
   const M = "'文山出貨V2'"; // 來源鏡像：算「今天該出多少」要用它（我們的訂單分頁是累計的，不是當日）
+  const SY = "'" + SHEET_SYSLOG + "'"; // 系統紀錄：人工修改訂單的紀錄從這裡撈
 
   // ---- 標題 ----
   sh.getRange('A1').setValue('文山出貨　即時儀表板');
@@ -1095,9 +1097,24 @@ function setupDashboardSheet_(){
   sectionTitle('J20:O20', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
   sh.getRange('J21:M21').setValues([['訂單號','包貨人員','核對結果','差異明細']])
     .setFontWeight('bold').setBackground('#f3f3f3');
+  // 限制最多15列（第22~36列）。這一區的FILTER本來是無上限往下長的，
+  // 下面第40列還有另一個區塊，出貨異常多的那天會直接被它蓋掉。
   sh.getRange('J22').setFormula(
-    `=IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
-    + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄")`
+    `=ARRAY_CONSTRAIN(IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
+    + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄"),15,4)`
+  );
+  sh.getRange('J37').setValue('（超過15筆時只顯示前15筆，完整內容請看「出貨紀錄」分頁）')
+    .setFontSize(9).setFontColor('#999999');
+
+  // ---- 6. 本日訂單修改（J40 起）----
+  // 人工改過的訂單要能一眼看到是誰、改了什麼、為什麼——這是所有「出貨內容跟原訂單不一樣」
+  // 的源頭，客訴回頭查的第一站。資料直接讀系統紀錄，不另外存一份，避免兩邊對不起來。
+  sectionTitle('J40:O40', '✏️ 本日訂單修改（缺貨／改單／盤差）');
+  sh.getRange('J41:L41').setValues([['時間','訂單號','修改內容（含原因）']])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange('J42').setFormula(
+    `=ARRAY_CONSTRAIN(IFERROR(CHOOSECOLS(FILTER(${SY}!$A$2:$E,${SY}!$B$2:$B="訂單品項人工修改",`
+    + `LEFT(${SY}!$A$2:$A,10)=TEXT(TODAY(),"yyyy/MM/dd")),1,3,5),"（今日尚無訂單修改）"),20,3)`
   );
 
   // ---- 版面 ----
@@ -1149,7 +1166,7 @@ function setupDashboardSheet_(){
 function debugReadDashboard_(){
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_DASHBOARD);
   if(!sh) return {error:'找不到儀表板分頁'};
-  const values = sh.getRange(1, 1, 20, 16).getDisplayValues();
+  const values = sh.getRange(1, 1, 45, 16).getDisplayValues();
   const out = [];
   values.forEach((row, i)=>{
     const cells = [];
@@ -1516,6 +1533,30 @@ function syncSpecialNotes_(){
 const SHEET_AMEND = '訂單修改';
 const AMEND_FIRST_ROW = 6;   // 第6列開始是品項工作區
 const AMEND_MAX_ROWS = 30;   // 一張訂單最多處理30個品項，夠用且不會無限往下長
+// 原因用下拉選單而不是自由填寫：這些字會被寫進出貨紀錄的「差異明細」，
+// 之後要靠它統計「到底是缺貨多還是客人改單多」。自由填寫的話同一件事會有十種寫法，統計不出東西。
+// 選單擋不住的細節（哪個客人、換成什麼顏色）寫在旁邊的「備註」欄，兩欄分工。
+const AMEND_REASONS = ['缺貨不出', '缺貨改出替代品', '客人改單', '盤差調整', '商品瑕疵更換', '贈品／加購', '其他'];
+
+function nowStamp_(){
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  return Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd HH:mm:ss');
+}
+
+// 把訂單上存的修改指令組成一句給人看的話，用在出貨紀錄的「差異明細」。
+// 舊資料的指令沒有 desc 欄（那時還沒有原因下拉），退回用貨號拼一句，不要整段變空白。
+function amendSummary_(overrideJson){
+  const ops = safeParse(String(overrideJson||''), []);
+  if(!ops.length) return '';
+  const parts = ops.map(function(op){
+    if(op.desc) return op.desc;
+    const from = String(op.sku||''), to = String(op.toSku||'');
+    if(!from) return '加出 ' + to;
+    if(op.qty === 0) return '不出 ' + from;
+    return to ? (from + ' 改出 ' + to) : (from + ' 數量改為 ' + op.qty);
+  });
+  return '出貨前經人工修改：' + parts.join('；');
+}
 
 // 把一串修改指令套用到品項清單上。純函式，不碰試算表，方便單獨驗證。
 // op 格式：{sku:'原貨號', toSku:'新貨號'|'', qty:數字|null, name:'新品名'}
@@ -1642,10 +1683,18 @@ function testAmendFlow_(){
     const loaded = sh.getRange(AMEND_FIRST_ROW, 1, 3, 3).getValues();
     steps.push((loaded[0][0]==='TSKU-A' && loaded[2][2]===5 ? '✅ ' : '❌ ') + '帶出原始品項：' + loadMsg);
 
-    // 第1列：整件不出；第3列：換成別的貨號並改數量
+    // 沒選原因就要被擋下來——原因是要寫進出貨紀錄的，漏了等於這筆修改事後查不出所以然
     sh.getRange(AMEND_FIRST_ROW, 5).setValue(0);
+    const noReason = applyAmendSheet_(sh, orderNo);
+    steps.push((noReason.indexOf('❌')===0 && noReason.indexOf('原因')>0 ? '✅ ' : '❌ ')
+      + '沒選原因被擋下：' + noReason);
+
+    // 第1列：整件不出；第3列：換成別的貨號並改數量
+    sh.getRange(AMEND_FIRST_ROW, 6).setValue('缺貨不出');
     sh.getRange(AMEND_FIRST_ROW + 2, 4).setValue('TSKU-Z');
     sh.getRange(AMEND_FIRST_ROW + 2, 5).setValue(3);
+    sh.getRange(AMEND_FIRST_ROW + 2, 6).setValue('客人改單');
+    sh.getRange(AMEND_FIRST_ROW + 2, 7).setValue('客人來電改成綠色');
     const applyMsg = applyAmendSheet_(sh, orderNo);
     steps.push((applyMsg.indexOf('✅')===0 ? '✅ ' : '❌ ') + '套用：' + applyMsg);
 
@@ -1673,6 +1722,13 @@ function testAmendFlow_(){
       && !appOrder.items.some(function(i){ return i.sku==='TSKU-A'; })
       && appOrder.items.some(function(i){ return i.sku==='TSKU-Z' && i.qty===3; });
     steps.push((appOk ? '✅ ' : '❌ ') + 'getState（APP的資料來源）回傳的就是改過的品項');
+
+    // 出貨時會寫進「差異明細」的那段字：原因跟備註都要在裡面，而且要自己讀得懂
+    const summary = amendSummary_(after.itemsOverrideJson);
+    const sumOk = summary.indexOf('出貨前經人工修改')===0
+      && summary.indexOf('缺貨不出')>0 && summary.indexOf('客人改單')>0
+      && summary.indexOf('客人來電改成綠色')>0;
+    steps.push((sumOk ? '✅ ' : '❌ ') + '差異明細用字：' + summary);
   }catch(err){
     steps.push('❌ 例外：' + err);
   }finally{
@@ -1680,6 +1736,8 @@ function testAmendFlow_(){
     sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).clearContent();
     sh.getRange('B2').clearContent();
     sh.getRange('D2:D3').clearContent();
+    sh.getRange('B3').setValue(false);
+    cleanupTestSysLogRows_();
   }
   return {全部通過: steps.every(function(s){ return s.indexOf('✅')===0; }), 明細: steps};
 }
@@ -1721,7 +1779,9 @@ function testOnEditWiring_(){
 
     // 2) 模擬「填好修改內容後勾選套用」
     sh.getRange(AMEND_FIRST_ROW, 5).setValue(1);        // 甲 2→1 件
+    sh.getRange(AMEND_FIRST_ROW, 6).setValue('盤差調整');
     sh.getRange(AMEND_FIRST_ROW + 1, 4).setValue('TSKU-Y'); // 乙 換成 Y
+    sh.getRange(AMEND_FIRST_ROW + 1, 6).setValue('商品瑕疵更換');
     sh.getRange('B3').setValue(true);
     onEdit({range: sh.getRange('B3')});
     const d3 = String(sh.getRange('D3').getValue()||'');
@@ -1737,10 +1797,11 @@ function testOnEditWiring_(){
     steps.push((y && y.qty===4 && y.location==='' ? '✅ ' : '❌ ') + '貨號已換且沿用原數量4、儲位已清空');
 
     // 3) 套用後工作區應該已經重新帶出改後內容、輸入欄清空（避免手滑重複套用）
-    const regrid = sh.getRange(AMEND_FIRST_ROW, 1, 2, 5).getValues();
-    const inputsCleared = !String(regrid[0][3]||'').trim() && !String(regrid[0][4]||'').trim()
-                       && !String(regrid[1][3]||'').trim() && !String(regrid[1][4]||'').trim();
-    steps.push((inputsCleared ? '✅ ' : '❌ ') + '套用後輸入欄已清空，不會被重複套用');
+    const regrid = sh.getRange(AMEND_FIRST_ROW, 1, 2, 7).getValues();
+    const inputsCleared = [0,1].every(function(i){
+      return [3,4,5,6].every(function(c){ return !String(regrid[i][c]||'').trim(); });
+    });
+    steps.push((inputsCleared ? '✅ ' : '❌ ') + '套用後四個輸入欄都已清空，不會被重複套用');
 
     // 4) 已出貨的訂單要擋下來
     ordersSh.getRange(testRow, colOf(ORDERS_HEADER,'status')).setValue(statusToText('shipped'));
@@ -1754,8 +1815,26 @@ function testOnEditWiring_(){
     sh.getRange('B2').clearContent();
     sh.getRange('D2:D3').clearContent();
     sh.getRange('B3').setValue(false);
+    cleanupTestSysLogRows_();
   }
   return {全部通過: steps.every(function(s){ return s.indexOf('✅')===0; }), 明細: steps};
+}
+
+// 測試用的訂單會在系統紀錄留下修改紀錄，不清掉的話儀表板的「本日訂單修改」
+// 會列出一堆 TEST- 開頭的假資料，看的人分不出哪些是真的。
+// 由後往前刪，才不會刪掉一列之後後面的列號整個往上位移。
+function cleanupTestSysLogRows_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SYSLOG);
+  if(!sh) return 0;
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return 0;
+  const col = colOf(SYSLOG_HEADER, 'orderNo');
+  const values = sh.getRange(2, col, lastRow - 1, 1).getValues();
+  let removed = 0;
+  for(let i = values.length - 1; i >= 0; i--){
+    if(String(values[i][0]||'').indexOf('TEST-') === 0){ sh.deleteRow(i + 2); removed++; }
+  }
+  return removed;
 }
 
 function setupAmendSheet_(){
@@ -1787,16 +1866,25 @@ function setupAmendSheet_(){
     .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
   sh.setRowHeight(4, 52);
 
-  const header = ['原貨號','原品名','原數量','改成貨號','改成數量','說明／原因','狀態'];
+  const header = ['原貨號','原品名','原數量','改成貨號','改成數量','原因（下拉）','備註'];
   sh.getRange(5, 1, 1, header.length).setValues([header])
     .setFontWeight('bold').setBackground('#f3f3f3');
+  // 原因欄裝下拉選單。setAllowInvalid(false) 是刻意的：允許亂填就等於沒有選單，
+  // 之後在儀表板上按原因分類統計會又回到各寫各的。
+  sh.getRange(AMEND_FIRST_ROW, 6, AMEND_MAX_ROWS, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList(AMEND_REASONS, true)
+      .setAllowInvalid(false)
+      .setHelpText('請從清單選一個原因；細節寫在右邊的「備註」欄')
+      .build()
+  );
   sh.getRange(AMEND_FIRST_ROW, 3, AMEND_MAX_ROWS, 1).setNumberFormat('0');
   sh.getRange(AMEND_FIRST_ROW, 5, AMEND_MAX_ROWS, 1).setNumberFormat('0');
   // 貨號欄一律文字格式：有些貨號是純數字，被當成數字會掉前導零、也會變科學記號
   sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 1).setNumberFormat('@');
   sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 1).setNumberFormat('@');
-  // 要填的兩欄給底色，一眼看得出哪裡是輸入區
-  sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 2).setBackground('#fff9e6');
+  // 要填的四欄給底色，一眼看得出哪裡是輸入區
+  sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 4).setBackground('#fff9e6');
 
   [140, 300, 70, 160, 80, 200, 220].forEach(function(w, i){ sh.setColumnWidth(i+1, w); });
   sh.setFrozenRows(5);
@@ -1839,14 +1927,15 @@ function applyAmendSheet_(sh, orderNo){
     return '❌ 這張訂單正在被「'+(row.claimedBy||'?')+'」掃描中。'
       + '現在改的話他手機上那份不會跟著變，掃到最後會對不起來——請先請他中止再改。';
   }
-  const grid = sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 6).getValues();
+  const grid = sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).getValues();
   const nameMap = skuNameMap_();
-  const ops = [], notes = [];
+  const ops = [], notes = [], missingReason = [];
   grid.forEach(function(r){
     const from = String(r[0]||'').trim();
     const toSku = String(r[3]||'').trim();
     const qtyRaw = String(r[4]===0 ? '0' : (r[4]||'')).trim();
     const reason = String(r[5]||'').trim();
+    const memo = String(r[6]||'').trim();
     if(!toSku && qtyRaw === '') return;            // 這一列沒動過
     const qty = qtyRaw === '' ? null : Number(qtyRaw);
     if(qtyRaw !== '' && (isNaN(qty) || qty < 0)){
@@ -1854,13 +1943,21 @@ function applyAmendSheet_(sh, orderNo){
       return;
     }
     if(!from && !toSku) return;
-    ops.push({sku: from, toSku: toSku, qty: qty, name: toSku ? (nameMap[toSku] || '') : ''});
-    notes.push(!from ? ('新增 '+toSku+' × '+(qty===null?1:qty))
+    if(!reason){ missingReason.push(from || toSku); return; }
+    // 這一句會原封不動寫進出貨紀錄的「差異明細」，所以要自己讀得懂、不依賴上下文。
+    const what = !from ? ('加出 '+toSku+' × '+(qty===null?1:qty))
       : qty === 0 ? ('不出 '+from)
-      : toSku ? (from+' → '+toSku+(qty===null?'':' × '+qty))
-      : (from+' 數量改為 '+qty)
-      + (reason ? '（'+reason+'）' : ''));
+      : toSku ? (from+' 改出 '+toSku+(qty===null?'':' × '+qty))
+      : (from+' 數量改為 '+qty);
+    const desc = what + '（' + reason + (memo ? '：'+memo : '') + '）';
+    ops.push({sku: from, toSku: toSku, qty: qty, name: toSku ? (nameMap[toSku] || '') : '',
+              reason: reason, memo: memo, desc: desc, at: nowStamp_()});
+    notes.push(desc);
   });
+  if(missingReason.length){
+    return '❌ 這幾列還沒選「原因」：' + missingReason.join('、')
+      + '。原因會寫進出貨紀錄的差異明細，沒有原因的修改事後查不出所以然，所以一律要選。';
+  }
   if(!ops.length) return '⚠️ 沒有填任何修改內容（改成貨號／改成數量兩欄都是空的）';
 
   // 工作區顯示的是「目前的品項」＝ 已經套過舊指令的結果，所以這次的指令要接在舊的後面，
@@ -2473,6 +2570,10 @@ function finalizeShipment(entry){
     if(row.status === 'shipped'){
       return {ok:false, reason:'already_shipped'};
     }
+    // 這張訂單如果在「訂單修改」分頁被人工調整過，把調整內容一起寫進出貨紀錄的差異明細。
+    // 不寫的話，事後看紀錄只會看到「完成 🟢、無差異」，完全看不出實際出的東西跟原訂單不一樣，
+    // 客訴回頭查的時候會查不到為什麼少一件。APP端不知道有這回事，所以只能在這裡補。
+    entry.amendSummary = amendSummary_(row.itemsOverrideJson);
     const now = new Date().toISOString();
     ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([[statusToText('shipped'), '', '', now]]);
   }
@@ -2594,6 +2695,9 @@ function appendLogRow(entry){
   // 掃到不屬於這張訂單的條碼時，後面接著寫清楚「後來到底有沒有拿對商品掃進去」，
   // 這樣事後看差異明細就能直接判斷這張訂單實際出的貨對不對，不用再自己去比對件數。
   if(orderLevelText && hasMismatch_(entry)) orderLevelText += buildMismatchResolution_(entry);
+  // 人工修改的說明擺在最前面：看差異明細的人要先知道「這張訂單本來就跟原始訂單不一樣」，
+  // 才不會把包貨人員掃出來的結果誤判成他掃錯。
+  if(entry.amendSummary) orderLevelText = [entry.amendSummary, orderLevelText].filter(Boolean).join('；');
   const rows = items.map((it, idx)=>{
     const rowObj = {
       orderNo: entry.orderNo, orderDate: String(entry.orderDate||''), waybill: entry.waybill||'',
