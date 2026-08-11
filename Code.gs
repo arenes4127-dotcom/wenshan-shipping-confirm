@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.38';
+const BACKEND_VERSION = '2026-08-10.39';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -905,7 +905,14 @@ function setupDashboardSheet_(){
     ['今日未進物流籃', '=MAX(0,$E$6-$E$10)'],
     // 換貨的單還沒真的結束——客服要到蝦皮把訂單內容補正，訂單/發票/庫存才會一致。
     // 這一格就是提醒「有幾張在等補正」，不為0代表有事情還沒收尾。
-    ['今日換貨待補正', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"換貨出貨*")`]
+    ['今日換貨待補正', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"換貨出貨*")`],
+    // 件數口徑（跟上面的「張數」不同，這裡算的是實際商品件數）：
+    // 應出＝來源裡屬於我們（文山＋調撥）的數量加總。來源的「日期」欄是 ARRAYFORMULA(TODAY())、
+    // 而且每晚重置，所以整份就是當日的量，不需要再篩日期。
+    // 未出＝應出−已出，用相減而不是另外數一次，這樣三個數字一定對得起來。
+    ['今日應出（件）',
+      `=SUMIFS(${M}!$I$2:$I,${M}!$S$2:$S,"文山")+SUMIFS(${M}!$I$2:$I,${M}!$S$2:$S,"調*")`],
+    ['今日未出（件）', '=MAX(0,$E$13-$E$8)']
   ];
   todayStats.forEach((r, i)=>{
     sh.getRange(5+i, 4).setValue(r[0]);
@@ -957,7 +964,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
-  sh.getRange('E5:E12').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('E5:E14').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
 
@@ -978,7 +985,12 @@ function setupDashboardSheet_(){
       .whenNumberGreaterThan(0).setBackground('#d9ead3').setRanges([sh.getRange('E10')]).build(),
     // 有換貨待補正就標橘，提醒客服要去處理
     SpreadsheetApp.newConditionalFormatRule()
-      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E12')]).build()
+      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E12')]).build(),
+    // 今日未出件數：還有東西沒出就標橘，全部出完轉綠
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E14')]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberEqualTo(0).setBackground('#d9ead3').setRanges([sh.getRange('E14')]).build()
   ]);
 
   Logger.log('「儀表板」分頁已建立（公式驅動，資料異動自動重算，不需要排程）。');
