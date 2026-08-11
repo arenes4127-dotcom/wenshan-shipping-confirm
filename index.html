@@ -982,7 +982,7 @@ function renderPickList(){
     (o.items||[]).forEach(it=>{
       rows.push({orderNo:o.orderNo, store:o.store||'', shipMethod:o.shipMethod||'',
         sku:it.sku, baseName:it.baseName||it.name||'', spec:it.spec||'', qty:it.qty||0,
-        location:it.location||'', stockWs:it.stockWs||'', picked:!!it.picked, pickedBy:it.pickedBy||''});
+        location:it.location||'', stockWs:it.stockWs||'', stockMain:it.stockMain||'', picked:!!it.picked, pickedBy:it.pickedBy||''});
     });
   });
   const total = rows.length, done = rows.filter(r=>r.picked).length;
@@ -1014,7 +1014,7 @@ function renderPickList(){
           </div>
           <div style="text-align:right;white-space:nowrap;">
             <div style="font-size:22px;font-weight:800;">×${r.qty}</div>
-            <div class="hint">文山 ${escapeHtml(String(r.stockWs||'-'))}</div>
+            <div class="hint">文山 ${escapeHtml(String(r.stockWs||'-'))}　總倉 ${escapeHtml(String(r.stockMain||'-'))}</div>
           </div>
         </div>
       </div>`;
