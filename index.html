@@ -1336,10 +1336,11 @@ inputOrder.addEventListener('keydown', async e=>{
   current = order;
   // scanned/noBarcodeCount/overScanCount/manualEditHistory 都是「這個品項自己」的紀錄，
   // 差異明細會依貨號分別組成，不會再把整張訂單所有品項的事件混在同一段文字裡。
-  current.items.forEach(i=>{ i.scanned=0; i.noBarcodeCount=0; i.overScanCount=0; i.manualEditHistory=[]; i.shortShip=false; i.shortShipQty=0; });
+  current.items.forEach(i=>{ i.scanned=0; i.noBarcodeCount=0; i.overScanCount=0; i.manualEditHistory=[]; i.shortShip=false; i.shortShipQty=0; i.substitutes=[]; });
   current.hadIssue = false;
   current.hadManualEdit = false;
-  current.hadNoBarcodeConfirm = false; // 這次出貨有沒有用過「找不到條碼，手動核對」
+  current.hadNoBarcodeConfirm = false;
+  current.hadSubstitute = false; // 這次出貨有沒有用過「找不到條碼，手動核對」
   current.issueLog = []; // 差異明細裡「跟特定品項無關」的訂單層級事件（目前只有：掃到不屬於這張訂單的條碼）
   document.getElementById('stage-order').style.display='none';
   document.getElementById('stage-items').style.display='block';
@@ -1517,7 +1518,13 @@ function renderItemTable(){
     total += i.qty; done += Math.min(i.scanned,i.qty);
     const tr = document.createElement('tr');
     let cls='pending', label='<span class="tag warn">待掃描</span>';
-    if(i.shortShip){ cls='ok'; label='<span class="tag warn">缺貨不出 '+(i.shortShipQty||0)+'</span>'; }
+    if(i.shortShip){
+      cls='ok';
+      label='<span class="tag warn">缺貨不出 '+(i.shortShipQty||0)+'</span>';
+      if(i.substitutes && i.substitutes.length){
+        label += '<br><span class="tag warn">改出 ' + i.substitutes.map(x=>x.sku+'×'+x.qty).join('、') + '</span>';
+      }
+    }
     else if(i.scanned>i.qty){ cls='over'; label='<span class="tag danger">超量</span>'; }
     else if(i.scanned===i.qty){ cls='ok'; label='<span class="tag ok">OK</span>'; }
     tr.className=cls;
@@ -1527,6 +1534,7 @@ function renderItemTable(){
       `<button class="btn gray sm" onclick="adjustScanned('${skuEsc}')">修改</button> `+
       `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button> `+
       `<button class="btn gray sm" onclick="confirmShortShip('${skuEsc}')">${i.shortShip?'取消缺貨':'缺貨不出'}</button>`+
+      (i.shortShip ? ` <button class="btn gray sm" onclick="confirmSubstitute('${skuEsc}')">換貨</button>` : '')+
       `</td>`;
     tbody.appendChild(tr);
   });
@@ -1557,6 +1565,10 @@ function confirmShortShip(sku){
   const item = current.items.find(i=>i.sku===sku);
   if(!item) return;
   if(item.shortShip){                      // 再按一次＝取消標記
+    if(item.substitutes && item.substitutes.length){
+      if(!confirm('這件已經登記了換貨，取消缺貨標記會一併清掉換貨紀錄，確定嗎？')) return;
+      item.substitutes = [];
+    }
     item.shortShip = false;
     item.shortShipQty = 0;
     renderItemTable();
@@ -1574,6 +1586,53 @@ function confirmShortShip(sku){
   item.shortShipQty = missing;
   okBeep();
   flash('ok','已標記缺貨不出', `${item.sku} 缺 ${missing} 件，可以繼續完成這張單`, 1600);
+  renderItemTable();
+  checkComplete();
+}
+
+// 顧客換貨：缺貨的商品經客服跟顧客談好改出別的商品。
+//
+// 這個功能刻意設了兩道限制，因為它動到的是核對機制本身：
+//   1. 一定要先標記「缺貨不出」才能用。不然任何人掃錯貨都可以按「換貨」讓「商品不符」消失，
+//      核對系統的擋錯能力就從內部被破掉了，而且事後查不出來。
+//   2. 替換的商品一定要掃條碼，不能用打字的。紀錄要能證明實際拿的是什麼。
+//
+// 定位是「現場回報實際出了什麼」，不是「修改訂單」——訂單內容的權威在蝦皮/ERP，
+// 我們改了那邊也不會跟著動。所以核對基準（需求件數）維持原訂單不變，
+// 核對結果標成「換貨出貨（待客服補正）」橘燈而不是綠燈完成，提醒這張還沒真的結束。
+function confirmSubstitute(sku){
+  if(!current) return;
+  const item = current.items.find(i=>i.sku===sku);
+  if(!item) return;
+  if(!item.shortShip){
+    errorBeep();
+    flash('err','要先標記缺貨', '換貨只能用在已標記「缺貨不出」的品項上，避免被拿來掩蓋掃錯貨', 2400);
+    return;
+  }
+  const code = prompt(`「${item.baseName||item.name}」缺 ${item.shortShipQty||0} 件\n請掃描要改出的替換商品條碼：`);
+  if(code === null) return;
+  const raw = String(code).trim();
+  if(!raw) return;
+  // 跟掃描出貨同一套解析：先當品號，比對不到再查條碼對照表
+  const subSku = barcodeMap[raw] || raw;
+  if(subSku === item.sku){
+    errorBeep();
+    flash('err','替換商品不能跟原商品相同', '', 1800);
+    return;
+  }
+  const qtyStr = prompt(`替換商品 ${subSku}\n改出幾件？`, String(item.shortShipQty||1));
+  if(qtyStr === null) return;
+  const qty = parseInt(qtyStr, 10);
+  if(isNaN(qty) || qty <= 0){
+    errorBeep();
+    flash('err','數量不正確', '', 1400);
+    return;
+  }
+  item.substitutes = item.substitutes || [];
+  item.substitutes.push({sku: subSku, qty: qty});
+  current.hadSubstitute = true;
+  okBeep();
+  flash('ok','已記錄換貨', `${item.sku} 缺 ${item.shortShipQty||0} 件 → 改出 ${subSku} ${qty} 件　（客服需到蝦皮補正）`, 2600);
   renderItemTable();
   checkComplete();
 }
@@ -1624,6 +1683,9 @@ function buildItemDifferenceDetails(item){
   if(item.manualEditHistory && item.manualEditHistory.length) methods.push(`人工修正數量（${item.manualEditHistory.join('、')}）`);
   if(item.noBarcodeCount) methods.push(`無條碼手動核對${item.noBarcodeCount}件`);
   if(item.shortShip) methods.push(`缺貨未出${item.shortShipQty||0}件`);
+  if(item.substitutes && item.substitutes.length){
+    methods.push('改出 ' + item.substitutes.map(x=>`${x.sku}×${x.qty}`).join('、'));
+  }
   if(!methods.length) return '';
   return `${item.sku}／${item.spec||'-'}／${methods.join('、')}`;
 }
@@ -1669,7 +1731,7 @@ async function finalizeShipment(){
     orderNo: current.orderNo,
     orderDate: current.date || '',
     waybill: waybill,
-    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned,noBarcodeCount:i.noBarcodeCount||0,shortShipQty:i.shortShip?(i.shortShipQty||0):0,itemDifferenceDetails:buildItemDifferenceDetails(i)})),
+    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned,noBarcodeCount:i.noBarcodeCount||0,shortShipQty:i.shortShip?(i.shortShipQty||0):0,substitutes:(i.substitutes||[]),itemDifferenceDetails:buildItemDifferenceDetails(i)})),
     staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
     time: new Date().toLocaleString('zh-TW'),
     startTime: current.claimedAt ? new Date(current.claimedAt).toLocaleString('zh-TW') : '',
