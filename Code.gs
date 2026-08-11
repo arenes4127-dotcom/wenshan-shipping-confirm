@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.42';
+const BACKEND_VERSION = '2026-08-10.43';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -147,6 +147,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   syncNativeOrderSheet_: () => syncNativeOrderSheet_(),
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
   syncSpecialNotes_: () => syncSpecialNotes_(),
+  batchCloseOtherWarehouseOrders_: () => batchCloseOtherWarehouseOrders_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
   inspectSheetFormulas_: (arg) => inspectSheetFormulas_(arg),
@@ -1348,6 +1349,52 @@ function syncSpecialNotes_(){
   });
   Logger.log('特殊註記同步：來源'+sourceCount+'筆，更新'+updated+'張訂單。');
   return {ok:true, 來源筆數:sourceCount, 已更新:updated};
+}
+
+// ---------------- 一次性處理：把積在待出貨清單裡的山物出／中華宅配訂單批次結案 ----------------
+// 背景：訂單狀態篩選（文山＋調撥）是後來才加的，篩選只擋新進來的，不會回頭清舊的。
+// 所以在那之前匯入的山物出／中華宅配訂單一直留在待出貨清單裡——那些貨不在文山，
+// 揀貨員看得到卻永遠找不到，而且會一直累積。
+//
+// 這個動作等於代替人宣告「這些都已經由對方出掉了」，本身沒有辦法驗證，
+// 所以每一筆都寫進「系統紀錄」：之後如果發現哪一張其實沒出，查得到是這次批次標記的、什麼時候做的。
+// 只動 山物出／中華宅配 且尚未結案的，文山跟調撥的訂單完全不碰。
+function batchCloseOtherWarehouseOrders_(){
+  const targetStatus = {'山物出':1, '中華宅配':1};
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const col = colOf(ORDERS_HEADER, 'manualClose');
+  const hits = rows.filter(function(r){
+    const st = String(r.routingStatus||'').trim();
+    return targetStatus[st] && !String(r.manualClose||'').trim();
+  });
+  if(!hits.length) return {已結案:0, 說明:'沒有符合條件的訂單'};
+
+  hits.forEach(function(r){ sh.getRange(r._row, col).setValue('出貨完成'); });
+
+  // 整批寫一次系統紀錄，不要每筆各寫一次（38筆各來回一次會很慢）
+  const logSh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
+  const start = logSh.getLastRow() + 1;
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const now = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd HH:mm:ss');
+  logSh.getRange(start, colOf(SYSLOG_HEADER,'logTime'), hits.length, 1).setNumberFormat('@');
+  const logRows = hits.map(function(r){
+    const o = {
+      logTime: now, event: '批次人工結案', orderNo: r.orderNo, claimedBy: '',
+      detail: '出貨地「' + String(r.routingStatus||'') + '」的訂單積在待出貨清單裡，'
+        + '批次標記為「出貨完成」以清出清單。此標記未經逐筆確認，如發現實際未出貨請以此紀錄回溯。'
+    };
+    return SYSLOG_HEADER.map(function(h){ return o[h]; });
+  });
+  logSh.getRange(start, 1, logRows.length, SYSLOG_HEADER.length).setValues(logRows);
+
+  const byStatus = {};
+  hits.forEach(function(r){
+    const st = String(r.routingStatus||'').trim();
+    byStatus[st] = (byStatus[st]||0) + 1;
+  });
+  Logger.log('批次結案 ' + hits.length + ' 張：' + JSON.stringify(byStatus));
+  return {已結案: hits.length, 依出貨地: byStatus, 訂單號: hits.map(function(r){ return r.orderNo; })};
 }
 
 // ---------------- 揀貨路線：把儲位換算成「走動順序」 ----------------
