@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.46';
+const BACKEND_VERSION = '2026-08-10.49';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -808,6 +808,7 @@ function setupDashboardSheet_(){
 
   const O = "'訂單'";   // 來源分頁名稱有中文，公式裡要加單引號
   const G = "'出貨紀錄'";
+  const M = "'文山出貨V2'"; // 來源鏡像：算「今天該出多少」要用它（我們的訂單分頁是累計的，不是當日）
 
   // ---- 標題 ----
   sh.getRange('A1').setValue('文山出貨　即時儀表板');
@@ -852,12 +853,35 @@ function setupDashboardSheet_(){
     ['── 累計（未歸檔）──', ''],
     ['已出貨', `=COUNTIFS(${O}!$G$2:$G,"已出貨*",${O}!$M$2:$M,"")`],
     ['人工結案', `=COUNTA(${O}!$M$2:$M)`],
-    ['訂單總數', `=COUNTA(${O}!$A$2:$A)`]
+    ['訂單總數', `=COUNTA(${O}!$A$2:$A)`],
+    // 累計數字要能自己說明「累計了多久」，不然看到566只會覺得「很多」，
+    // 不知道那是三天還是三個月的量，也不知道什麼時候會降下來。
+    // 訂單日期存的是「2026/8/5」這種純文字（欄位刻意設成文字格式避免被轉成日期型別），
+    // 所以要先 DATEVALUE 轉回日期才能取最小／最大值。
+    ['訂單日期範圍',
+      `=IFERROR(TEXT(MIN(ARRAYFORMULA(IFERROR(DATEVALUE(${O}!$C$2:$C)))),"M/d")&" ~ "&`
+      + `TEXT(MAX(ARRAYFORMULA(IFERROR(DATEVALUE(${O}!$C$2:$C)))),"M/d"),"-")`],
+    // 只算「已出貨滿7天」這一個條件。實際歸檔還要求「來源已無此單」，那要比對鏡像、
+    // 公式算起來慢又容易跟真正的歸檔邏輯對不起來，所以這裡只講得出口的那一半，
+    // 完整規則寫在下面那行說明，不要讓人以為這個數字就是下次會被移走的量。
+    ['已出貨滿7天',
+      `=SUMPRODUCT((LEFT(${O}!$G$2:$G,3)="已出貨")*(IFERROR(INT(DATEVALUE(LEFT(${O}!$J$2:$J,10))`
+      + `+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)<=TODAY()-7,0)))`]
   ];
   orderStats.forEach((r, i)=>{
     sh.getRange(5+i, 1).setValue(r[0]);
     sh.getRange(5+i, 2).setFormula(r[1]);
   });
+
+  // 歸檔規則寫在數字旁邊，不要只留在程式碼註解裡——
+  // 看儀表板的人才是需要知道「這些數字什麼時候會降下來」的人。
+  // 列號用 orderStats 的長度算出來，不要寫死：先前寫死 A16，後來概況區多了兩列，
+  // 這行就蓋掉了「訂單日期範圍」那一格，而且畫面上看起來只是少一列，很難察覺。
+  const ruleRow = 5 + orderStats.length;
+  sh.getRange(ruleRow, 1, 1, 2).merge();
+  sh.getRange(ruleRow, 1).setValue('歸檔規則：每天 19:30；已出貨滿 7 天且來源已無此單才移出')
+    .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
+  sh.setRowHeight(ruleRow, 34);
 
   // ---- 2. 出貨品質（J4:K9）----
   // 都加上「R欄有值」的條件，才是以「訂單張數」為單位，不是品項列數
@@ -928,36 +952,36 @@ function setupDashboardSheet_(){
   });
 
   // ---- 4. 目前掃描中（A13 起，往下長）----
-  sectionTitle('A18:E18', '🟠 目前掃描中（誰正在處理哪張）');
-  sh.getRange('A19:E19').setValues([['訂單號','賣場','認領人','認領時間','已經過(小時)']])
+  sectionTitle('A20:E20', '🟠 目前掃描中（誰正在處理哪張）');
+  sh.getRange('A21:E21').setValues([['訂單號','賣場','認領人','認領時間','已經過(小時)']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('A20').setFormula(
+  sh.getRange('A22').setFormula(
     `=IFERROR(FILTER({${O}!$A$2:$A,${O}!$B$2:$B,${O}!$H$2:$H,${O}!$I$2:$I},LEFT(${O}!$G$2:$G,3)="掃描中"),"目前沒有人在掃描")`
   );
   // 認領時間存的是 ISO 字串（2026-08-07T04:58:45.545Z），拆出日期跟時間再組回來，
   // 加 8/24 換成台灣時間，跟 NOW() 相減得到已經過幾小時。格式不合就顯示空白不要噴錯。
-  sh.getRange('E20').setFormula(
-    '=ARRAYFORMULA(IF(D20:D35="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D20:D35,10))+TIMEVALUE(MID(D20:D35,12,8))+8/24))*24,1),"")))'
+  sh.getRange('E22').setFormula(
+    '=ARRAYFORMULA(IF(D22:D37="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D22:D37,10))+TIMEVALUE(MID(D22:D37,12,8))+8/24))*24,1),"")))'
   );
 
   // ---- 5. 今日包貨人員（G13 起，往下長）----
-  sectionTitle('G18:H18', '👤 本日包貨人員出貨張數');
-  sh.getRange('G19:H19').setValues([['包貨人員','出貨張數']])
+  sectionTitle('G20:H20', '👤 本日包貨人員出貨張數');
+  sh.getRange('G21:H21').setValues([['包貨人員','出貨張數']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('G20').setFormula(
+  sh.getRange('G22').setFormula(
     `=IFERROR(UNIQUE(FILTER(${G}!$L$2:$L,${G}!$R$2:$R>0)),"（尚無出貨）")`
   );
-  sh.getRange('H20').setFormula(
-    `=ARRAYFORMULA(IF(G20:G35="","",COUNTIFS(${G}!$L$2:$L,G20:G35,${G}!$R$2:$R,">0")))`
+  sh.getRange('H22').setFormula(
+    `=ARRAYFORMULA(IF(G22:G37="","",COUNTIFS(${G}!$L$2:$L,G22:G37,${G}!$R$2:$R,">0")))`
   );
 
   // ---- 6. 需要注意的出貨紀錄（J13 起，往下長）----
   // 直接用核對結果裡的燈號來篩：紅燈(錯誤)或橘燈(有人工介入)的才列出來，
   // 不用再自己組一堆條件，燈號本身就是既有的分類結果。
-  sectionTitle('J18:N18', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
-  sh.getRange('J19:M19').setValues([['訂單號','包貨人員','核對結果','差異明細']])
+  sectionTitle('J20:N20', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
+  sh.getRange('J21:M21').setValues([['訂單號','包貨人員','核對結果','差異明細']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('J20').setFormula(
+  sh.getRange('J22').setFormula(
     `=IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
     + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄")`
   );
@@ -971,7 +995,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(9, 24);
   sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
-  sh.getRange('B5:B15').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('B5:B13').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
