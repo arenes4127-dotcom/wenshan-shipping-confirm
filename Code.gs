@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.41';
+const BACKEND_VERSION = '2026-08-10.42';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -832,13 +832,15 @@ function setupDashboardSheet_(){
     ['── 依出貨地 ──', ''],
     ['文山可出', uniqOrders(`${M}!$S$2:$S="文山"`)],
     ['需調撥（待調入）', uniqOrders(`LEFT(${M}!$S$2:$S,1)="調"`)],
-    // 山物／中華是手動核單，我們這邊沒有可靠的「已核」訊號可以用：
-    // 「包貨時間」來自統計V2，那是文山自己的過刷台——實測文山有67%的訂單過刷，
-    // 但山物出／調中華／調OM 全部是 0%，因為它們的貨根本不經過文山的物流籃。
-    // 拿它來當未核依據的話，未核數會永遠等於總數，看起來像有在追蹤、實際上什麼也沒測到。
-    // 這種數字比沒有更糟，所以先只顯示張數；等確認手動核單實際記在哪，再把未核加回來。
-    ['山物出貨', uniqOrders(`${M}!$S$2:$S="山物出"`)],
-    ['中華出貨', uniqOrders(`${M}!$S$2:$S="中華宅配"`)]
+    // 山物／中華是手動核單，機制就是「人工結案」欄——所以這兩組要從我們自己的訂單分頁算，
+    // 不能從鏡像算：結案標記記在我們這裡，鏡像沒有這個資訊。
+    // 「未核」＝ 還沒有人去把它結案的，那就是實際待處理的張數。
+    // （先前用鏡像的「包貨時間」當已核依據是錯的：那是文山過刷台的紀錄，
+    //   山物／中華的貨不經過那裡，實測命中率 0%，未核數會永遠等於總數。）
+    ['山物出貨', `=COUNTIFS(${O}!$L$2:$L,"山物出")`],
+    ['　└ 未核', `=COUNTIFS(${O}!$L$2:$L,"山物出",${O}!$M$2:$M,"")`],
+    ['中華出貨', `=COUNTIFS(${O}!$L$2:$L,"中華宅配")`],
+    ['　└ 未核', `=COUNTIFS(${O}!$L$2:$L,"中華宅配",${O}!$M$2:$M,"")`]
   ];
   orderStats.forEach((r, i)=>{
     sh.getRange(5+i, 1).setValue(r[0]);
@@ -962,7 +964,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(9, 24);
   sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
-  sh.getRange('B5:B14').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('B5:B16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E14').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
