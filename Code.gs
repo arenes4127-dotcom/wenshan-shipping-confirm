@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.66';
+const BACKEND_VERSION = '2026-08-11.68';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -899,6 +899,9 @@ function setupDashboardSheet_(){
   // 列號用 orderStats 的長度算出來，不要寫死：先前寫死 A16，後來概況區多了兩列，
   // 這行就蓋掉了「訂單日期範圍」那一格，而且畫面上看起來只是少一列，很難察覺。
   const ruleRow = 5 + orderStats.length;
+  // 明確擋一次：說明列一旦長到下半部的起始列（24），就會把區塊標題整個蓋掉，
+  // 而且不會有任何錯誤訊息。寧可在這裡直接失敗，也不要產出一張看起來正常的壞儀表板。
+  if(ruleRow >= 24) throw new Error('概況區項目太多（'+orderStats.length+'項），說明列會蓋到第24列的下半部區塊，請先把下半部往下移');
   sh.getRange(ruleRow, 1, 1, 2).merge();
   sh.getRange(ruleRow, 1).setValue([
       '⚠ 上半部（待出貨／掃描中／待人工結案）是「現在」的待處理量，含前幾天累積下來的，不是今天的量。',
@@ -1071,52 +1074,58 @@ function setupDashboardSheet_(){
   sh.setRowHeight(todayNoteRow, 46);
 
   // ---- 4. 目前掃描中（A13 起，往下長）----
-  sectionTitle('A20:E20', '🟠 目前掃描中（誰正在處理哪張）');
-  sh.getRange('A21:E21').setValues([['訂單號','賣場','認領人','認領時間','已經過(分鐘)']])
+  // 下半部從第24列開始，不是緊貼著上面。上面的概況區是會長的（每加一個指標就多一列，
+  // 說明文字又跟在最後一列的下一列），先前就發生過說明文字長到蓋掉別的內容。
+  // 留4列緩衝，概況區還能再加4個指標都不會撞到這裡。
+  sectionTitle('A24:E24', '🟠 目前掃描中（誰正在處理哪張）');
+  sh.getRange('A25:E25').setValues([['訂單號','賣場','認領人','認領時間','已經過(分鐘)']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('A22').setFormula(
+  sh.getRange('A26').setFormula(
     `=IFERROR(FILTER({${O}!$A$2:$A,${O}!$B$2:$B,${O}!$H$2:$H,${O}!$I$2:$I},LEFT(${O}!$G$2:$G,3)="掃描中"),"目前沒有人在掃描")`
   );
   // 認領時間存的是 ISO 字串（2026-08-07T04:58:45.545Z），拆出日期跟時間再組回來，
   // 加 8/24 換成台灣時間，跟 NOW() 相減得到已經過幾分鐘。格式不合就顯示空白不要噴錯。
   // 用分鐘不用小時：時限是30分鐘，顯示「0.3小時」看不出離逾時還有多久。
-  sh.getRange('E22').setFormula(
-    '=ARRAYFORMULA(IF(D22:D37="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D22:D37,10))+TIMEVALUE(MID(D22:D37,12,8))+8/24))*1440,0),"")))'
+  sh.getRange('E26').setFormula(
+    '=ARRAYFORMULA(IF(D26:D41="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D26:D41,10))+TIMEVALUE(MID(D26:D41,12,8))+8/24))*1440,0),"")))'
   );
 
   // ---- 5. 今日包貨人員（G13 起，往下長）----
-  sectionTitle('G20:H20', '👤 本日包貨人員出貨張數');
-  sh.getRange('G21:H21').setValues([['包貨人員','出貨張數']])
+  sectionTitle('G24:H24', '👤 本日包貨人員出貨張數');
+  sh.getRange('G25:H25').setValues([['包貨人員','出貨張數']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('G22').setFormula(
+  sh.getRange('G26').setFormula(
     `=IFERROR(UNIQUE(FILTER(${G}!$L$2:$L,${G}!$R$2:$R>0)),"（尚無出貨）")`
   );
-  sh.getRange('H22').setFormula(
-    `=ARRAYFORMULA(IF(G22:G37="","",COUNTIFS(${G}!$L$2:$L,G22:G37,${G}!$R$2:$R,">0")))`
+  // 這裡的 G26:G41 一定要跟上面 G26 的清單起點對齊。先前把整個下半部往下移4列時
+  // 漏改這一行（還停在 G22:G37），結果姓名在26列起、張數卻從28列起，
+  // 每個人被配到別人的數字——而且看起來完全正常，不會有任何錯誤訊息。
+  sh.getRange('H26').setFormula(
+    `=ARRAYFORMULA(IF(G26:G41="","",COUNTIFS(${G}!$L$2:$L,G26:G41,${G}!$R$2:$R,">0")))`
   );
 
   // ---- 6. 需要注意的出貨紀錄（J13 起，往下長）----
   // 直接用核對結果裡的燈號來篩：紅燈(錯誤)或橘燈(有人工介入)的才列出來，
   // 不用再自己組一堆條件，燈號本身就是既有的分類結果。
-  sectionTitle('J20:O20', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
-  sh.getRange('J21:M21').setValues([['訂單號','包貨人員','核對結果','差異明細']])
+  sectionTitle('J24:O24', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
+  sh.getRange('J25:M25').setValues([['訂單號','包貨人員','核對結果','差異明細']])
     .setFontWeight('bold').setBackground('#f3f3f3');
   // 限制最多15列（第22~36列）。這一區的FILTER本來是無上限往下長的，
-  // 下面第40列還有另一個區塊，出貨異常多的那天會直接被它蓋掉。
-  sh.getRange('J22').setFormula(
+  // 下面第44列還有另一個區塊，出貨異常多的那天會直接被它蓋掉。
+  sh.getRange('J26').setFormula(
     `=ARRAY_CONSTRAIN(IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
     + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄"),15,4)`
   );
-  sh.getRange('J37').setValue('（超過15筆時只顯示前15筆，完整內容請看「出貨紀錄」分頁）')
+  sh.getRange('J41').setValue('（超過15筆時只顯示前15筆，完整內容請看「出貨紀錄」分頁）')
     .setFontSize(9).setFontColor('#999999');
 
   // ---- 6. 本日訂單修改（J40 起）----
   // 人工改過的訂單要能一眼看到是誰、改了什麼、為什麼——這是所有「出貨內容跟原訂單不一樣」
   // 的源頭，客訴回頭查的第一站。資料直接讀系統紀錄，不另外存一份，避免兩邊對不起來。
-  sectionTitle('J40:O40', '✏️ 本日訂單修改（缺貨／改單／盤差）');
-  sh.getRange('J41:L41').setValues([['時間','訂單號','修改內容（含原因）']])
+  sectionTitle('J44:O44', '✏️ 本日訂單修改（缺貨／改單／盤差）');
+  sh.getRange('J45:L45').setValues([['時間','訂單號','修改內容（含原因）']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('J42').setFormula(
+  sh.getRange('J46').setFormula(
     `=ARRAY_CONSTRAIN(IFERROR(CHOOSECOLS(FILTER(${SY}!$A$2:$E,${SY}!$B$2:$B="訂單品項人工修改",`
     + `LEFT(${SY}!$A$2:$A,10)=TEXT(TODAY(),"yyyy/MM/dd")),1,3,5),"（今日尚無訂單修改）"),20,3)`
   );
@@ -1170,7 +1179,7 @@ function setupDashboardSheet_(){
 function debugReadDashboard_(){
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_DASHBOARD);
   if(!sh) return {error:'找不到儀表板分頁'};
-  const values = sh.getRange(1, 1, 45, 16).getDisplayValues();
+  const values = sh.getRange(1, 1, 50, 16).getDisplayValues();
   const out = [];
   values.forEach((row, i)=>{
     const cells = [];
