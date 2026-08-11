@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.44';
+const BACKEND_VERSION = '2026-08-10.46';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -148,6 +148,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
   syncSpecialNotes_: () => syncSpecialNotes_(),
   batchCloseOtherWarehouseOrders_: () => batchCloseOtherWarehouseOrders_(),
+  dailyMaintenance_: () => dailyMaintenance_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
   inspectSheetFormulas_: (arg) => inspectSheetFormulas_(arg),
@@ -560,6 +561,21 @@ function backupAndClearShippingLog_(){
   Logger.log('已備份 '+(allValues.length-1)+' 列出貨紀錄到「'+fileName+'」，並清空出貨紀錄分頁準備明天使用。');
 }
 
+// ---------------- 每天的收尾維護 ----------------
+// 訂單狀態會變：今天匯入時是「文山」的單，之後可能被改成山物出／中華宅配。
+// 篩選只擋新進來的，已經在我們系統裡的不會被擋掉，所以那些單會一直留在待出貨清單，
+// 而那些貨根本不在文山，揀貨員看得到卻永遠找不到。之前就這樣累積了38張、最久的卡了三天。
+//
+// 所以每天收尾時自動結案一次。刻意排在晚上而不是每次同步就做：
+// 訂單狀態白天可能來回變動，給它一整天的時間穩定下來再處理，不要一變就立刻結案。
+// 每一筆都會寫進系統紀錄，可以回溯。
+function dailyMaintenance_(){
+  const closed = batchCloseOtherWarehouseOrders_();
+  const archived = archiveShippedOrders_();
+  Logger.log('每日維護完成：' + JSON.stringify({自動結案: closed, 歸檔: archived}));
+  return {自動結案: closed, 歸檔: archived};
+}
+
 // ---------------- 一次性設定用：在「訂單」分頁的「人工結案」欄裝下拉選單 ----------------
 // 不是由文山實際掃描出貨的訂單（別的門市/倉庫已經出掉、缺貨取消、整張訂單取消），
 // 主管直接在試算表這一欄用下拉選單挑一個原因，APP的待出貨清單就不會再顯示這張訂單，
@@ -815,33 +831,28 @@ function setupDashboardSheet_(){
   // ---- 1. 訂單即時概況（A4:B9）----
   // 四個狀態刻意做成「互斥」的（已出貨也要排除掉人工結案的，不然一張訂單會被算兩次），
   // 這樣四個數字加起來剛好等於訂單總數，看到不一致就知道是資料有問題，而不是統計方式的錯。
-  sectionTitle('A4:B4', '📦 訂單即時概況');
-  // 下半段是「依出貨地」的拆解，資料來自鏡像分頁而不是我們的訂單分頁——
-  // 因為我們只匯入文山＋調撥的訂單，山物出／中華宅配那些根本不在我們的訂單分頁裡，
-  // 要看它們的張數只能回頭數來源。鏡像欄位：E訂單 R包貨時間 S訂單狀態。
-  const M = "'文山出貨V2'";
-  // 先用 SUMPRODUCT 數「有幾列符合」，是0才直接回0。
-  // 不能只靠 IFERROR 包 FILTER——實測完全沒有符合列時它不會乖乖給0（中華宅配那格因此浮出一個假的1），
-  // 而這種假數字在儀表板上最難發現：看起來很合理，只是剛好是錯的。
-  const uniqOrders = cond => `=IF(SUMPRODUCT(--(${cond}))=0,0,COUNTA(UNIQUE(FILTER(${M}!$E$2:$E,${cond}))))`;
+  // 這一區只講「現在」——待處理的工作，以及它們卡在誰身上。
+  // 累計數字（已出貨／人工結案／訂單總數）另外分一段並標明，不要跟現況混在一起：
+  // 它們是「訂單分頁裡累積了多少列」，會一直長到歸檔才減少，跟現場狀況無關。
+  // 早先這裡把「今天的」（來自鏡像的文山可出／需調撥）跟「累計的」（山物出貨）並排，
+  // 看起來可以互相比較，實際上時間範圍不同，是錯的。現在全部改用同一個來源、同一個時間範圍。
+  sectionTitle('A4:B4', '📦 訂單即時概況（現在）');
+  const pendingBy = cond => `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,""${cond})`;
   const orderStats = [
-    ['待出貨', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")`],
+    ['待出貨', pendingBy('')],
+    ['　└ 文山', pendingBy(`,${O}!$L$2:$L,"文山"`)],
+    ['　└ 調撥（待調入）', pendingBy(`,${O}!$L$2:$L,"調*"`)],
+    ['　└ 缺貨', pendingBy(`,${O}!$L$2:$L,"缺貨"`)],
+    // 用相減補齊，確保三個細項加起來一定等於待出貨總數。
+    // 細項湊不齊總數（實測差過1張，是訂單狀態空白的）會讓人整個不信任這張表，
+    // 而且那一張反而是最該被看到的——狀態空白代表來源資料有問題。
+    ['　└ 其他', '=MAX(0,$B$5-$B$6-$B$7-$B$8)'],
     ['掃描中', `=COUNTIFS(${O}!$G$2:$G,"掃描中*",${O}!$M$2:$M,"")`],
+    ['待人工結案', `=COUNTIFS(${O}!$L$2:$L,"山物出",${O}!$M$2:$M,"")+COUNTIFS(${O}!$L$2:$L,"中華宅配",${O}!$M$2:$M,"")`],
+    ['── 累計（未歸檔）──', ''],
     ['已出貨', `=COUNTIFS(${O}!$G$2:$G,"已出貨*",${O}!$M$2:$M,"")`],
     ['人工結案', `=COUNTA(${O}!$M$2:$M)`],
-    ['訂單總數', `=COUNTA(${O}!$A$2:$A)`],
-    ['── 依出貨地 ──', ''],
-    ['文山可出', uniqOrders(`${M}!$S$2:$S="文山"`)],
-    ['需調撥（待調入）', uniqOrders(`LEFT(${M}!$S$2:$S,1)="調"`)],
-    // 山物／中華是手動核單，機制就是「人工結案」欄——所以這兩組要從我們自己的訂單分頁算，
-    // 不能從鏡像算：結案標記記在我們這裡，鏡像沒有這個資訊。
-    // 「未核」＝ 還沒有人去把它結案的，那就是實際待處理的張數。
-    // （先前用鏡像的「包貨時間」當已核依據是錯的：那是文山過刷台的紀錄，
-    //   山物／中華的貨不經過那裡，實測命中率 0%，未核數會永遠等於總數。）
-    ['山物出貨', `=COUNTIFS(${O}!$L$2:$L,"山物出")`],
-    ['　└ 未核', `=COUNTIFS(${O}!$L$2:$L,"山物出",${O}!$M$2:$M,"")`],
-    ['中華出貨', `=COUNTIFS(${O}!$L$2:$L,"中華宅配")`],
-    ['　└ 未核', `=COUNTIFS(${O}!$L$2:$L,"中華宅配",${O}!$M$2:$M,"")`]
+    ['訂單總數', `=COUNTA(${O}!$A$2:$A)`]
   ];
   orderStats.forEach((r, i)=>{
     sh.getRange(5+i, 1).setValue(r[0]);
@@ -897,7 +908,11 @@ function setupDashboardSheet_(){
       + `+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0)))`],
     ['今日未進物流籃', '=MAX(0,$E$6-$E$9)'],
     ['今日換貨待補正', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"換貨出貨*")`],
-    ['今日應出（單）', '=$B$11+$B$12'],
+    // 今天該由我們出的訂單數：從鏡像算（來源每晚重置，整份就是當日的量）。
+    // 不能再引用上面概況區的格子——那一區已經改成「現在的待處理」，不是「今天應出」。
+    ['今日應出（單）',
+      `=IF(SUMPRODUCT(--((${M}!$S$2:$S="文山")+(LEFT(${M}!$S$2:$S,1)="調")))=0,0,`
+      + `COUNTA(UNIQUE(FILTER(${M}!$E$2:$E,(${M}!$S$2:$S="文山")+(LEFT(${M}!$S$2:$S,1)="調")))))`],
     // 未出再依出貨地拆開，看得出「還沒出的那些卡在誰身上」：
     //   文山／調撥 是我們自己要處理的（調撥要等貨調進來才出得掉）；
     //   山物／中華不是我們出的，它們的「未出」＝ 還沒有人去人工結案確認對方出了沒。
@@ -956,7 +971,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(9, 24);
   sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
-  sh.getRange('B5:B16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('B5:B15').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
@@ -1124,7 +1139,7 @@ function syncNativeOrderSheet_(){
 // 都不會有副作用（只是把「訂單」分頁同步到源頭當下最新的樣子），不影響最終結果只是可能差幾分鐘。
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
-    'syncNativeOrderSheet_', 'hourlySync_'];
+    'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -1139,13 +1154,13 @@ function installAutomationTriggers_(){
   // 來判斷「這張訂單是不是已經從來源消失了」，如果撞在一起跑，鏡像可能已經被清空，
   // 歸檔函式的安全檢查（來源沒有資料列就整個略過）就會被觸發，導致歸檔永遠不會真的執行。
   // 排在來源被清空之前，來源資料還在，判斷才有意義。
-  ScriptApp.newTrigger('archiveShippedOrders_').timeBased().atHour(19).nearMinute(30).everyDays(1).create();
+  ScriptApp.newTrigger('dailyMaintenance_').timeBased().atHour(19).nearMinute(30).everyDays(1).create();
   // 舊核對表單每小時同步一次。刻意不掛在「完成出貨」的流程裡：開啟外部試算表寫入要1~2秒，
   // 掛上去會直接拖慢人員每掃完一張訂單的反應時間，那是現場最在意的速度。
   ScriptApp.newTrigger('hourlySync_').timeBased().everyHours(1).create();
 
   Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)'
-    +' + 已出貨訂單歸檔(19:30) + 舊核對表單與物流確認同步(每小時)，共'
+    +' + 每日維護：自動結案＋歸檔(19:30) + 舊核對表單與物流確認同步(每小時)，共'
     +ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
