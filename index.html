@@ -105,6 +105,9 @@
   .stat-tile{background:var(--panel2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;}
   .stat-tile .num{font-size:28px;font-weight:800;line-height:1.1;}
   .stat-tile .lbl{font-size:12px;color:var(--muted);margin-top:4px;}
+  /* 備註：這個數字算的是哪個時間範圍。含前期累積的一定要標，不然會被當成當日數字看。 */
+  .stat-tile .note{font-size:11px;color:var(--muted2);margin-top:3px;line-height:1.35;}
+  .stat-tile .note.warn{color:#d98324;}
 
   /* ---- progress ---- */
   .progress-num{font-size:40px;font-weight:800;}
@@ -151,12 +154,36 @@
     <section id="view-home" class="view active">
       <div class="section-label">今日概況</div>
       <div class="stat-grid">
-        <div class="stat-tile"><div class="num" id="statPending">0</div><div class="lbl">待出貨訂單</div></div>
-        <div class="stat-tile"><div class="num" id="statBacklog">0</div><div class="lbl">上期未出貨</div></div>
-        <div class="stat-tile"><div class="num" id="statNewToday">0</div><div class="lbl">今日新增訂單</div></div>
-        <div class="stat-tile"><div class="num" id="statShippedToday">0</div><div class="lbl">今日已出貨</div></div>
-        <div class="stat-tile"><div class="num" id="statIssue">0</div><div class="lbl">曾觸發警示</div></div>
+        <div class="stat-tile"><div class="num" id="statPending">0</div><div class="lbl">待出貨訂單</div>
+          <div class="note warn">含前期未出，非只有今日</div></div>
+        <div class="stat-tile"><div class="num" id="statBacklog">0</div><div class="lbl">上期未出貨</div>
+          <div class="note">今日以前，已含在待出貨</div></div>
+        <div class="stat-tile"><div class="num" id="statNewToday">0</div><div class="lbl">今日新增訂單</div>
+          <div class="note">僅今日，含已出掉的</div></div>
+        <div class="stat-tile"><div class="num" id="statShippedToday">0</div><div class="lbl">今日已出貨</div>
+          <div class="note">僅今日</div></div>
+        <div class="stat-tile"><div class="num" id="statIssue">0</div><div class="lbl">曾觸發警示</div>
+          <div class="note">僅今日（紀錄每晚清空）</div></div>
         <div class="stat-tile"><div class="num" id="statLastSync">-</div><div class="lbl">最後同步</div></div>
+      </div>
+
+      <!-- 待出貨的組成：卡在哪裡比總數更能決定現在要做什麼。
+           前三格是我們自己的貨（本機訂單資料算得出來），後兩格不是我們出的，
+           本系統不匯入那些訂單，數字只能在同步時從來源順手數，所以標明是同步當下的快照。 -->
+      <div class="section-label">待出貨組成</div>
+      <div class="stat-grid">
+        <div class="stat-tile"><div class="num" id="statWenshan">0</div><div class="lbl">文山可出</div>
+          <div class="note warn">含前期未出</div></div>
+        <div class="stat-tile"><div class="num" id="statTransfer">0</div><div class="lbl">調撥在途</div>
+          <div class="note warn">含前期未出，待他店調入</div></div>
+        <div class="stat-tile"><div class="num" id="statShort">0</div><div class="lbl">缺貨待處理</div>
+          <div class="note warn">含前期未出</div></div>
+        <div class="stat-tile"><div class="num" id="statSanwu">-</div><div class="lbl">山物出貨</div>
+          <div class="note">來源當日資料，非本倉出貨</div></div>
+        <div class="stat-tile"><div class="num" id="statZhonghua">-</div><div class="lbl">中華出貨</div>
+          <div class="note">來源當日資料，非本倉出貨</div></div>
+        <div class="stat-tile"><div class="num" id="statTransferBy">-</div><div class="lbl">調撥來源</div>
+          <div class="note" id="statTransferByNote">待同步</div></div>
       </div>
 
       <div class="section-label">目前包貨人員</div>
@@ -455,7 +482,10 @@
 const LS = {
   orders: 'ssz_orders', log: 'ssz_log', staff: 'ssz_staff',
   currentStaff: 'ssz_current_staff', settings: 'ssz_settings',
-  netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue'
+  netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue',
+  // 同步時順手從來源數出來的「非本倉」訂單數（山物出／中華宅配／各調撥來源）。
+  // 這些訂單本系統不匯入，本機訂單資料裡永遠是0，只有同步當下看得到，所以存起來給首頁用。
+  sourceStats: 'ssz_source_stats'
 };
 function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
 function saveJSON(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
@@ -518,6 +548,11 @@ function isHandledStatus(status){
 // 條碼對照表（國際碼）：條碼 → 品號。掃描商品時如果掃到的是外包裝條碼而不是內部品號，
 // 用這份表轉換過去再比對，跟「文山核對 工作區」原生系統的「轉換品號」欄位同樣邏輯。
 let barcodeMap = {};
+
+// 同步時從來源整份資料數出來的訂單狀態分佈（含不屬於本倉的山物出／中華宅配）。
+// {at:'同步時間', byStatus:{狀態:張數}} —— 沒同步過就是空的，首頁顯示「-」而不是0，
+// 「0」會被讀成「今天沒有山物出的單」，跟「還不知道」是兩回事。
+let sourceStats = loadJSON(LS.sourceStats, null);
 
 // ============================================================
 // 共用後端（Google Apps Script Web App）：有設定就走多人共用資料，
@@ -850,11 +885,18 @@ async function syncOrders(){
 
     const parsed = {};
     let skippedRows = 0, skippedOtherWarehouse = 0;
+    // 順手把來源整份的訂單狀態分佈數出來（含我們不匯入的山物出／中華宅配）。
+    // 來源是一列一品項，同一張訂單會有多列，所以用 Set 去重才是「張數」。
+    const statusOrders = {};
     for(const row of table.slice(1)){
       const orderNo = (row[iOrder]||'').trim();
       const sku = (row[iSku]||'').trim();
       const qty = parseInt(row[iQty], 10);
       if(!orderNo || !sku || isNaN(qty)){ skippedRows++; continue; }
+      if(iStatus>=0){
+        const st = (row[iStatus]||'').trim() || '（空白）';
+        (statusOrders[st] = statusOrders[st] || new Set()).add(orderNo);
+      }
       if(iStatus>=0 && !isHandledStatus(row[iStatus])){ skippedOtherWarehouse++; continue; }
       const spec = iSpec>=0 ? (row[iSpec]||'').trim() : '';
       const baseName = iName>=0 ? (row[iName]||'').trim() : sku;
@@ -869,6 +911,10 @@ async function syncOrders(){
       else parsed[orderNo].items.push({sku, name, baseName, spec, qty, scanned:0});
     }
     const n = Object.keys(parsed).length;
+    const byStatus = {};
+    Object.keys(statusOrders).forEach(k=>{ byStatus[k] = statusOrders[k].size; });
+    sourceStats = {at: new Date().toLocaleString('zh-TW'), byStatus: byStatus};
+    saveJSON(LS.sourceStats, sourceStats);
     const {added, updated, skippedShipped} = await mergeOrders(parsed);
     settings.lastSyncAt = new Date().toLocaleString('zh-TW');
     saveJSON(LS.settings, settings);
@@ -2030,7 +2076,36 @@ function renderHome(){
   document.getElementById('statShippedToday').textContent = countShippedToday();
   document.getElementById('statIssue').textContent = log.filter(l=>l.hadIssue).length;
   document.getElementById('statLastSync').textContent = settings.lastSyncAt ? settings.lastSyncAt.split(' ')[0] : '尚未同步';
+  renderHomeBreakdown(pending);
   renderStaffSelects();
+}
+
+// 待出貨的組成。前三格算的是本機訂單資料（＝我們自己要出的貨，含前期累積）；
+// 後三格是同步時從來源數來的當日快照，本系統不匯入那些訂單，本機永遠查不到。
+function renderHomeBreakdown(pending){
+  const isTransfer = o => String(o.routingStatus||'').trim().indexOf('調') === 0;
+  const set = (id, v) => { const el = document.getElementById(id); if(el) el.textContent = v; };
+  set('statWenshan',  pending.filter(o=>String(o.routingStatus||'').trim()==='文山').length);
+  set('statTransfer', pending.filter(isTransfer).length);
+  set('statShort',    pending.filter(o=>String(o.routingStatus||'').trim()==='缺貨').length);
+
+  // 還沒同步過就維持「-」：0 會被讀成「今天沒有山物出的單」，那跟「還不知道」是兩回事。
+  if(!sourceStats || !sourceStats.byStatus) return;
+  const by = sourceStats.byStatus;
+  set('statSanwu',    by['山物出'] || 0);
+  set('statZhonghua', by['中華宅配'] || 0);
+
+  // 調撥來源：一張單可能同時要跟兩家調（調山物+中華），所以各家分別計，加總會大於張數。
+  const src = {山物:0, 中華:0, OM:0};
+  let transferOrders = 0;
+  Object.keys(by).forEach(st=>{
+    if(st.indexOf('調') !== 0) return;
+    transferOrders += by[st];
+    Object.keys(src).forEach(k=>{ if(st.indexOf(k) >= 0) src[k] += by[st]; });
+  });
+  set('statTransferBy', transferOrders);
+  set('statTransferByNote',
+    `山物 ${src.山物}／中華 ${src.中華}／OM ${src.OM}（來源 ${sourceStats.at.split(' ')[1]||sourceStats.at} 快照）`);
 }
 // 訂單日期是「2026/8/10」這種字串，但來源有時候會給零填補的「2026/08/10」，
 // 直接比字串會把同一天判成不同天，所以拆成數字比對。

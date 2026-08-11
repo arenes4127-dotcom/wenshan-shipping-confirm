@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.57';
+const BACKEND_VERSION = '2026-08-11.58';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -880,9 +880,12 @@ function setupDashboardSheet_(){
   // 這行就蓋掉了「訂單日期範圍」那一格，而且畫面上看起來只是少一列，很難察覺。
   const ruleRow = 5 + orderStats.length;
   sh.getRange(ruleRow, 1, 1, 2).merge();
-  sh.getRange(ruleRow, 1).setValue('歸檔規則：每天 19:30；已出貨滿 7 天且來源已無此單才移出')
+  sh.getRange(ruleRow, 1).setValue([
+      '⚠ 上半部（待出貨／掃描中／待人工結案）是「現在」的待處理量，含前幾天累積下來的，不是今天的量。',
+      '歸檔規則：每天 19:30；已出貨滿 7 天且來源已無此單才移出'
+    ].join('\n'))
     .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
-  sh.setRowHeight(ruleRow, 34);
+  sh.setRowHeight(ruleRow, 46);
 
   // ---- 2. 出貨品質（J4:K9）----
   // 都加上「R欄有值」的條件，才是以「訂單張數」為單位，不是品項列數
@@ -986,6 +989,11 @@ function setupDashboardSheet_(){
   sh.getRange('J14:O14').setFontWeight('bold')
     .setBorder(true, null, null, null, null, null, '#999999', SpreadsheetApp.BorderStyle.SOLID);
   sh.getRange('N14:O14').setFontColor('#666666');
+  sh.getRange('J15:O15').merge();
+  sh.getRange('J15').setValue(
+      '「待出貨」含前期累積，不等於「今日訂單－今日已出」；右邊兩欄就是它的今日／前期拆解。')
+    .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
+  sh.setRowHeight(15, 32);
 
   // ---- 3b. 當日數據（J4:K9）----
   // 「今日已出貨」不能直接拿更新時間的前10碼比對日期：那個欄位存的是UTC的ISO字串
@@ -1010,19 +1018,37 @@ function setupDashboardSheet_(){
     ['今日應出（單）',
       `=IF(SUMPRODUCT(--((${M}!$S$2:$S="文山")+(LEFT(${M}!$S$2:$S,1)="調")))=0,0,`
       + `COUNTA(UNIQUE(FILTER(${M}!$E$2:$E,(${M}!$S$2:$S="文山")+(LEFT(${M}!$S$2:$S,1)="調")))))`],
-    // 未出再依出貨地拆開，看得出「還沒出的那些卡在誰身上」：
-    //   文山／調撥 是我們自己要處理的（調撥要等貨調進來才出得掉）；
-    //   山物／中華不是我們出的，它們的「未出」＝ 還沒有人去人工結案確認對方出了沒。
-    // 三者的判斷來源不同，所以分開算而不是用相減拆分。
-    ['今日未出（單）-文山', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$L$2:$L,"文山",${O}!$M$2:$M,"")`],
-    ['今日未出（單）-調撥', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$L$2:$L,"調*",${O}!$M$2:$M,"")`],
-    ['今日未出（單）-山物', `=COUNTIFS(${O}!$L$2:$L,"山物出",${O}!$M$2:$M,"")`],
-    ['今日未出（單）-中華', `=COUNTIFS(${O}!$L$2:$L,"中華宅配",${O}!$M$2:$M,"")`]
+    // 未出再依出貨地拆開，看得出「還沒出的那些卡在誰身上」。
+    // 這兩項刻意不叫「今日未出」——公式裡沒有任何日期條件，算的是「現在所有還沒出的」，
+    // 含前幾天累積下來的。原本掛著「今日」兩個字擺在當日數據區裡，會被讀成今天的量
+    // （實際查過：文山12張裡有6張是5天前的），標籤跟數字對不起來比沒有這個數字更糟。
+    ['未出（單）-文山 ⚠含前期', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$L$2:$L,"文山",${O}!$M$2:$M,"")`],
+    ['未出（單）-調撥 ⚠含前期', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$L$2:$L,"調*",${O}!$M$2:$M,"")`],
+    // 山物出／中華宅配改從鏡像算，不能再從我們的「訂單」分頁算：
+    // 訂單匯入是照「文山＋調撥」篩選的，那兩種狀態的訂單根本不會進來，
+    // 分頁裡僅存的38張是加篩選以前的舊資料、而且都已經結案，公式永遠回0。
+    // 一個永遠是0的數字比沒有更糟——它看起來像「今天對方沒有單」，其實是量不到。
+    // 鏡像是來源當日全量（每晚重置），這兩個數字才真的是今天的。
+    ['今日山物出（單）',
+      `=IF(SUMPRODUCT(--(${M}!$S$2:$S="山物出"))=0,0,`
+      + `COUNTA(UNIQUE(FILTER(${M}!$E$2:$E,${M}!$S$2:$S="山物出"))))`],
+    ['今日中華宅配（單）',
+      `=IF(SUMPRODUCT(--(${M}!$S$2:$S="中華宅配"))=0,0,`
+      + `COUNTA(UNIQUE(FILTER(${M}!$E$2:$E,${M}!$S$2:$S="中華宅配"))))`]
   ];
   todayStats.forEach((r, i)=>{
     sh.getRange(5+i, 4).setValue(r[0]);
     sh.getRange(5+i, 5).setFormula(r[1]);
   });
+  // 備註列跟著項目數量走，之後增減項目不用回頭改列號（先前寫死列號害說明被蓋掉過一次）
+  const todayNoteRow = 5 + todayStats.length;
+  sh.getRange(todayNoteRow, 4, 1, 2).merge();
+  sh.getRange(todayNoteRow, 4).setValue([
+      '除了標「⚠含前期」的兩項，本區都只算今天。',
+      '山物出／中華宅配來自來源鏡像（當日全量），不是本倉出貨。'
+    ].join('\n'))
+    .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
+  sh.setRowHeight(todayNoteRow, 46);
 
   // ---- 4. 目前掃描中（A13 起，往下長）----
   sectionTitle('A20:E20', '🟠 目前掃描中（誰正在處理哪張）');
