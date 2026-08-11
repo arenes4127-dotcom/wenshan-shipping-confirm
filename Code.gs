@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.43';
+const BACKEND_VERSION = '2026-08-10.44';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -890,31 +890,22 @@ function setupDashboardSheet_(){
     ['今日已出貨（張）',
       `=SUMPRODUCT((LEFT(${O}!$G$2:$G,3)="已出貨")*(${O}!$M$2:$M="")*(IFERROR(INT(DATEVALUE(LEFT(${O}!$J$2:$J,10))`
       + `+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0)))`],
-    ['今日出貨（張）', `=COUNTIF(${G}!$R$2:$R,">0")`],
     ['今日出貨（件）', `=SUM(${G}!$J$2:$J)`],
     ['今日掃描品項列數', `=COUNTA(${G}!$B$2:$B)`],
-    // 包裝完成之後還要掃進物流籃才算真的出得去，這兩格是這段的進度。
-    // 「已進物流籃」不能直接數整欄：那一欄會保留前幾天確認過的結果（來源的統計V2隔天就清空，
-    // 我們這邊刻意不讓它退回「未進」），整欄數出來會是歷史累計而不是今天的量。
-    // 所以要再加上「這張是今天出貨的」這個條件，跟上面「今日已出貨」用同一套時區換算。
-    // 「未進物流籃」則只會寫在今天出貨的訂單上，直接數整欄就是今天的數字。
-    // 兩者相加應該等於「今日已出貨（張）」，對不起來就代表哪裡有問題。
     ['今日已進物流籃',
       `=SUMPRODUCT((LEFT(${O}!$N$2:$N,5)="已進物流籃")*(${O}!$M$2:$M="")*(IFERROR(INT(DATEVALUE(LEFT(${O}!$J$2:$J,10))`
       + `+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0)))`],
-    // 未進 = 今日已出貨 − 今日已進，用相減而不是去數「未進物流籃」那個欄位值。
-    // 原因：欄位值是同步時才寫進去的，剛出貨還沒同步到的訂單那一格會是空的，
-    // 用數的就會漏掉它們，三個數字加起來對不上（實測差了3張，就是同步後才出的貨）。
-    // 相減則是由構造上保證一致，而且語意也對——剛包好還沒同步的訂單，本來就還沒進物流籃。
-    ['今日未進物流籃', '=MAX(0,$E$6-$E$10)'],
-    // 換貨的單還沒真的結束——客服要到蝦皮把訂單內容補正，訂單/發票/庫存才會一致。
-    // 這一格就是提醒「有幾張在等補正」，不為0代表有事情還沒收尾。
+    ['今日未進物流籃', '=MAX(0,$E$6-$E$9)'],
     ['今日換貨待補正', `=COUNTIFS(${G}!$R$2:$R,">0",${G}!$U$2:$U,"換貨出貨*")`],
-    // 應出＝今天該由我們出的訂單數，直接引用上面「依出貨地」算好的兩格（文山可出＋需調撥），
-    // 不另外再數一次——同一個數字在兩個地方各算各的，遲早會因為條件寫法不同而對不起來。
-    // 未出＝應出−已出，一樣用相減，三個數字由構造上保證一致。
     ['今日應出（單）', '=$B$11+$B$12'],
-    ['今日未出（單）', '=MAX(0,$E$13-$E$6)']
+    // 未出再依出貨地拆開，看得出「還沒出的那些卡在誰身上」：
+    //   文山／調撥 是我們自己要處理的（調撥要等貨調進來才出得掉）；
+    //   山物／中華不是我們出的，它們的「未出」＝ 還沒有人去人工結案確認對方出了沒。
+    // 三者的判斷來源不同，所以分開算而不是用相減拆分。
+    ['今日未出（單）-文山', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$L$2:$L,"文山",${O}!$M$2:$M,"")`],
+    ['今日未出（單）-調撥', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$L$2:$L,"調*",${O}!$M$2:$M,"")`],
+    ['今日未出（單）-山物', `=COUNTIFS(${O}!$L$2:$L,"山物出",${O}!$M$2:$M,"")`],
+    ['今日未出（單）-中華', `=COUNTIFS(${O}!$L$2:$L,"中華宅配",${O}!$M$2:$M,"")`]
   ];
   todayStats.forEach((r, i)=>{
     sh.getRange(5+i, 4).setValue(r[0]);
@@ -966,7 +957,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
-  sh.getRange('E5:E14').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('E5:E16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
 
@@ -984,15 +975,15 @@ function setupDashboardSheet_(){
       .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E11')]).build(),
     // 已進物流籃是好事，0張以上就標綠
     SpreadsheetApp.newConditionalFormatRule()
-      .whenNumberGreaterThan(0).setBackground('#d9ead3').setRanges([sh.getRange('E10')]).build(),
+      .whenNumberGreaterThan(0).setBackground('#d9ead3').setRanges([sh.getRange('E9')]).build(),
     // 有換貨待補正就標橘，提醒客服要去處理
     SpreadsheetApp.newConditionalFormatRule()
-      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E12')]).build(),
-    // 今日未出件數：還有東西沒出就標橘，全部出完轉綠
+      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E11')]).build(),
+    // 未出（文山）：還有東西沒出就標橘，全部出完轉綠
     SpreadsheetApp.newConditionalFormatRule()
-      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E14')]).build(),
+      .whenNumberGreaterThan(0).setBackground('#fce5cd').setRanges([sh.getRange('E13:E16')]).build(),
     SpreadsheetApp.newConditionalFormatRule()
-      .whenNumberEqualTo(0).setBackground('#d9ead3').setRanges([sh.getRange('E14')]).build()
+      .whenNumberEqualTo(0).setBackground('#d9ead3').setRanges([sh.getRange('E13:E16')]).build()
   ]);
 
   Logger.log('「儀表板」分頁已建立（公式驅動，資料異動自動重算，不需要排程）。');
