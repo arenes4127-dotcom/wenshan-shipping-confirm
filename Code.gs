@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.56';
+const BACKEND_VERSION = '2026-08-11.57';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1026,15 +1026,16 @@ function setupDashboardSheet_(){
 
   // ---- 4. 目前掃描中（A13 起，往下長）----
   sectionTitle('A20:E20', '🟠 目前掃描中（誰正在處理哪張）');
-  sh.getRange('A21:E21').setValues([['訂單號','賣場','認領人','認領時間','已經過(小時)']])
+  sh.getRange('A21:E21').setValues([['訂單號','賣場','認領人','認領時間','已經過(分鐘)']])
     .setFontWeight('bold').setBackground('#f3f3f3');
   sh.getRange('A22').setFormula(
     `=IFERROR(FILTER({${O}!$A$2:$A,${O}!$B$2:$B,${O}!$H$2:$H,${O}!$I$2:$I},LEFT(${O}!$G$2:$G,3)="掃描中"),"目前沒有人在掃描")`
   );
   // 認領時間存的是 ISO 字串（2026-08-07T04:58:45.545Z），拆出日期跟時間再組回來，
-  // 加 8/24 換成台灣時間，跟 NOW() 相減得到已經過幾小時。格式不合就顯示空白不要噴錯。
+  // 加 8/24 換成台灣時間，跟 NOW() 相減得到已經過幾分鐘。格式不合就顯示空白不要噴錯。
+  // 用分鐘不用小時：時限是30分鐘，顯示「0.3小時」看不出離逾時還有多久。
   sh.getRange('E22').setFormula(
-    '=ARRAYFORMULA(IF(D22:D37="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D22:D37,10))+TIMEVALUE(MID(D22:D37,12,8))+8/24))*24,1),"")))'
+    '=ARRAYFORMULA(IF(D22:D37="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D22:D37,10))+TIMEVALUE(MID(D22:D37,12,8))+8/24))*1440,0),"")))'
   );
 
   // ---- 5. 今日包貨人員（G13 起，往下長）----
@@ -1237,7 +1238,7 @@ function syncNativeOrderSheet_(){
 // 都不會有副作用（只是把「訂單」分頁同步到源頭當下最新的樣子），不影響最終結果只是可能差幾分鐘。
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
-    'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_'];
+    'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_', 'releaseStaleClaims_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -1256,9 +1257,15 @@ function installAutomationTriggers_(){
   // 舊核對表單每小時同步一次。刻意不掛在「完成出貨」的流程裡：開啟外部試算表寫入要1~2秒，
   // 掛上去會直接拖慢人員每掃完一張訂單的反應時間，那是現場最在意的速度。
   ScriptApp.newTrigger('hourlySync_').timeBased().everyHours(1).create();
+  // 認領逾時釋放另外排一個15分鐘的觸發器。原本這件事只掛在訂單同步裡（一天4次），
+  // 時限3小時的時候還算堪用，改成30分鐘之後就不行了：早上10點卡住的單要等到14:05
+  // 才會被釋放，時限寫30分鐘但實際上要4小時，等於數字是假的。
+  // 15分鐘檢查一次，最壞情況是認領後45分鐘被釋放，跟設定值差得不多。
+  ScriptApp.newTrigger('releaseStaleClaims_').timeBased().everyMinutes(15).create();
 
   Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)'
-    +' + 每日維護：自動結案＋歸檔(19:30) + 舊核對表單與物流確認同步(每小時)，共'
+    +' + 每日維護：自動結案＋歸檔(19:30) + 舊核對表單與物流確認同步(每小時)'
+    +' + 認領逾時釋放(每15分鐘)，共'
     +ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
@@ -1321,14 +1328,15 @@ function healOrderRowIfNeeded_(sh, row){
 // （清單只撈 pending），別人掃它也會被擋掉（claimed_by_other），等於整張訂單沒有人出得掉，
 // 而且不會有任何人發現。這裡設一個時限，超過就自動放回待出貨。
 //
-// 為什麼是3小時：一張訂單正常掃完只要幾分鐘。誤釋放的代價很小（人員回來繼續掃，完成時
+// 為什麼是30分鐘：一張訂單正常掃完只要幾分鐘。誤釋放的代價很小（人員回來繼續掃，完成時
 // finalizeShipment 不檢查認領人照樣能正常記錄，而且有「已出貨就不重複記錄」的防呆擋著）；
 // 但卡住不放的代價是整張訂單當天出不掉、還沒人會發現。兩邊風險不對稱，所以取比較短的時限。
-const STALE_CLAIM_HOURS = 3;
+// （原本是3小時，實際上一張單卡到3小時當天就快來不及出了，改成30分鐘。）
+const STALE_CLAIM_MINUTES = 30;
 function isStaleClaim_(claimedAt){
   const t = Date.parse(claimedAt);
   if(isNaN(t)) return true; // 認領時間讀不出來（空白/格式壞掉）也視為逾時，不然會永遠卡著沒人能處理
-  return (Date.now() - t) > STALE_CLAIM_HOURS * 3600 * 1000;
+  return (Date.now() - t) > STALE_CLAIM_MINUTES * 60 * 1000;
 }
 
 function appendSysLog_(event, orderNo, claimedBy, detail){
@@ -1878,24 +1886,25 @@ function releaseStaleClaims_(){
   rows.forEach(r=>{
     if(r.status !== 'scanning') return;
     if(!isStaleClaim_(r.claimedAt)) return;
-    const hours = ((Date.now() - Date.parse(r.claimedAt)) / 3600000).toFixed(1);
+    const mins = Math.round((Date.now() - Date.parse(r.claimedAt)) / 60000);
     sh.getRange(r._row, colOf(ORDERS_HEADER,'status'), 1, 3).setValues([[statusToText('pending'), '', '']]);
     appendSysLog_('認領逾時自動釋放', r.orderNo, r.claimedBy,
-      '認領後 '+(isNaN(Date.parse(r.claimedAt)) ? '（認領時間異常）' : hours+' 小時')
-      +'未完成出貨，已自動放回待出貨清單（時限'+STALE_CLAIM_HOURS+'小時）');
+      '認領後 '+(isNaN(Date.parse(r.claimedAt)) ? '（認領時間異常）' : mins+' 分鐘')
+      +'未完成出貨，已自動放回待出貨清單（時限'+STALE_CLAIM_MINUTES+'分鐘）');
     released++;
   });
   if(released) Logger.log('認領逾時自動釋放：'+released+' 張訂單已放回待出貨清單。');
   return released;
 }
 
-// 驗證用：自己建一張「5小時前就被認領、之後就沒動作」的測試訂單，跑一次自動釋放看結果對不對，
+// 驗證用：自己建一張「遠早於時限就被認領、之後就沒動作」的測試訂單，跑一次自動釋放看結果對不對，
 // 跑完把測試訂單刪掉。用測試資料驗證才不用去動真實訂單，也不用把時限改成0（那樣在正式環境很危險，
 // 真的有人員正在掃描的話會被立刻釋放掉）。確認功能正常之後這個函式可以刪掉。
 function testStaleClaimRelease_(){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const orderNo = 'TEST-STALE-' + Date.now();
-  const staleAt = new Date(Date.now() - 5 * 3600 * 1000).toISOString(); // 5小時前
+  // 用時限的4倍當測試時間點，時限之後再調整也不用回頭改這裡
+  const staleAt = new Date(Date.now() - STALE_CLAIM_MINUTES * 4 * 60 * 1000).toISOString();
   const rowObj = {
     orderNo: orderNo, store: '測試', date: '2026/8/7',
     itemsJson: JSON.stringify([{sku:'TEST-SKU', name:'測試品項', baseName:'測試品項', spec:'', qty:1}]),
@@ -1913,7 +1922,7 @@ function testStaleClaimRelease_(){
   const result = {
     測試訂單: orderNo,
     認領時間: staleAt,
-    時限小時: STALE_CLAIM_HOURS,
+    時限分鐘: STALE_CLAIM_MINUTES,
     釋放前狀態: before ? before.status : '(找不到)',
     釋放前認領人: before ? before.claimedBy : '',
     這次釋放張數: released,
@@ -1948,7 +1957,7 @@ function claimOrder(orderNo, staffId, staffName){
       return {ok:false, reason:'claimed_by_other', claimedBy: row.claimedBy};
     }
     appendSysLog_('認領逾時被接手', orderNo, row.claimedBy,
-      '原認領人未完成出貨（超過'+STALE_CLAIM_HOURS+'小時），改由「'+(staffId||'?')+'」接手掃描');
+      '原認領人未完成出貨（超過'+STALE_CLAIM_MINUTES+'分鐘），改由「'+(staffId||'?')+'」接手掃描');
   }
   const now = new Date().toISOString();
   // 同一人重新叫出同一張還在掃描中的訂單（例如中途切到別的畫面又回來），
