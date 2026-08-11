@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.36';
+const BACKEND_VERSION = '2026-08-10.38';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -815,12 +815,29 @@ function setupDashboardSheet_(){
   // 四個狀態刻意做成「互斥」的（已出貨也要排除掉人工結案的，不然一張訂單會被算兩次），
   // 這樣四個數字加起來剛好等於訂單總數，看到不一致就知道是資料有問題，而不是統計方式的錯。
   sectionTitle('A4:B4', '📦 訂單即時概況');
+  // 下半段是「依出貨地」的拆解，資料來自鏡像分頁而不是我們的訂單分頁——
+  // 因為我們只匯入文山＋調撥的訂單，山物出／中華宅配那些根本不在我們的訂單分頁裡，
+  // 要看它們的張數只能回頭數來源。鏡像欄位：E訂單 R包貨時間 S訂單狀態。
+  // 「未核」＝ 還沒被掃進統計V2過刷紀錄的（包貨時間是「-」或空白）。
+  const M = "'文山出貨V2'";
+  // 先用 SUMPRODUCT 數「有幾列符合」，是0才直接回0。
+  // 不能只靠 IFERROR 包 FILTER——實測完全沒有符合列時它不會乖乖給0（中華宅配那格因此浮出一個假的1），
+  // 而這種假數字在儀表板上最難發現：看起來很合理，只是剛好是錯的。
+  const uniqOrders = cond => `=IF(SUMPRODUCT(--(${cond}))=0,0,COUNTA(UNIQUE(FILTER(${M}!$E$2:$E,${cond}))))`;
+  const notChecked = `((${M}!$R$2:$R="-")+(${M}!$R$2:$R=""))`;
   const orderStats = [
     ['待出貨', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")`],
     ['掃描中', `=COUNTIFS(${O}!$G$2:$G,"掃描中*",${O}!$M$2:$M,"")`],
     ['已出貨', `=COUNTIFS(${O}!$G$2:$G,"已出貨*",${O}!$M$2:$M,"")`],
     ['人工結案', `=COUNTA(${O}!$M$2:$M)`],
-    ['訂單總數', `=COUNTA(${O}!$A$2:$A)`]
+    ['訂單總數', `=COUNTA(${O}!$A$2:$A)`],
+    ['── 依出貨地 ──', ''],
+    ['文山可出', uniqOrders(`${M}!$S$2:$S="文山"`)],
+    ['需調撥（待調入）', uniqOrders(`LEFT(${M}!$S$2:$S,1)="調"`)],
+    ['山物出貨', uniqOrders(`${M}!$S$2:$S="山物出"`)],
+    ['　└ 未核', uniqOrders(`(${M}!$S$2:$S="山物出")*${notChecked}`)],
+    ['中華出貨', uniqOrders(`${M}!$S$2:$S="中華宅配"`)],
+    ['　└ 未核', uniqOrders(`(${M}!$S$2:$S="中華宅配")*${notChecked}`)]
   ];
   orderStats.forEach((r, i)=>{
     sh.getRange(5+i, 1).setValue(r[0]);
@@ -896,36 +913,36 @@ function setupDashboardSheet_(){
   });
 
   // ---- 4. 目前掃描中（A13 起，往下長）----
-  sectionTitle('A13:E13', '🟠 目前掃描中（誰正在處理哪張）');
-  sh.getRange('A14:E14').setValues([['訂單號','賣場','認領人','認領時間','已經過(小時)']])
+  sectionTitle('A18:E18', '🟠 目前掃描中（誰正在處理哪張）');
+  sh.getRange('A19:E19').setValues([['訂單號','賣場','認領人','認領時間','已經過(小時)']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('A15').setFormula(
+  sh.getRange('A20').setFormula(
     `=IFERROR(FILTER({${O}!$A$2:$A,${O}!$B$2:$B,${O}!$H$2:$H,${O}!$I$2:$I},LEFT(${O}!$G$2:$G,3)="掃描中"),"目前沒有人在掃描")`
   );
   // 認領時間存的是 ISO 字串（2026-08-07T04:58:45.545Z），拆出日期跟時間再組回來，
   // 加 8/24 換成台灣時間，跟 NOW() 相減得到已經過幾小時。格式不合就顯示空白不要噴錯。
-  sh.getRange('E15').setFormula(
-    '=ARRAYFORMULA(IF(D15:D30="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D15:D30,10))+TIMEVALUE(MID(D15:D30,12,8))+8/24))*24,1),"")))'
+  sh.getRange('E20').setFormula(
+    '=ARRAYFORMULA(IF(D20:D35="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D20:D35,10))+TIMEVALUE(MID(D20:D35,12,8))+8/24))*24,1),"")))'
   );
 
   // ---- 5. 今日包貨人員（G13 起，往下長）----
-  sectionTitle('G13:H13', '👤 本日包貨人員出貨張數');
-  sh.getRange('G14:H14').setValues([['包貨人員','出貨張數']])
+  sectionTitle('G18:H18', '👤 本日包貨人員出貨張數');
+  sh.getRange('G19:H19').setValues([['包貨人員','出貨張數']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('G15').setFormula(
+  sh.getRange('G20').setFormula(
     `=IFERROR(UNIQUE(FILTER(${G}!$L$2:$L,${G}!$R$2:$R>0)),"（尚無出貨）")`
   );
-  sh.getRange('H15').setFormula(
-    `=ARRAYFORMULA(IF(G15:G30="","",COUNTIFS(${G}!$L$2:$L,G15:G30,${G}!$R$2:$R,">0")))`
+  sh.getRange('H20').setFormula(
+    `=ARRAYFORMULA(IF(G20:G35="","",COUNTIFS(${G}!$L$2:$L,G20:G35,${G}!$R$2:$R,">0")))`
   );
 
   // ---- 6. 需要注意的出貨紀錄（J13 起，往下長）----
   // 直接用核對結果裡的燈號來篩：紅燈(錯誤)或橘燈(有人工介入)的才列出來，
   // 不用再自己組一堆條件，燈號本身就是既有的分類結果。
-  sectionTitle('J13:N13', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
-  sh.getRange('J14:M14').setValues([['訂單號','包貨人員','核對結果','差異明細']])
+  sectionTitle('J18:N18', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
+  sh.getRange('J19:M19').setValues([['訂單號','包貨人員','核對結果','差異明細']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('J15').setFormula(
+  sh.getRange('J20').setFormula(
     `=IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
     + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄")`
   );
@@ -939,7 +956,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(9, 24);
   sh.setColumnWidth(10, 120); sh.setColumnWidth(11, 90);  // J/K欄放賣場名稱與張數
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
-  sh.getRange('B5:B9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('B5:B16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E12').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('H5:H9').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(2);
@@ -2503,12 +2520,13 @@ function setupImportedMirrorSheets(){
     // 欄位：1日期 2賣場 3下單時間 4寄送方式 5訂單 6品名 7規格 8品號 9數量
     //       12文山儲位 13總倉 14文山（揀貨要用：儲位決定走動路線，庫存讓人員判斷缺不缺）
     //       18缺貨量 19文山分配 20山物分配 21中華分配 22OM分配
+    //       28包貨時間（來源是統計V2的過刷紀錄；沒過刷會是「-」，用來算「未核單數」）
     //         （這五欄決定「這件在文山揀得到嗎」——分配到別的門店的要走調撥，
     //           揀貨員在文山怎麼找都找不到，一定要標示出來，不然就是白找）
     //       31訂單狀態
     // 多抓欄位不影響既有邏輯——autoSyncOrders_ 是用表頭名稱找欄位（header.indexOf），
     // 不是用寫死的欄號，所以欄位順序變動不會讓它讀錯。
-    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,12,13,14,18,19,20,21,22,31)'
+    '=CHOOSECOLS(IMPORTRANGE("1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ","\'文山出貨V2\'!A:AE"),1,2,3,4,5,6,7,8,9,12,13,14,18,19,20,21,22,28,31)'
   );
 
   // 蝦proV2 的「特殊註記」：客服處理缺貨／盤差時寫的備註，例如
