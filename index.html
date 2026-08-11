@@ -306,8 +306,9 @@
       <div class="section-label">手動匯入（備用）</div>
       <div class="card">
         <h2>CSV 貼上</h2>
-        <p class="hint">格式：訂單號,貨號,品名,數量（每行一筆；運單編號在包貨完成時另外掃描登記，不在此匯入）</p>
-        <textarea id="csvInput" placeholder="ORD1001,SKU-A01,兒童學習褲(M),2&#10;ORD1001,SKU-B02,露營燈,1"></textarea>
+        <p class="hint">格式：訂單號,貨號,品名,數量,<b>賣場,日期</b>（每行一筆；運單編號在包貨完成時另外掃描登記，不在此匯入）<br>
+          賣場和日期可以不填，但填了儀表板才歸得到正確的賣場與日期——沒填的會歸到「（未指定）」並算成前期訂單。</p>
+        <textarea id="csvInput" placeholder="ORD1001,SKU-A01,兒童學習褲(M),2,秀山莊,2026/8/7&#10;ORD1001,SKU-B02,露營燈,1,秀山莊,2026/8/7"></textarea>
         <div class="row" style="margin-top:10px;">
           <button class="btn" id="btnImport">匯入</button>
           <button class="btn gray" id="btnLoadSample">載入範例</button>
@@ -710,17 +711,26 @@ function parseCsvRFC4180(text){
   return rows.filter(r => r.some(f=>f.trim()!==''));
 }
 // 手動CSV貼上：簡易格式，無逗號跳脫
+// 賣場、日期是選填的第5、6欄。原本這裡寫死空字串，結果手動補進來的訂單在儀表板上
+// 沒有賣場可歸、日期也是空的（會被算成「前期」），實際上就發生過每天一張這種訂單。
+// 不從訂單號推日期：訂單號前6碼是蝦皮的成立日，跟來源「日期」欄差0~3天不等（實際比對過562張），
+// 推出來的值看起來很合理但是錯的，寧可留白。
 function parseSimpleCsv(text){
   const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
   const result = {};
   for(const line of lines){
     const parts = line.split(',').map(s=>s.trim());
     if(parts.length<4) continue;
-    const [orderNo, sku, name, qtyStr] = parts;
+    const [orderNo, sku, name, qtyStr, store, dateStr] = parts;
     if(orderNo==='訂單號') continue;
     const qty = parseInt(qtyStr,10);
     if(!orderNo || isNaN(qty)) continue;
-    if(!result[orderNo]) result[orderNo] = {orderNo, store:'', date:'', items:[], status:'pending'};
+    if(!result[orderNo]) result[orderNo] = {
+      orderNo, store: store||'', date: parseOrderDate(dateStr||''), items:[], status:'pending'
+    };
+    // 同一張訂單只有第一行會帶到賣場/日期，後面幾行如果有填就補上去（前面漏填時才有機會補救）
+    if(!result[orderNo].store && store) result[orderNo].store = store;
+    if(!result[orderNo].date && dateStr) result[orderNo].date = parseOrderDate(dateStr);
     result[orderNo].items.push({sku, name, qty, scanned:0});
   }
   return result;
@@ -732,7 +742,11 @@ function excelSerialToDateStr(serial){
   const ms = Math.round((n - 25569) * 86400 * 1000);
   const d = new Date(ms);
   if(isNaN(d.getTime())) return '';
-  return d.toLocaleDateString('zh-TW', {year:'numeric', month:'2-digit', day:'2-digit'});
+  // 一定要輸出「2026/8/7」這種不補零的格式，跟來源日期欄以及儀表板的
+  // TEXT(TODAY(),"yyyy/M/d") 對得起來——之前用 toLocaleDateString 的 2-digit
+  // 會產生「2026/08/07」，字串比對永遠不相等，那張訂單就會從「今日訂單」裡消失。
+  // 用 UTC 取值：Excel 序號本來就只表示日期，用本地時區取會在時區換算時整個差一天。
+  return d.getUTCFullYear() + '/' + (d.getUTCMonth()+1) + '/' + d.getUTCDate();
 }
 function parseOrderDate(raw){
   const s = (raw||'').trim();
@@ -953,11 +967,11 @@ document.getElementById('btnImport').addEventListener('click', async ()=>{
 });
 document.getElementById('btnLoadSample').addEventListener('click', ()=>{
   document.getElementById('csvInput').value =
-`ORD1001,SKU-A01,兒童學習褲(M),2
-ORD1001,SKU-B02,露營燈,1
-ORD1002,SKU-C03,收納袋,3
-ORD1003,SKU-D04,口罩掛繩,5
-ORD1003,SKU-A01,兒童學習褲(M),1`;
+`ORD1001,SKU-A01,兒童學習褲(M),2,秀山莊,2026/8/7
+ORD1001,SKU-B02,露營燈,1,秀山莊,2026/8/7
+ORD1002,SKU-C03,收納袋,3,青森,2026/8/7
+ORD1003,SKU-D04,口罩掛繩,5,XLAND,2026/8/8
+ORD1003,SKU-A01,兒童學習褲(M),1,XLAND,2026/8/8`;
 });
 document.getElementById('btnClearOrders').addEventListener('click', ()=>{
   if(!confirm('確定要清空所有待出貨訂單？（不影響已出貨紀錄）')) return;
