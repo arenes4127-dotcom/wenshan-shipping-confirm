@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.65';
+const BACKEND_VERSION = '2026-08-11.66';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -153,6 +153,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
   syncSpecialNotes_: () => syncSpecialNotes_(),
   batchCloseOtherWarehouseOrders_: () => batchCloseOtherWarehouseOrders_(),
+  closeBasketConfirmedPending_: () => closeBasketConfirmedPending_(),
   batchCloseOrdersBefore_: (arg) => batchCloseOrdersBefore_(arg),
   setupAmendSheet_: () => setupAmendSheet_(),
   testApplyItemOps_: () => testApplyItemOps_(),
@@ -866,6 +867,9 @@ function setupDashboardSheet_(){
     // 而且那一張反而是最該被看到的——狀態空白代表來源資料有問題。
     ['　└ 其他', '=MAX(0,$B$5-$B$6-$B$7-$B$8)'],
     ['掃描中', `=COUNTIFS(${O}!$G$2:$G,"掃描中*",${O}!$M$2:$M,"")`],
+    // 看門狗：正常應該一直是0。有數字代表有人用舊流程包貨（掃了物流籃但沒走本系統），
+    // 每小時的自動結案會把它清掉，所以看到非0多半是剛發生、還沒輪到下一次同步。
+    ['已進物流籃未結案', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"",${O}!$N$2:$N,"已進*")`],
     ['待人工結案', `=COUNTIFS(${O}!$L$2:$L,"山物出",${O}!$M$2:$M,"")+COUNTIFS(${O}!$L$2:$L,"中華宅配",${O}!$M$2:$M,"")`],
     ['── 累計（未歸檔）──', ''],
     ['已出貨', `=COUNTIFS(${O}!$G$2:$G,"已出貨*",${O}!$M$2:$M,"")`],
@@ -2042,6 +2046,47 @@ function onEdit(e){
   }
 }
 
+// ---------------- 已進物流籃卻還掛在待出貨的訂單，自動結案 ----------------
+// 為什麼會有這種訂單：物流籃掃描（來源的統計V2）是舊系統的包貨完成確認。
+// 有人用舊流程包完、把訂單號掃進物流籃，貨就跟著出去了，但我們這套系統從頭到尾沒被碰過，
+// 狀態就一直停在「待出貨」。實際查過的例子：2608101FY04R1R 在來源的包貨時間是 11:40:23，
+// 跟我們記到的物流籃時間一模一樣，但出貨紀錄裡完全沒有這張單。
+//
+// 不處理的後果比誤判嚴重：那張單會一直留在待出貨清單和揀貨清單裡，
+// 揀貨員看到就會再揀一次、再包一次 —— 重複出貨的成本遠高於漏出貨。
+// 而且物流籃是實體流程的最後一步，掃進去就代表貨已經離開了，證據夠強。
+//
+// 只動「待出貨」的：掃描中代表現在有人正在處理（他等一下自己會完成），不能抽掉。
+function closeBasketConfirmedPending_(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const col = colOf(ORDERS_HEADER, 'manualClose');
+  const hits = rows.filter(function(r){
+    return r.status === 'pending'
+      && !String(r.manualClose||'').trim()
+      && String(r.logisticsConfirmed||'').indexOf('已進') === 0;
+  });
+  if(!hits.length) return {已結案: 0};
+
+  hits.forEach(function(r){ sh.getRange(r._row, col).setValue('出貨完成'); });
+  const logSh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
+  const start = logSh.getLastRow() + 1;
+  const now = nowStamp_();
+  logSh.getRange(start, colOf(SYSLOG_HEADER,'logTime'), hits.length, 1).setNumberFormat('@');
+  const logRows = hits.map(function(r){
+    const o = {
+      logTime: now, event: '已進物流籃自動結案', orderNo: r.orderNo, claimedBy: '',
+      detail: '訂單已掃進物流籃（' + String(r.logisticsTime||'') + '）＝已包貨出貨，'
+        + '但本系統沒有出貨紀錄，代表是用舊流程包的。自動標記為「出貨完成」以免留在待出貨清單裡被重複揀貨。'
+        + '如果是誤掃物流籃，把「人工結案」欄清空即可還原。'
+    };
+    return SYSLOG_HEADER.map(function(h){ return o[h]; });
+  });
+  logSh.getRange(start, 1, logRows.length, SYSLOG_HEADER.length).setValues(logRows);
+  Logger.log('已進物流籃自動結案 ' + hits.length + ' 張');
+  return {已結案: hits.length, 訂單號: hits.map(function(r){ return r.orderNo; })};
+}
+
 // ---------------- 依訂單日期批次結案（清舊帳用） ----------------
 // 用途：待出貨清單裡積了幾天前的老訂單，實際上早就在系統外處理掉了（別的管道出貨、
 // 客服取消、調撥後直接寄出沒回頭掃描…），主管要一次把某個日期以前的清掉。
@@ -2314,6 +2359,9 @@ function syncLogisticsConfirm_(){
 function hourlySync_(){
   syncNativeOrderSheet_();
   syncLogisticsConfirm_();
+  // 順序不能顛倒：要先更新完物流籃狀態，才知道哪些訂單該結案。
+  // 掛在每小時而不是每天19:30，是因為留在清單裡的每一分鐘都可能被人重複揀一次。
+  closeBasketConfirmedPending_();
   syncSpecialNotes_();
 }
 
