@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.55';
+const BACKEND_VERSION = '2026-08-11.56';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -148,6 +148,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
   syncSpecialNotes_: () => syncSpecialNotes_(),
   batchCloseOtherWarehouseOrders_: () => batchCloseOtherWarehouseOrders_(),
+  batchCloseOrdersBefore_: (arg) => batchCloseOrdersBefore_(arg),
   dailyMaintenance_: () => dailyMaintenance_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
@@ -1452,6 +1453,84 @@ function syncSpecialNotes_(){
   });
   Logger.log('特殊註記同步：來源'+sourceCount+'筆，更新'+updated+'張訂單。');
   return {ok:true, 來源筆數:sourceCount, 已更新:updated};
+}
+
+// ---------------- 依訂單日期批次結案（清舊帳用） ----------------
+// 用途：待出貨清單裡積了幾天前的老訂單，實際上早就在系統外處理掉了（別的管道出貨、
+// 客服取消、調撥後直接寄出沒回頭掃描…），主管要一次把某個日期以前的清掉。
+//
+// 跟 batchCloseOtherWarehouseOrders_ 一樣，這個動作是「代替人宣告結果」而不是驗證結果，
+// 所以每一筆都寫進系統紀錄，事後查得到是哪一次批次、用什麼條件、標了什麼原因。
+// 反悔的話把「人工結案」欄清空即可，訂單會自己回到待出貨清單（同步不會覆蓋這一欄）。
+//
+// 參數 arg：{before:'2026/8/10', reason:'出貨完成', dryRun:true}
+//   before  必填，只結案「訂單日期 < 這一天」的（不含當天）
+//   reason  必填，必須是「人工結案」下拉選單裡的值，不然試算表驗證會擋掉
+//   dryRun  true 時只回傳會被動到哪些訂單，不寫入
+// 日期欄存的是「2026/8/6」這種純文字，先轉成 yyyymmdd 數字再比，避免字串比大小
+// 把「2026/8/9」排在「2026/8/10」後面（字串比對是逐字元比，'9' > '1'）。
+function ymdKey_(s){
+  const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})/.exec(String(s||'').trim());
+  if(!m) return null; // 日期空白或格式不明的一律回 null，由呼叫端決定要不要碰——不猜
+  return Number(m[1]) * 10000 + Number(m[2]) * 100 + Number(m[3]);
+}
+function batchCloseOrdersBefore_(arg){
+  const opt = arg || {};
+  const cutoff = ymdKey_(opt.before);
+  const reason = String(opt.reason||'').trim();
+  if(!cutoff) return {ok:false, error:'before 必須是 yyyy/M/d 格式的日期'};
+  if(MANUAL_CLOSE_OPTIONS.indexOf(reason) < 0){
+    return {ok:false, error:'reason 必須是下拉選單裡的值：' + MANUAL_CLOSE_OPTIONS.join('／')};
+  }
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const col = colOf(ORDERS_HEADER, 'manualClose');
+  // 只動「待出貨」——掃描中代表現在有人正在處理，結掉會把人家做到一半的工作抽掉；
+  // 已出貨的本來就不在清單上。日期空白的也跳過：不知道是哪一天的，不能替它決定。
+  const skippedNoDate = [];
+  const hits = rows.filter(function(r){
+    if(r.status !== 'pending') return false;
+    if(String(r.manualClose||'').trim()) return false;
+    const k = ymdKey_(r.date);
+    if(k === null){ skippedNoDate.push(r.orderNo); return false; }
+    return k < cutoff;
+  });
+  const detailOf = function(r){
+    return [r.orderNo, r.date, (r.store||'(未指定)'), (r.routingStatus||'-')].join(' | ');
+  };
+  if(!hits.length){
+    return {ok:true, 已結案:0, 說明:'沒有訂單日期早於 '+opt.before+' 的待出貨訂單', 日期空白未處理:skippedNoDate};
+  }
+  if(opt.dryRun){
+    return {ok:true, dryRun:true, 將結案:hits.length, 原因:reason,
+            清單:hits.map(detailOf), 日期空白未處理:skippedNoDate};
+  }
+
+  hits.forEach(function(r){ sh.getRange(r._row, col).setValue(reason); });
+
+  const logSh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
+  const start = logSh.getLastRow() + 1;
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const now = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd HH:mm:ss');
+  logSh.getRange(start, colOf(SYSLOG_HEADER,'logTime'), hits.length, 1).setNumberFormat('@');
+  const logRows = hits.map(function(r){
+    const o = {
+      logTime: now, event: '批次人工結案（依日期）', orderNo: r.orderNo, claimedBy: '',
+      detail: '訂單日期 ' + r.date + '（出貨地「' + String(r.routingStatus||'') + '」）早於 '
+        + opt.before + '，依指示批次標記為「' + reason + '」以清出待出貨清單。'
+        + '此標記未經逐筆確認，如發現實際情況不符請以此紀錄回溯；把「人工結案」欄清空即可還原。'
+    };
+    return SYSLOG_HEADER.map(function(h){ return o[h]; });
+  });
+  logSh.getRange(start, 1, logRows.length, SYSLOG_HEADER.length).setValues(logRows);
+
+  const byStatus = {};
+  hits.forEach(function(r){
+    const st = String(r.routingStatus||'').trim() || '(空白)';
+    byStatus[st] = (byStatus[st]||0) + 1;
+  });
+  return {ok:true, 已結案:hits.length, 原因:reason, 依出貨地:byStatus,
+          清單:hits.map(detailOf), 日期空白未處理:skippedNoDate};
 }
 
 // ---------------- 一次性處理：把積在待出貨清單裡的山物出／中華宅配訂單批次結案 ----------------
