@@ -228,25 +228,53 @@
     <!-- ============ 訂單資料 ============ -->
     <!-- ============ 揀貨 ============ -->
     <section id="view-pick" class="view">
-      <div class="section-label">揀貨路線</div>
+      <div class="section-label">揀貨</div>
       <div class="card">
         <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap;">
           <select id="pickStaffSelect" style="flex:1;min-width:150px;"></select>
           <button class="btn gray sm" id="btnPickRefresh">重新整理</button>
         </div>
-        <p class="hint" id="pickSummary">載入中…</p>
-        <label class="field" style="margin-top:8px;margin-bottom:0;">
-          <span>只看某個賣場／寄送方式（留空＝全部）</span>
-          <input id="pickFilter" type="text" placeholder="例如：蝦皮店到店" autocomplete="off">
+        <div class="row" style="margin-top:10px;gap:8px;">
+          <button class="btn sm" id="btnModeSingle" style="flex:1;">單張揀貨</button>
+          <button class="btn gray sm" id="btnModeBatch" style="flex:1;">批次揀貨</button>
+        </div>
+        <p class="hint" id="pickSummary" style="margin-top:10px;">載入中…</p>
+      </div>
+
+      <!-- 單張模式：掃訂單號，只揀這一張 -->
+      <div class="card" id="pickSingleBox">
+        <label class="field" style="margin-bottom:8px;">
+          <span>掃描或輸入訂單號</span>
+          <input id="pickOrderInput" class="scan-input" type="text" placeholder="請掃描訂單號" autocomplete="off">
         </label>
-        <div class="row" style="margin-top:10px;">
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">
-            <input type="checkbox" id="pickHideDone" checked style="width:auto;"> 隱藏已揀
-          </label>
+        <div class="row">
+          <button class="btn gray sm" id="btnPickClearOrder">換一張</button>
         </div>
       </div>
 
-      <div class="section-label">依走動順序排列</div>
+      <!-- 批次模式：一次收多張，回來再分揀 -->
+      <div class="card" id="pickBatchBox" style="display:none;">
+        <div class="row" style="gap:8px;flex-wrap:wrap;">
+          <button class="btn sm" id="btnNewBatch">開始新批次</button>
+          <button class="btn gray sm" id="btnSortView">分揀檢視</button>
+          <button class="btn gray sm" id="btnClearBatch">清空批次</button>
+        </div>
+        <label class="field" style="margin-top:10px;margin-bottom:0;">
+          <span>每批訂單數上限</span>
+          <input id="pickBatchSize" type="text" value="10" inputmode="numeric" style="max-width:110px;">
+        </label>
+        <p class="hint" style="margin-top:8px;">一趟走完多張訂單的貨，回到分揀台再依訂單分裝。用「分揀檢視」按訂單分組核對。</p>
+      </div>
+
+      <div class="card">
+        <div class="row" style="gap:14px;flex-wrap:wrap;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">
+            <input type="checkbox" id="pickHideDone" checked style="width:auto;"> 隱藏已揀
+          </label>
+          <input id="pickFilter" type="text" placeholder="篩選賣場／寄送方式" autocomplete="off" style="flex:1;min-width:140px;">
+        </div>
+      </div>
+
       <div id="pickList"></div>
     </section>
 
@@ -971,62 +999,158 @@ let pickQueue = [];
 let pickFlushTimer = null;
 const PICK_FLUSH_MS = 2500;
 
+// 兩種模式對應現場兩種作業方式：
+//   single（預設）＝ 一次揀一張、揀完直接包。這是目前的實際做法，不需要分揀台。
+//   batch        ＝ 一趟收多張訂單的貨，回到分揀台再依訂單分裝。走動距離省很多，
+//                   但要有地方擺、也容易分錯，所以另外提供「分揀檢視」按訂單核對。
+let pickMode = localStorage.getItem('ssz_pick_mode') || 'single';
+let pickCurrentOrder = localStorage.getItem('ssz_pick_order') || '';
+let pickBatch = loadJSON('ssz_pick_batch', []);
+let pickSortView = false;
+
 function pickableOrders(){
   return Object.values(orders).filter(o=>o.status === 'pending' && !isManuallyClosed(o));
+}
+function orderFullyPicked(o){
+  const its = o.items || [];
+  return its.length > 0 && its.every(i=>i.picked);
+}
+
+function setPickMode(mode){
+  pickMode = mode;
+  localStorage.setItem('ssz_pick_mode', mode);
+  pickSortView = false;
+  document.getElementById('pickSingleBox').style.display = mode==='single' ? '' : 'none';
+  document.getElementById('pickBatchBox').style.display  = mode==='batch'  ? '' : 'none';
+  document.getElementById('btnModeSingle').className = 'btn sm' + (mode==='single'?'':' gray');
+  document.getElementById('btnModeBatch').className  = 'btn sm' + (mode==='batch' ?'':' gray');
+  renderPickList();
+  if(mode==='single') setTimeout(()=>{ const el=document.getElementById('pickOrderInput'); if(el) el.focus(); }, 50);
+}
+
+// 依目前模式決定要揀哪些訂單
+function pickScopeOrders(){
+  if(pickMode === 'single'){
+    const o = orders[pickCurrentOrder];
+    return (o && o.status==='pending' && !isManuallyClosed(o)) ? [o] : [];
+  }
+  return pickBatch.map(no=>orders[no]).filter(o=>o && o.status==='pending' && !isManuallyClosed(o));
+}
+
+// 批次模式：從待揀訂單裡取前 N 張（跳過已經全部揀完的）
+function startNewBatch(){
+  const size = Math.max(1, parseInt(document.getElementById('pickBatchSize').value, 10) || 10);
+  const kw = (document.getElementById('pickFilter').value||'').trim().toLowerCase();
+  const candidates = pickableOrders().filter(o=>{
+    if(orderFullyPicked(o)) return false;
+    if(kw && !((o.store||'')+' '+(o.shipMethod||'')+' '+o.orderNo).toLowerCase().includes(kw)) return false;
+    return true;
+  });
+  pickBatch = candidates.slice(0, size).map(o=>o.orderNo);
+  saveJSON('ssz_pick_batch', pickBatch);
+  pickSortView = false;
+  if(!pickBatch.length) flash('err','沒有可揀的訂單','待出貨清單裡沒有符合條件、且還沒揀完的訂單',1800);
+  renderPickList();
 }
 
 function renderPickList(){
   renderStaffSelects();
   const container = document.getElementById('pickList');
-  const kw = (document.getElementById('pickFilter').value||'').trim().toLowerCase();
+  const summary = document.getElementById('pickSummary');
   const hideDone = document.getElementById('pickHideDone').checked;
+  const scope = pickScopeOrders();
 
-  // 把所有待出貨訂單的品項攤平成一條清單，再依走動順序排序。
-  // 同一個儲位可能有多張訂單的貨，攤平之後才能一次拿完，不用為了每張訂單各走一趟。
-  let rows = [];
-  pickableOrders().forEach(o=>{
-    if(kw && !((o.store||'')+' '+(o.shipMethod||'')+' '+o.orderNo).toLowerCase().includes(kw)) return;
-    (o.items||[]).forEach(it=>{
-      rows.push({orderNo:o.orderNo, store:o.store||'', shipMethod:o.shipMethod||'',
-        sku:it.sku, baseName:it.baseName||it.name||'', spec:it.spec||'', qty:it.qty||0,
-        location:it.location||'', stockWs:it.stockWs||'', stockMain:it.stockMain||'', picked:!!it.picked, pickedBy:it.pickedBy||''});
-    });
-  });
-  const total = rows.length, done = rows.filter(r=>r.picked).length;
-  if(hideDone) rows = rows.filter(r=>!r.picked);
-  rows.sort((a,b)=> locationSortKey(a.location) < locationSortKey(b.location) ? -1 : 1);
-
-  document.getElementById('pickSummary').textContent =
-    total ? `共 ${total} 項，已揀 ${done} 項，剩 ${total-done} 項` + (pickQueue.length? `（${pickQueue.length} 筆待同步）`:'')
-          : '目前沒有待揀的品項';
-
-  if(!rows.length){
-    container.innerHTML = `<div class="card"><p class="hint">${total? '全部揀完了 🎉' : '沒有符合條件的品項'}</p></div>`;
+  if(pickMode==='single' && !pickCurrentOrder){
+    summary.textContent = '掃描一張訂單號開始揀貨';
+    container.innerHTML = '<div class="card"><p class="hint">還沒選訂單。掃描或輸入訂單號之後，會依走動順序列出這張訂單的品項。</p></div>';
+    return;
+  }
+  if(!scope.length){
+    summary.textContent = pickMode==='single' ? '找不到這張待出貨訂單' : '目前批次是空的';
+    container.innerHTML = '<div class="card"><p class="hint">' +
+      (pickMode==='single' ? '這張訂單不在待出貨清單裡（可能已出貨或已人工結案）。' : '按「開始新批次」抓一批訂單。') +
+      '</p></div>';
     return;
   }
 
-  // 依儲位分組顯示：同一個儲位的東西擺在一起，人員走到那一格就能一次拿完
+  let rows = [];
+  scope.forEach(o=>{
+    (o.items||[]).forEach(it=>{
+      rows.push({orderNo:o.orderNo, store:o.store||'', shipMethod:o.shipMethod||'',
+        sku:it.sku, baseName:it.baseName||it.name||'', spec:it.spec||'', qty:it.qty||0,
+        location:it.location||'', stockWs:it.stockWs||'', stockMain:it.stockMain||'',
+        picked:!!it.picked});
+    });
+  });
+  const total = rows.length, done = rows.filter(r=>r.picked).length;
+  if(hideDone && !pickSortView) rows = rows.filter(r=>!r.picked);
+
+  summary.textContent = (pickMode==='single'
+      ? '訂單 ' + scope[0].orderNo + '　' + (scope[0].store||'') + '　' + (scope[0].shipMethod||'')
+      : '本批 ' + scope.length + ' 張訂單')
+    + '　共 ' + total + ' 項，已揀 ' + done + '，剩 ' + (total-done)
+    + (pickQueue.length ? '（' + pickQueue.length + ' 筆待同步）' : '');
+
+  if(pickSortView){ container.innerHTML = renderSortView(scope); return; }
+
+  if(!rows.length){
+    container.innerHTML = '<div class="card"><p class="hint">' +
+      (total ? '這一批都揀完了 🎉' + (pickMode==='single' ? '　可以直接包這張了' : '　可以按「分揀檢視」開始分裝') : '沒有品項') +
+      '</p></div>';
+    return;
+  }
+
+  rows.sort(function(a,b){ return locationSortKey(a.location) < locationSortKey(b.location) ? -1 : 1; });
   let html = '', lastLoc = null;
-  rows.forEach(r=>{
+  rows.forEach(function(r){
     if(r.location !== lastLoc){
       lastLoc = r.location;
-      html += `<div class="section-label" style="margin-top:14px;">${escapeHtml(r.location||'（無儲位）')}</div>`;
+      html += '<div class="section-label" style="margin-top:14px;">' + escapeHtml(r.location||'（無儲位）') + '</div>';
     }
-    html += `<div class="card" style="padding:12px;margin-bottom:8px;${r.picked?'opacity:.5;':''}"
-        onclick="togglePick('${escapeHtml(r.orderNo)}','${escapeHtml(r.sku)}')">
-        <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
-          <div style="flex:1;min-width:0;">
-            <div style="font-weight:700;${r.picked?'text-decoration:line-through;':''}">${escapeHtml(r.baseName)}${r.spec?`（${escapeHtml(r.spec)}）`:''}</div>
-            <div class="hint" style="margin-top:2px;">${escapeHtml(r.sku)}　${escapeHtml(r.store)}　${escapeHtml(r.orderNo)}</div>
-          </div>
-          <div style="text-align:right;white-space:nowrap;">
-            <div style="font-size:22px;font-weight:800;">×${r.qty}</div>
-            <div class="hint">文山 ${escapeHtml(String(r.stockWs||'-'))}　總倉 ${escapeHtml(String(r.stockMain||'-'))}</div>
-          </div>
-        </div>
-      </div>`;
+    // 批次模式一定要顯示訂單號——回到分揀台要靠它把貨分回各張訂單
+    const orderTag = pickMode==='batch' ? '　<b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b>' : '';
+    html += '<div class="card" style="padding:12px;margin-bottom:8px;' + (r.picked?'opacity:.5;':'') + '"' +
+      ' onclick="togglePick(\'' + escapeHtml(r.orderNo) + '\',\'' + escapeHtml(r.sku) + '\')">' +
+      '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="font-weight:700;' + (r.picked?'text-decoration:line-through;':'') + '">' +
+            escapeHtml(r.baseName) + (r.spec?'（'+escapeHtml(r.spec)+'）':'') + '</div>' +
+          '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.sku) + '　' + escapeHtml(r.store) + orderTag + '</div>' +
+        '</div>' +
+        '<div style="text-align:right;white-space:nowrap;">' +
+          '<div style="font-size:22px;font-weight:800;">×' + r.qty + '</div>' +
+          '<div class="hint">文山 ' + escapeHtml(String(r.stockWs||'-')) + '　總倉 ' + escapeHtml(String(r.stockMain||'-')) + '</div>' +
+        '</div>' +
+      '</div></div>';
   });
   container.innerHTML = html;
+}
+
+// 分揀檢視：把本批的貨按「訂單」重新分組，回到分揀台照這個分裝。
+// 跟揀貨清單刻意用不同排列——揀貨看儲位、分揀看訂單，兩件事分開才不會弄混。
+function renderSortView(scope){
+  let html = '<div class="card"><p class="hint">照下面按訂單分裝。點品項可以改回未揀。紅框＝這件還沒揀到。</p></div>';
+  scope.forEach(function(o){
+    const its = o.items||[];
+    const doneCount = its.filter(function(i){ return i.picked; }).length;
+    html += '<div class="section-label" style="margin-top:14px;">' + escapeHtml(o.orderNo) + '　' +
+      escapeHtml(o.store||'') + '　' + escapeHtml(o.shipMethod||'') + '　(' + doneCount + '/' + its.length + ')</div>';
+    its.forEach(function(it){
+      html += '<div class="card" style="padding:10px;margin-bottom:6px;' + (it.picked?'':'border-color:var(--danger);') + '"' +
+        ' onclick="togglePick(\'' + escapeHtml(o.orderNo) + '\',\'' + escapeHtml(it.sku) + '\')">' +
+        '<div style="display:flex;justify-content:space-between;gap:10px;">' +
+          '<div style="flex:1;min-width:0;">' +
+            '<div style="font-weight:600;">' + escapeHtml(it.baseName||it.name||'') + (it.spec?'（'+escapeHtml(it.spec)+'）':'') + '</div>' +
+            '<div class="hint">' + escapeHtml(it.sku) + '　' + escapeHtml(it.location||'（無儲位）') + '</div>' +
+          '</div>' +
+          '<div style="text-align:right;white-space:nowrap;">' +
+            '<div style="font-size:18px;font-weight:800;">×' + it.qty + '</div>' +
+            '<div class="hint">' + (it.picked?'已揀':'<span style="color:var(--danger);">未揀</span>') + '</div>' +
+          '</div>' +
+        '</div></div>';
+    });
+  });
+  return html;
 }
 
 function togglePick(orderNo, sku){
@@ -1736,10 +1860,47 @@ if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就
   const el = document.getElementById(id);
   if(el) el.addEventListener(el.type==='checkbox'?'change':'input', renderPickList);
 });
-const btnPickRefresh = document.getElementById('btnPickRefresh');
-if(btnPickRefresh) btnPickRefresh.addEventListener('click', ()=>{
+document.getElementById('btnPickRefresh').addEventListener('click', ()=>{
   refreshFromBackend(true).then(()=>renderPickList());
 });
+document.getElementById('btnModeSingle').addEventListener('click', ()=>setPickMode('single'));
+document.getElementById('btnModeBatch').addEventListener('click', ()=>setPickMode('batch'));
+
+// 單張模式：掃訂單號
+document.getElementById('pickOrderInput').addEventListener('keydown', e=>{
+  if(e.key !== 'Enter') return;
+  const code = e.target.value.trim();
+  e.target.value = '';
+  if(!code) return;
+  const o = orders[code];
+  if(!o || o.status !== 'pending' || isManuallyClosed(o)){
+    errorBeep();
+    flash('err','找不到此訂單', `「${code}」不在待出貨清單中`, 1400);
+    return;
+  }
+  pickCurrentOrder = code;
+  localStorage.setItem('ssz_pick_order', code);
+  okBeep();
+  renderPickList();
+});
+document.getElementById('btnPickClearOrder').addEventListener('click', ()=>{
+  pickCurrentOrder = '';
+  localStorage.removeItem('ssz_pick_order');
+  renderPickList();
+  setTimeout(()=>document.getElementById('pickOrderInput').focus(), 50);
+});
+
+// 批次模式
+document.getElementById('btnNewBatch').addEventListener('click', startNewBatch);
+document.getElementById('btnClearBatch').addEventListener('click', ()=>{
+  pickBatch = []; saveJSON('ssz_pick_batch', pickBatch); pickSortView = false; renderPickList();
+});
+document.getElementById('btnSortView').addEventListener('click', ()=>{
+  pickSortView = !pickSortView;
+  document.getElementById('btnSortView').textContent = pickSortView ? '回揀貨清單' : '分揀檢視';
+  renderPickList();
+});
+setPickMode(pickMode);   // 套用上次選的模式
 
 renderPending();
 renderLog();
