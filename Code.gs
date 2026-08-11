@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.58';
+const BACKEND_VERSION = '2026-08-11.61';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -44,7 +44,11 @@ const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'
 // pickedJson：這張訂單「哪些品號已經揀好了」，存成 {"品號":{"by":"工號","at":"時間"}} 的JSON。
 // 放在訂單列上而不是另開一張表，是為了讓 getState 不用多讀一張表——揀貨畫面要能秒開，
 // 而 getState 本來就已經要讀「訂單」分頁了。稽核用的逐筆紀錄另外寫「揀貨紀錄」分頁。
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote'];
+// itemsOverrideJson 是「訂單修改」分頁存下來的修改指令（缺貨不出／改數量／換貨號／加品項）。
+// 為什麼要另外存一欄，而不是直接改 itemsJson：訂單每次同步都會從來源整列重寫，
+// 直接改品項的話下一次同步（一天4次＋隨時手動）就被蓋回去，改了等於沒改。
+// 存成「指令」而不是「改完的結果」，來源之後又變動（客服改了數量）也還套得上去。
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote','itemsOverrideJson'];
 const SHEET_PICKLOG = '揀貨紀錄';
 const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action'];
 // 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
@@ -76,7 +80,8 @@ const HEADER_LABELS = {
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
   logTime:'時間', event:'事件', detail:'說明',
   logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
-  pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作'
+  pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作',
+  itemsOverrideJson:'品項修改(JSON)'
 };
 
 function doGet(e){
@@ -149,6 +154,9 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   syncSpecialNotes_: () => syncSpecialNotes_(),
   batchCloseOtherWarehouseOrders_: () => batchCloseOtherWarehouseOrders_(),
   batchCloseOrdersBefore_: (arg) => batchCloseOrdersBefore_(arg),
+  setupAmendSheet_: () => setupAmendSheet_(),
+  testApplyItemOps_: () => testApplyItemOps_(),
+  testAmendFlow_: () => testAmendFlow_(),
   dailyMaintenance_: () => dailyMaintenance_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
@@ -387,8 +395,11 @@ function mergeOrders(incoming){
     const o = incoming[orderNo];
     const existing = byOrderNo[orderNo];
     if(existing && existing.status === 'shipped'){ skippedShipped++; return; }
-    const itemsJson = JSON.stringify(o.items||[]);
-    const {skuSummary, nameSummary} = summarizeItems(o.items);
+    // 主管在「訂單修改」分頁做過的調整，每次同步都要重新套一次——來源送過來的永遠是原始品項。
+    const override = existing ? String(existing.itemsOverrideJson||'') : '';
+    const finalItems = applyItemOps_(o.items||[], safeParse(override, []));
+    const itemsJson = JSON.stringify(finalItems);
+    const {skuSummary, nameSummary} = summarizeItems(finalItems);
     const targetRow = existing ? existing._row : sh.getLastRow()+1;
     // 「日期」欄位強制設成純文字格式再寫入，避免 Google試算表把「2026/8/5」這種字串
     // 自動偵測轉成日期型別儲存格（那樣讀回來會變成UTC的ISO時間字串，跟原本存的字不一樣）
@@ -415,7 +426,9 @@ function mergeOrders(incoming){
       // 揀貨狀態是人員實際揀出來的，同步只更新訂單內容，不能洗掉
       pickedJson: existing ? (existing.pickedJson||'') : '',
       // 特殊註記是客服寫的，由 syncSpecialNotes_ 專門更新，一般同步不要動它
-      specialNote: existing ? (existing.specialNote||'') : ''
+      specialNote: existing ? (existing.specialNote||'') : '',
+      // 品項修改指令要留著，不然同步一次就把主管改過的內容洗掉了
+      itemsOverrideJson: override
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     if(existing) updated++; else added++;
@@ -1341,7 +1354,7 @@ function healOrderRowIfNeeded_(sh, row){
     updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '',
     // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
     // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
-    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: ''};
+    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: '', itemsOverrideJson: ''};
   // 寫回試算表的狀態要轉成中文，回傳給呼叫端的物件維持英文代碼
   sh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
     .setValues([ORDERS_HEADER.map(h=> h==='status' ? statusToText(fixed.status) : fixed[h])]);
@@ -1487,6 +1500,366 @@ function syncSpecialNotes_(){
   });
   Logger.log('特殊註記同步：來源'+sourceCount+'筆，更新'+updated+'張訂單。');
   return {ok:true, 來源筆數:sourceCount, 已更新:updated};
+}
+
+// ================= 訂單品項人工修改（缺貨／客人改單／盤差） =================
+// 現場遇到「這件沒貨了」「客人臨時改成別款」「盤點數量對不上」時，訂單內容跟實際要出的東西
+// 就對不起來了，包貨人員掃到最後永遠湊不齊，只能靠人工介入硬過。
+// 這一區讓主管在試算表上直接把訂單改對，APP下次更新就會拿到改過的內容。
+//
+// 設計上最關鍵的一點：改的是「指令」，不是「結果」。
+// 訂單每次同步都會從來源整列重寫（一天4次＋隨時手動），如果直接改品項欄，
+// 下一次同步就整個蓋回去，改了等於沒改，而且不會有任何錯誤訊息，最難查。
+// 所以修改內容存成一串操作（哪個貨號 → 換成什麼／改幾件／不出），
+// 放在訂單自己的 itemsOverrideJson 欄，同步時重新套一次。
+const SHEET_AMEND = '訂單修改';
+const AMEND_FIRST_ROW = 6;   // 第6列開始是品項工作區
+const AMEND_MAX_ROWS = 30;   // 一張訂單最多處理30個品項，夠用且不會無限往下長
+
+// 把一串修改指令套用到品項清單上。純函式，不碰試算表，方便單獨驗證。
+// op 格式：{sku:'原貨號', toSku:'新貨號'|'', qty:數字|null, name:'新品名'}
+//   qty=0        → 這個品項不出（缺貨、客人取消）
+//   toSku 有值   → 換成別的貨號（客人改單、以同款替代）
+//   sku 空白     → 新增一個原本訂單上沒有的品項（客人加購）
+function applyItemOps_(items, ops){
+  if(!ops || !ops.length) return items;
+  const out = (items||[]).map(function(it){ return Object.assign({}, it); });
+  ops.forEach(function(op){
+    const from = String(op.sku||'').trim();
+    const toSku = String(op.toSku||'').trim();
+    const qty = (op.qty === null || op.qty === undefined || op.qty === '') ? null : Number(op.qty);
+    if(!from){
+      // 新增品項。沒指定數量就當1件，指定0件則是自相矛盾（新增又不出），直接忽略。
+      if(!toSku || qty === 0) return;
+      out.push({sku: toSku, name: op.name || toSku, baseName: op.name || toSku, spec: '',
+                qty: qty === null ? 1 : qty, location: '', stockWs: '', stockMain: '',
+                allocWs: 0, allocSp: 0, allocZh: 0, allocOm: 0, shortQty: 0, amended: true});
+      return;
+    }
+    const idx = out.findIndex(function(it){ return String(it.sku||'').trim() === from; });
+    if(idx < 0) return; // 來源已經沒有這個貨號了（客服自己改過），這條指令就跳過，不要憑空補一個回去
+    if(qty === 0){ out.splice(idx, 1); return; }
+    if(toSku && toSku !== from){
+      out[idx].sku = toSku;
+      out[idx].name = op.name || toSku;
+      out[idx].baseName = op.name || toSku;
+      out[idx].spec = '';
+      // 換了貨號之後，原本那件的儲位／庫存／各店分配數就全部不適用了，一律清掉。
+      // 留著會讓揀貨畫面指向錯的儲位，比沒有資訊更糟。
+      out[idx].location = ''; out[idx].stockWs = ''; out[idx].stockMain = '';
+      out[idx].allocWs = 0; out[idx].allocSp = 0; out[idx].allocZh = 0; out[idx].allocOm = 0;
+      out[idx].shortQty = 0;
+    }
+    if(qty !== null && !isNaN(qty) && qty > 0) out[idx].qty = qty;
+    out[idx].amended = true;
+  });
+  return out;
+}
+
+// 貨號→品名對照，從既有的「條碼轉品號」鏡像分頁拿（B欄品號、D欄品名）。
+// 換貨號時順手把品名帶出來，包貨人員畫面上才不是一串看不懂的編號。
+function skuNameMap_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('條碼轉品號');
+  const map = {};
+  if(!sh) return map;
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return map;
+  const values = sh.getRange(2, 2, lastRow - 1, 3).getValues(); // B:品號 C:條碼 D:品名
+  values.forEach(function(r){
+    const sku = String(r[0]||'').trim();
+    if(sku && !map[sku]) map[sku] = String(r[2]||'').trim();
+  });
+  return map;
+}
+
+// applyItemOps_ 是這個功能唯一會改到訂單內容的地方，出錯的話是包貨人員拿到錯的清單，
+// 所以先用假資料把每一種情況跑過一遍再上線，不要拿真訂單試。
+function testApplyItemOps_(){
+  const base = [
+    {sku:'A1', name:'甲', qty:2, location:'A-01-1'},
+    {sku:'B2', name:'乙', qty:1, location:'B-02-3'},
+    {sku:'C3', name:'丙', qty:5, location:'C-03-2'}
+  ];
+  const cases = [
+    ['改數量', [{sku:'A1', qty:1}], function(r){ return r.length===3 && r[0].qty===1; }],
+    ['整件不出', [{sku:'B2', qty:0}], function(r){ return r.length===2 && !r.some(function(x){return x.sku==='B2';}); }],
+    ['換貨號並清掉儲位', [{sku:'C3', toSku:'D4', name:'丁', qty:2}], function(r){
+      const d = r.find(function(x){ return x.sku==='D4'; });
+      return !!d && d.qty===2 && d.name==='丁' && d.location===''; }],
+    ['換貨號不改數量', [{sku:'A1', toSku:'E5', name:'戊'}], function(r){
+      const e5 = r.find(function(x){ return x.sku==='E5'; }); return !!e5 && e5.qty===2; }],
+    ['新增品項', [{sku:'', toSku:'F6', name:'己', qty:3}], function(r){
+      return r.length===4 && r[3].sku==='F6' && r[3].qty===3; }],
+    ['來源已無此貨號就跳過', [{sku:'ZZ', qty:9}], function(r){
+      return r.length===3 && !r.some(function(x){ return x.sku==='ZZ'; }); }],
+    ['多個指令一起套', [{sku:'A1', qty:1},{sku:'B2', qty:0},{sku:'', toSku:'G7', qty:1}], function(r){
+      return r.length===3 && r[0].qty===1 && !r.some(function(x){return x.sku==='B2';})
+        && r.some(function(x){ return x.sku==='G7'; }); }],
+    ['沒有指令時原樣返回', [], function(r){ return r.length===3 && r[2].qty===5; }]
+  ];
+  const results = cases.map(function(c){
+    let pass = false, err = '';
+    try{ pass = c[2](applyItemOps_(base, c[1])); }catch(e){ err = String(e); }
+    return (pass ? '✅ ' : '❌ ') + c[0] + (err ? ' ('+err+')' : '');
+  });
+  // 原始陣列不能被改到——套用是每次同步都要重跑的，改到來源就會一次比一次錯
+  const untouched = base[0].qty === 2 && base.length === 3 && base[2].location === 'C-03-2';
+  results.push((untouched ? '✅ ' : '❌ ') + '不會改到傳進來的原始陣列');
+  return {全部通過: results.every(function(r){ return r.indexOf('✅')===0; }), 明細: results};
+}
+
+// 端對端驗證：自己建一張測試訂單，走完「帶出品項 → 填修改 → 套用」，
+// 再模擬一次同步，確認修改沒有被同步蓋掉（這是整個設計最關鍵、也最容易錯的一點）。
+// 跑完把測試訂單刪掉、工作區清空。用測試資料驗證才不用拿真訂單冒險。
+function testAmendFlow_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const sh = ss.getSheetByName(SHEET_AMEND);
+  if(!sh) return {error:'請先執行 setupAmendSheet_'};
+  const orderNo = 'TEST-AMEND-' + Date.now();
+  const srcItems = [
+    {sku:'TSKU-A', name:'測試甲', baseName:'測試甲', spec:'', qty:2, location:'A-01-1'},
+    {sku:'TSKU-B', name:'測試乙', baseName:'測試乙', spec:'', qty:1, location:'B-02-3'},
+    {sku:'TSKU-C', name:'測試丙', baseName:'測試丙', spec:'', qty:5, location:'C-03-2'}
+  ];
+  const rowObj = {
+    orderNo: orderNo, store: '測試', date: '2026/8/11',
+    itemsJson: JSON.stringify(srcItems),
+    skuSummary: summarizeItems(srcItems).skuSummary, nameSummary: summarizeItems(srcItems).nameSummary,
+    status: statusToText('pending'), claimedBy: '', claimedAt: '',
+    updatedAt: new Date().toISOString(), shipMethod: '', routingStatus: '文山',
+    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: '',
+    itemsOverrideJson: ''
+  };
+  const testRow = ordersSh.getLastRow() + 1;
+  ordersSh.getRange(testRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(function(h){ return rowObj[h]; })]);
+
+  const steps = [];
+  try{
+    sh.getRange('B2').setValue(orderNo);
+    const loadMsg = loadOrderIntoAmendSheet_(sh, orderNo);
+    const loaded = sh.getRange(AMEND_FIRST_ROW, 1, 3, 3).getValues();
+    steps.push((loaded[0][0]==='TSKU-A' && loaded[2][2]===5 ? '✅ ' : '❌ ') + '帶出原始品項：' + loadMsg);
+
+    // 第1列：整件不出；第3列：換成別的貨號並改數量
+    sh.getRange(AMEND_FIRST_ROW, 5).setValue(0);
+    sh.getRange(AMEND_FIRST_ROW + 2, 4).setValue('TSKU-Z');
+    sh.getRange(AMEND_FIRST_ROW + 2, 5).setValue(3);
+    const applyMsg = applyAmendSheet_(sh, orderNo);
+    steps.push((applyMsg.indexOf('✅')===0 ? '✅ ' : '❌ ') + '套用：' + applyMsg);
+
+    const after = readOrderRows().find(function(r){ return r.orderNo === orderNo; });
+    const items = safeParse(after.itemsJson, []);
+    const hasA = items.some(function(i){ return i.sku==='TSKU-A'; });
+    const z = items.find(function(i){ return i.sku==='TSKU-Z'; });
+    steps.push((!hasA ? '✅ ' : '❌ ') + '「不出」的品項已移除');
+    steps.push((z && z.qty===3 && z.location==='' ? '✅ ' : '❌ ') + '換貨號生效且儲位已清空');
+    steps.push((items.length===2 ? '✅ ' : '❌ ') + '剩餘品項數＝2（實際 '+items.length+'）');
+
+    // 最關鍵的一步：模擬同步。來源會送回「原始的」三個品項，
+    // 套上存起來的指令之後應該還是改過的結果，不是退回原始內容。
+    const ops = safeParse(String(after.itemsOverrideJson||''), []);
+    const resynced = applyItemOps_(srcItems, ops);
+    const okResync = resynced.length===2
+      && !resynced.some(function(i){ return i.sku==='TSKU-A'; })
+      && resynced.some(function(i){ return i.sku==='TSKU-Z' && i.qty===3; });
+    steps.push((okResync ? '✅ ' : '❌ ') + '同步後修改仍在（不會被來源蓋回去）');
+  }catch(err){
+    steps.push('❌ 例外：' + err);
+  }finally{
+    ordersSh.deleteRow(testRow);
+    sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).clearContent();
+    sh.getRange('B2').clearContent();
+    sh.getRange('D2:D3').clearContent();
+  }
+  return {全部通過: steps.every(function(s){ return s.indexOf('✅')===0; }), 明細: steps};
+}
+
+function setupAmendSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_AMEND);
+  if(!sh) sh = ss.insertSheet(SHEET_AMEND);
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
+  sh.clear();
+  sh.clearNotes();
+  try{ sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).removeCheckboxes(); }catch(e){}
+
+  sh.getRange('A1:G1').merge();
+  sh.getRange('A1').setValue('✏️ 訂單品項人工修改（缺貨不出／客人改單／盤差）')
+    .setFontSize(14).setFontWeight('bold').setBackground('#fff2cc');
+
+  sh.getRange('A2').setValue('訂單號').setFontWeight('bold');
+  sh.getRange('B2').setNumberFormat('@'); // 訂單號有純數字開頭的，設文字格式才不會被吃掉前導零
+  sh.getRange('C2').setValue('← 貼上訂單號後，下面會自動帶出原始品項').setFontColor('#666666');
+  sh.getRange('A3').setValue('套用').setFontWeight('bold');
+  sh.getRange('B3').insertCheckboxes().setValue(false);
+  sh.getRange('C3').setValue('← 填好右邊三欄之後勾選，勾完會自動取消勾選並顯示結果')
+    .setFontColor('#666666');
+  sh.getRange('A4:G4').merge();
+  sh.getRange('A4').setValue([
+      '填法：只改數量 → 只填「改成數量」；換商品 → 填「改成貨號」（要改數量再填數量）；',
+      '整件不出 → 「改成數量」填 0；客人加購 → 直接在空白列填「改成貨號」和「改成數量」。',
+      '已出貨的訂單不能改；正在掃描中的訂單會擋下來，請先請人員中止再改。'
+    ].join('\n'))
+    .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
+  sh.setRowHeight(4, 52);
+
+  const header = ['原貨號','原品名','原數量','改成貨號','改成數量','說明／原因','狀態'];
+  sh.getRange(5, 1, 1, header.length).setValues([header])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange(AMEND_FIRST_ROW, 3, AMEND_MAX_ROWS, 1).setNumberFormat('0');
+  sh.getRange(AMEND_FIRST_ROW, 5, AMEND_MAX_ROWS, 1).setNumberFormat('0');
+  // 貨號欄一律文字格式：有些貨號是純數字，被當成數字會掉前導零、也會變科學記號
+  sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 1).setNumberFormat('@');
+  sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 1).setNumberFormat('@');
+  // 要填的兩欄給底色，一眼看得出哪裡是輸入區
+  sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 2).setBackground('#fff9e6');
+
+  [140, 300, 70, 160, 80, 200, 220].forEach(function(w, i){ sh.setColumnWidth(i+1, w); });
+  sh.setFrozenRows(5);
+  return {ok:true, 分頁: SHEET_AMEND};
+}
+
+// 把某張訂單目前的品項帶進工作區。回傳訊息字串，直接寫在狀態欄給人看。
+function loadOrderIntoAmendSheet_(sh, orderNo){
+  const clearRange = sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7);
+  clearRange.clearContent();
+  if(!orderNo) return '';
+  const rows = readOrderRows();
+  const row = rows.find(function(r){ return String(r.orderNo||'').trim() === orderNo; });
+  if(!row) return '❌ 找不到這張訂單（可能已歸檔或訂單號有誤）';
+  if(row.status === 'shipped') return '❌ 這張訂單已經出貨，不能再改品項';
+  const items = safeParse(row.itemsJson, []);
+  if(!items.length) return '⚠️ 這張訂單沒有品項資料';
+  const out = items.slice(0, AMEND_MAX_ROWS).map(function(it){
+    return [it.sku||'', it.baseName || it.name || '', it.qty || 0, '', '', '', ''];
+  });
+  sh.getRange(AMEND_FIRST_ROW, 1, out.length, 7).setValues(out);
+  const warn = row.status === 'scanning'
+    ? '⚠️ 這張訂單正在被「'+(row.claimedBy||'?')+'」掃描中，改之前請先請他中止'
+    : '';
+  const prev = String(row.itemsOverrideJson||'').trim();
+  const prevNote = prev && prev !== '[]' ? '（這張先前已經改過 '+safeParse(prev,[]).length+' 項，下面顯示的是改過之後的內容）' : '';
+  return ('✅ 已帶出 '+out.length+' 個品項　'+warn+prevNote).trim();
+}
+
+// 讀工作區、組出修改指令、寫回訂單。回傳給使用者看的結果訊息。
+function applyAmendSheet_(sh, orderNo){
+  if(!orderNo) return '❌ 請先填訂單號';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const row = rows.find(function(r){ return String(r.orderNo||'').trim() === orderNo; });
+  if(!row) return '❌ 找不到這張訂單';
+  if(row.status === 'shipped') return '❌ 這張訂單已經出貨，不能再改品項';
+  if(row.status === 'scanning'){
+    return '❌ 這張訂單正在被「'+(row.claimedBy||'?')+'」掃描中。'
+      + '現在改的話他手機上那份不會跟著變，掃到最後會對不起來——請先請他中止再改。';
+  }
+  const grid = sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 6).getValues();
+  const nameMap = skuNameMap_();
+  const ops = [], notes = [];
+  grid.forEach(function(r){
+    const from = String(r[0]||'').trim();
+    const toSku = String(r[3]||'').trim();
+    const qtyRaw = String(r[4]===0 ? '0' : (r[4]||'')).trim();
+    const reason = String(r[5]||'').trim();
+    if(!toSku && qtyRaw === '') return;            // 這一列沒動過
+    const qty = qtyRaw === '' ? null : Number(qtyRaw);
+    if(qtyRaw !== '' && (isNaN(qty) || qty < 0)){
+      notes.push('「'+(from||toSku)+'」的數量填了「'+qtyRaw+'」，不是有效數字，這一列略過');
+      return;
+    }
+    if(!from && !toSku) return;
+    ops.push({sku: from, toSku: toSku, qty: qty, name: toSku ? (nameMap[toSku] || '') : ''});
+    notes.push(!from ? ('新增 '+toSku+' × '+(qty===null?1:qty))
+      : qty === 0 ? ('不出 '+from)
+      : toSku ? (from+' → '+toSku+(qty===null?'':' × '+qty))
+      : (from+' 數量改為 '+qty)
+      + (reason ? '（'+reason+'）' : ''));
+  });
+  if(!ops.length) return '⚠️ 沒有填任何修改內容（改成貨號／改成數量兩欄都是空的）';
+
+  // 工作區顯示的是「目前的品項」＝ 已經套過舊指令的結果，所以這次的指令要接在舊的後面，
+  // 不能取代舊的：舊指令描述的是「原始來源 → 目前」，取代掉的話同步時會退回原始內容。
+  const prevOps = safeParse(String(row.itemsOverrideJson||''), []);
+  const allOps = prevOps.concat(ops);
+  const baseItems = safeParse(row.itemsJson, []);
+  const newItems = applyItemOps_(baseItems, ops);
+  if(!newItems.length) return '❌ 改完之後這張訂單一件商品都不剩，這種情況請改用「人工結案」把整張訂單結掉';
+
+  const summary = summarizeItems(newItems);
+  const rowObj = Object.assign({}, row, {
+    itemsJson: JSON.stringify(newItems),
+    skuSummary: summary.skuSummary,
+    nameSummary: summary.nameSummary,
+    status: statusToText(row.status),
+    updatedAt: new Date().toISOString(),
+    itemsOverrideJson: JSON.stringify(allOps)
+  });
+  ordersSh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
+    .setValues([ORDERS_HEADER.map(function(h){ return rowObj[h]; })]);
+  appendSysLog_('訂單品項人工修改', orderNo, '', notes.join('；'));
+  rebuildOrderDetailSheet_();
+
+  // 套用完重新帶出一次，讓人直接看到改完的結果，也把輸入欄清空避免重複套用
+  loadOrderIntoAmendSheet_(sh, orderNo);
+  return '✅ 已套用 '+ops.length+' 項修改：'+notes.join('；')+'　（APP下次更新就會拿到）';
+}
+
+// 簡單觸發器：主管在分頁上打字就會跑，不用去按選單。
+// 只認「訂單修改」這一個分頁的B2（訂單號）和B3（套用勾選框），其他編輯一律立刻返回——
+// 這個函式在整份試算表的每一次編輯都會被呼叫，慢一點就會拖累所有人打字。
+// 選單是 onEdit 的備援。onEdit 是簡單觸發器，權限受限、也可能被「保護範圍」之類的設定擋掉；
+// 選單項目則是以操作者本人的身分執行，權限完整。兩條路呼叫的是同一組函式。
+function onOpen(){
+  SpreadsheetApp.getUi()
+    .createMenu('出貨系統')
+    .addItem('帶出訂單品項（讀 B2 的訂單號）', 'menuLoadAmendOrder')
+    .addItem('套用訂單修改', 'menuApplyAmend')
+    .addToUi();
+}
+function menuLoadAmendOrder(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_AMEND);
+  if(!sh) return;
+  const orderNo = String(sh.getRange('B2').getValue()||'').trim();
+  sh.getRange('D2').setValue(loadOrderIntoAmendSheet_(sh, orderNo));
+}
+function menuApplyAmend(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_AMEND);
+  if(!sh) return;
+  const orderNo = String(sh.getRange('B2').getValue()||'').trim();
+  let msg;
+  try{ msg = applyAmendSheet_(sh, orderNo); }
+  catch(err){ msg = '❌ 套用失敗：' + err; }
+  sh.getRange('D3').setValue(msg);
+  SpreadsheetApp.getUi().alert(msg);
+}
+
+function onEdit(e){
+  try{
+    if(!e || !e.range) return;
+    const sh = e.range.getSheet();
+    if(sh.getName() !== SHEET_AMEND) return;
+    const a1 = e.range.getA1Notation();
+    if(a1 === 'B2'){
+      const orderNo = String(e.range.getValue()||'').trim();
+      sh.getRange('D2').setValue(loadOrderIntoAmendSheet_(sh, orderNo));
+      return;
+    }
+    if(a1 === 'B3'){
+      if(e.range.getValue() !== true) return;
+      const orderNo = String(sh.getRange('B2').getValue()||'').trim();
+      let msg;
+      try{ msg = applyAmendSheet_(sh, orderNo); }
+      catch(err){ msg = '❌ 套用失敗：' + err; }
+      sh.getRange('B3').setValue(false); // 勾選框只是按鈕，用完馬上彈回來，避免以為還沒套
+      sh.getRange('D3').setValue(msg);
+    }
+  }catch(err){
+    // 觸發器裡不能讓例外靜靜消失，寫進系統紀錄才查得到
+    try{ appendSysLog_('onEdit 例外', '', '', String(err)); }catch(e2){}
+  }
 }
 
 // ---------------- 依訂單日期批次結案（清舊帳用） ----------------
