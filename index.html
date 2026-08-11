@@ -1336,7 +1336,7 @@ inputOrder.addEventListener('keydown', async e=>{
   current = order;
   // scanned/noBarcodeCount/overScanCount/manualEditHistory 都是「這個品項自己」的紀錄，
   // 差異明細會依貨號分別組成，不會再把整張訂單所有品項的事件混在同一段文字裡。
-  current.items.forEach(i=>{ i.scanned=0; i.noBarcodeCount=0; i.overScanCount=0; i.manualEditHistory=[]; });
+  current.items.forEach(i=>{ i.scanned=0; i.noBarcodeCount=0; i.overScanCount=0; i.manualEditHistory=[]; i.shortShip=false; i.shortShipQty=0; });
   current.hadIssue = false;
   current.hadManualEdit = false;
   current.hadNoBarcodeConfirm = false; // 這次出貨有沒有用過「找不到條碼，手動核對」
@@ -1517,14 +1517,16 @@ function renderItemTable(){
     total += i.qty; done += Math.min(i.scanned,i.qty);
     const tr = document.createElement('tr');
     let cls='pending', label='<span class="tag warn">待掃描</span>';
-    if(i.scanned>i.qty){ cls='over'; label='<span class="tag danger">超量</span>'; }
+    if(i.shortShip){ cls='ok'; label='<span class="tag warn">缺貨不出 '+(i.shortShipQty||0)+'</span>'; }
+    else if(i.scanned>i.qty){ cls='over'; label='<span class="tag danger">超量</span>'; }
     else if(i.scanned===i.qty){ cls='ok'; label='<span class="tag ok">OK</span>'; }
     tr.className=cls;
     const skuEsc = i.sku.replace(/'/g,"\\'");
     tr.innerHTML = `<td>${i.sku}</td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
       `<td style="white-space:nowrap;">`+
       `<button class="btn gray sm" onclick="adjustScanned('${skuEsc}')">修改</button> `+
-      `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button>`+
+      `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button> `+
+      `<button class="btn gray sm" onclick="confirmShortShip('${skuEsc}')">${i.shortShip?'取消缺貨':'缺貨不出'}</button>`+
       `</td>`;
     tbody.appendChild(tr);
   });
@@ -1533,7 +1535,10 @@ function renderItemTable(){
 }
 
 function checkComplete(silent){
-  const allDone = current.items.every(i=>i.scanned===i.qty);
+  // 標記為「缺貨不出」的品項視同處理完畢——它本來就出不了，不該卡住整張單。
+  // 這是給缺貨/盤差用的正式出口：以前只能用「修改數量」把已掃數硬改成足額，
+  // 那樣紀錄上看起來是正常出貨，實際上根本沒出，事後對帳完全查不出來。
+  const allDone = current.items.every(i=>i.scanned===i.qty || i.shortShip);
   if(allDone){
     setPill('done', `訂單 ${current.orderNo} 商品核對完成，待掃運單編號`);
     if(!silent){ doneBeep(); flash('ok','核對完成','所有品項數量正確，請掃描運單編號完成紀錄',900); }
@@ -1545,6 +1550,32 @@ function checkComplete(silent){
     setPill('scan', `訂單 ${current.orderNo} 掃描中`);
     document.getElementById('completeBox').style.display='none';
   }
+}
+
+function confirmShortShip(sku){
+  if(!current) return;
+  const item = current.items.find(i=>i.sku===sku);
+  if(!item) return;
+  if(item.shortShip){                      // 再按一次＝取消標記
+    item.shortShip = false;
+    item.shortShipQty = 0;
+    renderItemTable();
+    checkComplete(true);
+    return;
+  }
+  const missing = Math.max(item.qty - item.scanned, 0);
+  if(missing <= 0){
+    errorBeep();
+    flash('err','這件已經掃齊了', `「${item.name}」數量已足額，不需要標記缺貨`, 1400);
+    return;
+  }
+  if(!confirm(`「${item.sku}／${item.spec||'-'}／${item.baseName||item.name}」\n這件缺 ${missing} 件出不了嗎？\n（標記後這張單就能完成出貨，紀錄會註明缺貨未出，不會算成掃描疏失）`)) return;
+  item.shortShip = true;
+  item.shortShipQty = missing;
+  okBeep();
+  flash('ok','已標記缺貨不出', `${item.sku} 缺 ${missing} 件，可以繼續完成這張單`, 1600);
+  renderItemTable();
+  checkComplete();
 }
 
 function adjustScanned(sku){
@@ -1592,6 +1623,7 @@ function buildItemDifferenceDetails(item){
   if(item.overScanCount) methods.push('數量超過應出數量');
   if(item.manualEditHistory && item.manualEditHistory.length) methods.push(`人工修正數量（${item.manualEditHistory.join('、')}）`);
   if(item.noBarcodeCount) methods.push(`無條碼手動核對${item.noBarcodeCount}件`);
+  if(item.shortShip) methods.push(`缺貨未出${item.shortShipQty||0}件`);
   if(!methods.length) return '';
   return `${item.sku}／${item.spec||'-'}／${methods.join('、')}`;
 }
@@ -1637,7 +1669,7 @@ async function finalizeShipment(){
     orderNo: current.orderNo,
     orderDate: current.date || '',
     waybill: waybill,
-    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned,noBarcodeCount:i.noBarcodeCount||0,itemDifferenceDetails:buildItemDifferenceDetails(i)})),
+    items: current.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.scanned,noBarcodeCount:i.noBarcodeCount||0,shortShipQty:i.shortShip?(i.shortShipQty||0):0,itemDifferenceDetails:buildItemDifferenceDetails(i)})),
     staffId: staffObj?staffObj.id:'', staffName: staffObj?staffObj.name:'',
     time: new Date().toLocaleString('zh-TW'),
     startTime: current.claimedAt ? new Date(current.claimedAt).toLocaleString('zh-TW') : '',

@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.32';
+const BACKEND_VERSION = '2026-08-10.33';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1666,7 +1666,17 @@ function classifyVerifyStatus_(entry){
   if(entry.hadIssue && String(entry.differenceDetails||'').indexOf('商品不符') >= 0) return '錯誤：商品不符';
   const required = Number(entry.requiredCount) || 0;
   const scanned = Number(entry.scannedCount) || 0;
-  if(required > 0 && scanned < required) return '錯誤：少'+(required-scanned)+'件';
+  // 缺貨/盤差時人員會把出不了的品項標成「缺貨不出」。這種短少是「知道而且刻意」的，
+  // 跟掃漏、掃錯那種疏失完全不同，不能一律歸成「錯誤：少N件」——
+  // 那會讓真正需要追查的漏掃案件淹沒在一堆正常的缺貨出貨裡。
+  const shortShip = Number(entry.shortShipCount) || 0;
+  if(required > 0 && scanned < required){
+    const missing = required - scanned;
+    if(shortShip >= missing) return '缺貨出貨：少'+missing+'件';
+    // 短少的量超過標記的缺貨量，代表除了缺貨之外還漏了東西，那部分仍然是錯誤
+    if(shortShip > 0) return '錯誤：少'+(missing-shortShip)+'件（另缺貨'+shortShip+'件）';
+    return '錯誤：少'+missing+'件';
+  }
   if(required > 0 && scanned >= required) return '完成';
   return '待核對';
 }
@@ -1685,6 +1695,8 @@ function formatScannedCount_(required, scanned){
 // 也能一眼看出這筆是哪一種狀態。verifyStatus可以省略不傳，函式會自己算一次。
 function classifyLogEmoji_(entry, verifyStatus){
   const vs = verifyStatus !== undefined ? verifyStatus : classifyVerifyStatus_(entry);
+  // 缺貨出貨是已知情況，給橘燈（要留意但不是做錯）；真正的漏掃才給紅燈
+  if(String(vs).indexOf('缺貨出貨') === 0) return '🟠';
   if(entry.hadIssue || String(vs).indexOf('錯誤') === 0) return '🔴';
   if(entry.hadManualEdit || entry.hadNoBarcodeConfirm) return '🟠';
   if(vs === '待核對' || entry.importedExternal) return '🔵';
@@ -1740,6 +1752,8 @@ function appendLogRow(entry){
   logSh.getRange(startRow, colOf(LOG_HEADER,'startTime'), items.length, 1).setNumberFormat('@');
   // 核對結果是整張訂單層級的判斷（核對狀態＋人工介入註記＋燈號），每個品項列都一樣，
   // 只需要算一次，不用放進.map()裡每個品項都重算一次。
+  // 各品項標記的缺貨量加總，用來判斷「短少是不是已知的缺貨」
+  entry.shortShipCount = items.reduce(function(sum, it){ return sum + (Number(it.shortShipQty)||0); }, 0);
   const verifyStatus = classifyVerifyStatus_(entry);
   const checkResultText = buildCheckResult_(entry, verifyStatus);
   // entry.differenceDetails是「跟特定品項無關」的訂單層級事件（目前只有：掃到不屬於這張訂單的條碼），
