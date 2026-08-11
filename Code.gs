@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-10.50';
+const BACKEND_VERSION = '2026-08-10.51';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -907,8 +907,8 @@ function setupDashboardSheet_(){
   // 「秀山莊 待出貨31／今日已出20」比單看一個數字有意義得多。
   // 刻意用「今日」已出而不是累計已出——這一區是現況視角，
   // 擺一個累計數字進來就會像先前概況區那樣，兩個時間範圍並排卻看起來可以比較。
-  sectionTitle('J4:L4', '🏪 各賣場（待出貨／今日已出）');
-  sh.getRange('J5:L5').setValues([['賣場','待出貨','今日已出']])
+  sectionTitle('J4:M4', '🏪 各賣場');
+  sh.getRange('J5:M5').setValues([['賣場','今日訂單','今日已出','待出貨']])
     .setFontWeight('bold').setBackground('#f3f3f3');
   // 賣場清單會往下長，限制最多8列（第6~13列），確保不會撞到第20列的下一個區塊
   sh.getRange('J6').setFormula(
@@ -916,14 +916,23 @@ function setupDashboardSheet_(){
   );
   // K/L 逐列寫，不用 ARRAYFORMULA 包 SUMPRODUCT——後者在陣列展開時不會逐列broadcast，
   // 會整欄算出同一個值，是很容易忽略的錯。
+  // 欄位順序照作業流程讀：今天進來多少 → 出了多少 → 還剩多少。
+  // 注意「待出貨」是含前幾天累積的，不等於「今日訂單－今日已出」——
+  // 這三個數字之間不該硬湊等式，各自回答不同問題。
   for(let i = 0; i < 8; i++){
     const row = 6 + i;
+    // 今日訂單：訂單日期是今天的（日期欄存純文字，直接跟 TEXT(TODAY()) 比字串）
     sh.getRange(row, 11).setFormula(
-      `=IF($J${row}="","",COUNTIFS(${O}!$B$2:$B,$J${row},${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,""))`
+      `=IF($J${row}="","",COUNTIFS(${O}!$B$2:$B,$J${row},${O}!$C$2:$C,TEXT(TODAY(),"yyyy/M/d")))`
     );
+    // 今日已出：出貨完成時間換算台灣時間是今天的
     sh.getRange(row, 12).setFormula(
       `=IF($J${row}="","",SUMPRODUCT((${O}!$B$2:$B=$J${row})*(LEFT(${O}!$G$2:$G,3)="已出貨")*(${O}!$M$2:$M="")`
       + `*(IFERROR(INT(DATEVALUE(LEFT(${O}!$J$2:$J,10))+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0))))`
+    );
+    // 待出貨：現在還沒出的（含前幾天累積）
+    sh.getRange(row, 13).setFormula(
+      `=IF($J${row}="","",COUNTIFS(${O}!$B$2:$B,$J${row},${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,""))`
     );
   }
 
@@ -1006,7 +1015,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(6, 24);
   sh.setColumnWidth(7, 145); sh.setColumnWidth(8, 100); // G欄放出貨品質標籤
   sh.setColumnWidth(9, 24);
-  sh.setColumnWidth(10, 110); sh.setColumnWidth(11, 80); sh.setColumnWidth(12, 90); // J/K/L：賣場、待出貨、今日已出
+  sh.setColumnWidth(10, 105); sh.setColumnWidth(11, 85); sh.setColumnWidth(12, 85); sh.setColumnWidth(13, 80); // J~M：賣場、今日訂單、今日已出、待出貨
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B13').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
