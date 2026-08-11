@@ -938,7 +938,8 @@ document.getElementById('btnClearOrders').addEventListener('click', ()=>{
 // ============================================================
 // 走動順序完全跟後端 locationSortKey_() 同一套規則（倉庫地圖 L→A 蛇行）。
 // 兩邊都要有是因為：後端負責寫入與稽核，前端要能離線排序、點下去立刻重排，不能每次都問後端。
-const AISLE_ORDER = ['L','K','J','I','H','G','F','E','D','C','B','A'];
+// 跟後端同一份順序。M＝總倉（未編正式儲位的商品），在文山倉後半段，所以排在最後。
+const AISLE_ORDER = ['L','K','J','I','H','G','F','E','D','C','B','A','M'];
 function parseLocation(loc){
   const s = String(loc||'').trim();
   if(!s) return null;
