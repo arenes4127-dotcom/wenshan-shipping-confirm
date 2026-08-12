@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.68';
+const BACKEND_VERSION = '2026-08-11.69';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -901,7 +901,7 @@ function setupDashboardSheet_(){
   const ruleRow = 5 + orderStats.length;
   // 明確擋一次：說明列一旦長到下半部的起始列（24），就會把區塊標題整個蓋掉，
   // 而且不會有任何錯誤訊息。寧可在這裡直接失敗，也不要產出一張看起來正常的壞儀表板。
-  if(ruleRow >= 24) throw new Error('概況區項目太多（'+orderStats.length+'項），說明列會蓋到第24列的下半部區塊，請先把下半部往下移');
+  if(ruleRow >= 22) throw new Error('概況區項目太多（'+orderStats.length+'項），說明列會蓋到第22列的各賣場區塊，請先把下面的區塊往下移');
   sh.getRange(ruleRow, 1, 1, 2).merge();
   sh.getRange(ruleRow, 1).setValue([
       '⚠ 上半部（待出貨／掃描中／待人工結案）是「現在」的待處理量，含前幾天累積下來的，不是今天的量。',
@@ -927,96 +927,102 @@ function setupDashboardSheet_(){
     sh.getRange(5+i, 8).setFormula(r[1]);
   });
 
-  // ---- 3. 各賣場待出貨（G4:H）----
-  // 用 UNIQUE+FILTER 抓出目前實際有待出貨訂單的賣場，不寫死賣場名稱，
-  // 之後多了新品牌也會自己出現，不用回頭改公式。
-  // 待出貨（現在）跟今日已出並排，才看得出各賣場的進度：
-  // 「秀山莊 待出貨31／今日已出20」比單看一個數字有意義得多。
-  // 刻意用「今日」已出而不是累計已出——這一區是現況視角，
-  // 擺一個累計數字進來就會像先前概況區那樣，兩個時間範圍並排卻看起來可以比較。
-  sectionTitle('J4:O4', '🏪 各賣場');
-  sh.getRange('J5:O5').setValues([['賣場','今日訂單','今日已出','待出貨','　└ 今日','　└ 前期']])
-    .setFontWeight('bold').setBackground('#f3f3f3');
-  // 賣場清單會往下長，限制最多8列（第6~13列），確保不會撞到第20列的下一個區塊
-  // 賣場欄可能是空的（實際發生過：有訂單同步進來時來源就沒填賣場／日期）。
-  // 空白如果直接進清單，那一列會被下面的 IF($J="") 判成「沒有這個賣場」而整列消失，
-  // 結果就是各賣場加總比概況區的待出貨少，而且少的那幾張完全看不見。
-  // 這裡把空白換成「（未指定）」讓它現形，統計時再換回空字串去比對。
+  // ---- 3. 各賣場（第22列起，橫跨A~H）----
+  // 位置：擺在上面三個區塊的下面、「目前掃描中」的上面，讓由上往下讀的順序是
+  // 「整體概況 → 當日數據／品質 → 各賣場分解 → 現在誰在做什麼」。
+  // 欄位配置要注意：A~H 之間夾著兩根24px的間隔欄（C、F，是上面三個區塊之間的視覺留白），
+  // 所以六個資料欄放在 A/B/D/E/G/H，那兩根間隔欄剛好變成表格裡的分隔空白。
+  // 用 UNIQUE+FILTER 抓出賣場，不寫死名稱，之後多了新品牌會自己出現。
+  const SB = 22;                         // 區塊起始列
+  const SC = ['A','B','D','E','G','H'];  // 六個資料欄（跳過間隔欄C、F）
+  const SROWS = 8;                       // 最多列8個賣場
+  const sr = function(i){ return SB + 2 + i; };
+  sectionTitle('A'+SB+':H'+SB, '🏪 各賣場');
+  sh.getRange('A'+(SB+1)+':H'+(SB+1)).setFontWeight('bold').setBackground('#f3f3f3');
+  ['賣場','今日訂單','今日已出','待出貨','　└ 今日','　└ 前期'].forEach(function(t, i){
+    sh.getRange(SC[i]+(SB+1)).setValue(t);
+  });
+
   const today = 'TEXT(TODAY(),"yyyy/M/d")';
   const shippedToday = `(IFERROR(INT(DATEVALUE(LEFT(${O}!$J$2:$J,10))+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0))`;
+  // 賣場欄可能是空的（實際發生過：有訂單同步進來時來源就沒填賣場／日期）。
+  // 空白如果直接進清單，那一列會被下面的 IF($A="") 判成「沒有這個賣場」而整列消失，
+  // 結果就是各賣場加總比概況區的待出貨少，而且少的那幾張完全看不見。
+  // 這裡把空白換成「（未指定）」讓它現形，統計時再換回空字串去比對。
+  //
   // 清單的來源條件必須涵蓋這一區會呈現的每一種數字，否則欄位會憑空少算：
   // 只用「有待出貨」抓賣場的話，某個賣場今天出完、待出貨歸零，它就整列消失，
   // 連帶它今天出的那幾張也從表上不見了——合計對不起來但看不出是誰的。（實際發生過。）
   // 所以：現在有待出貨 或 今天有新訂單 或 今天有出貨，三者任一就要列出來。
   // 條件相加後用 >0 轉回布林，FILTER 只接受布林/0-1，相加得到的 2 不能直接餵進去。
-  sh.getRange('J6').setFormula(
+  sh.getRange('A'+sr(0)).setFormula(
     `=ARRAY_CONSTRAIN(IFERROR(UNIQUE(FILTER(ARRAYFORMULA(IF(${O}!$B$2:$B="","（未指定）",${O}!$B$2:$B)),`
     + `ARRAYFORMULA(((LEFT(${O}!$G$2:$G,3)="待出貨")*(${O}!$M$2:$M="")`
     + `+(${O}!$C$2:$C=${today})`
-    + `+(LEFT(${O}!$G$2:$G,3)="已出貨")*(${O}!$M$2:$M="")*${shippedToday})>0))),"（無）"),8,1)`
+    + `+(LEFT(${O}!$G$2:$G,3)="已出貨")*(${O}!$M$2:$M="")*${shippedToday})>0))),"（無）"),${SROWS},1)`
   );
-  // K/L 逐列寫，不用 ARRAYFORMULA 包 SUMPRODUCT——後者在陣列展開時不會逐列broadcast，
+  // 逐列寫，不用 ARRAYFORMULA 包 SUMPRODUCT——後者在陣列展開時不會逐列broadcast，
   // 會整欄算出同一個值，是很容易忽略的錯。
   // 欄位順序照作業流程讀：今天進來多少 → 出了多少 → 還剩多少。
   // 注意「待出貨」是含前幾天累積的，不等於「今日訂單－今日已出」——
   // 這三個數字之間不該硬湊等式，各自回答不同問題。
-  // 顯示名稱轉回實際存在訂單分頁裡的賣場值：「（未指定）」對應到空字串。
-  const storeCri = row => `IF($J${row}="（未指定）","",$J${row})`;
-  for(let i = 0; i < 8; i++){
-    const row = 6 + i;
+  const storeCri = function(row){ return `IF($A${row}="（未指定）","",$A${row})`; };
+  for(let i = 0; i < SROWS; i++){
+    const row = sr(i);
+    const guard = `IF($A${row}="",""`;
     // 今日訂單：訂單日期是今天的（日期欄存純文字，直接跟 TEXT(TODAY()) 比字串）
-    sh.getRange(row, 11).setFormula(
-      `=IF($J${row}="","",COUNTIFS(${O}!$B$2:$B,${storeCri(row)},${O}!$C$2:$C,TEXT(TODAY(),"yyyy/M/d")))`
+    sh.getRange(SC[1]+row).setFormula(
+      `=${guard},COUNTIFS(${O}!$B$2:$B,${storeCri(row)},${O}!$C$2:$C,${today}))`
     );
     // 今日已出：出貨完成時間換算台灣時間是今天的
-    sh.getRange(row, 12).setFormula(
-      `=IF($J${row}="","",SUMPRODUCT((${O}!$B$2:$B=${storeCri(row)})*(LEFT(${O}!$G$2:$G,3)="已出貨")*(${O}!$M$2:$M="")`
-      + `*(IFERROR(INT(DATEVALUE(LEFT(${O}!$J$2:$J,10))+TIMEVALUE(MID(${O}!$J$2:$J,12,8))+8/24)=TODAY(),0))))`
+    sh.getRange(SC[2]+row).setFormula(
+      `=${guard},SUMPRODUCT((${O}!$B$2:$B=${storeCri(row)})*(LEFT(${O}!$G$2:$G,3)="已出貨")*(${O}!$M$2:$M="")`
+      + `*${shippedToday}))`
     );
     // 待出貨：現在還沒出的（含前幾天累積）
-    sh.getRange(row, 13).setFormula(
-      `=IF($J${row}="","",COUNTIFS(${O}!$B$2:$B,${storeCri(row)},${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,""))`
+    sh.getRange(SC[3]+row).setFormula(
+      `=${guard},COUNTIFS(${O}!$B$2:$B,${storeCri(row)},${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,""))`
     );
     // 待出貨再拆成「今日進來的」與「前期累積的」，兩個數字相加要等於左邊的待出貨，
     // 對不起來就是資料有問題——這一欄的作用就是讓人一眼查得出來。
-    sh.getRange(row, 14).setFormula(
-      `=IF($J${row}="","",COUNTIFS(${O}!$B$2:$B,${storeCri(row)},${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"",`
-      + `${O}!$C$2:$C,TEXT(TODAY(),"yyyy/M/d")))`
+    sh.getRange(SC[4]+row).setFormula(
+      `=${guard},COUNTIFS(${O}!$B$2:$B,${storeCri(row)},${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"",${O}!$C$2:$C,${today}))`
     );
     // 前期刻意用 SUMPRODUCT 而不是 COUNTIFS 的 "<>今天"：
     // COUNTIFS 的不等於條件會把空白日期整個排除掉，日期一旦缺漏，今日+前期就會小於待出貨總數，
     // 反而讓查驗用的欄位自己先失準。SUMPRODUCT 下空白≠今天成立，會被歸進前期（當成舊單），
     // 兩欄相加才保證等於總數。
-    sh.getRange(row, 15).setFormula(
-      `=IF($J${row}="","",SUMPRODUCT((${O}!$B$2:$B=${storeCri(row)})*(LEFT(${O}!$G$2:$G,3)="待出貨")*(${O}!$M$2:$M="")`
-      + `*(${O}!$C$2:$C<>TEXT(TODAY(),"yyyy/M/d"))))`
+    sh.getRange(SC[5]+row).setFormula(
+      `=${guard},SUMPRODUCT((${O}!$B$2:$B=${storeCri(row)})*(LEFT(${O}!$G$2:$G,3)="待出貨")*(${O}!$M$2:$M="")`
+      + `*(${O}!$C$2:$C<>${today})))`
     );
   }
+  sh.getRange(SC[4]+sr(0)+':'+SC[5]+sr(SROWS-1)).setFontColor('#666666');
 
-  sh.getRange('N5:O13').setFontColor('#666666');
-
-  // 合計列刻意不用 SUM(K6:K13)——那樣只是把上面幾列再抄一次，上面漏掉什麼它就跟著漏掉什麼。
+  // 合計列刻意不用 SUM()——那樣只是把上面幾列再抄一次，上面漏掉什麼它就跟著漏掉什麼。
   // 這裡改成各自對整張訂單分頁重算，於是它跟明細的差額就代表「有訂單沒被列進來」
   // （賣場超過8個被截斷，或出現預期外的賣場值），數字自己會把問題講出來。
-  // 待出貨的合計也應該等於左邊概況區的「待出貨」，兩區對不起來就是有一邊算錯。
-  sh.getRange('J14:O14').setValues([['合計（全表）','','','','','']]);
-  sh.getRange('K14').setFormula(`=COUNTIF(${O}!$C$2:$C,${today})`);
-  sh.getRange('L14').setFormula(
+  // 待出貨的合計也應該等於上面概況區的「待出貨」，兩區對不起來就是有一邊算錯。
+  const tot = SB + 2 + SROWS;
+  sh.getRange(SC[0]+tot).setValue('合計（全表）');
+  sh.getRange(SC[1]+tot).setFormula(`=COUNTIF(${O}!$C$2:$C,${today})`);
+  sh.getRange(SC[2]+tot).setFormula(
     `=SUMPRODUCT((LEFT(${O}!$G$2:$G,3)="已出貨")*(${O}!$M$2:$M="")*${shippedToday})`
   );
-  sh.getRange('M14').setFormula(`=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")`);
-  sh.getRange('N14').setFormula(`=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"",${O}!$C$2:$C,${today})`);
-  sh.getRange('O14').setFormula(
+  sh.getRange(SC[3]+tot).setFormula(`=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"")`);
+  sh.getRange(SC[4]+tot).setFormula(`=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"",${O}!$C$2:$C,${today})`);
+  sh.getRange(SC[5]+tot).setFormula(
     `=SUMPRODUCT((LEFT(${O}!$G$2:$G,3)="待出貨")*(${O}!$M$2:$M="")*(${O}!$C$2:$C<>${today}))`
   );
-  sh.getRange('J14:O14').setFontWeight('bold')
+  sh.getRange('A'+tot+':H'+tot).setFontWeight('bold')
     .setBorder(true, null, null, null, null, null, '#999999', SpreadsheetApp.BorderStyle.SOLID);
-  sh.getRange('N14:O14').setFontColor('#666666');
-  sh.getRange('J15:O15').merge();
-  sh.getRange('J15').setValue(
+  sh.getRange(SC[4]+tot+':'+SC[5]+tot).setFontColor('#666666');
+  const snote = tot + 1;
+  sh.getRange('A'+snote+':H'+snote).merge();
+  sh.getRange('A'+snote).setValue(
       '「待出貨」含前期累積，不等於「今日訂單－今日已出」；右邊兩欄就是它的今日／前期拆解。')
     .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
-  sh.setRowHeight(15, 32);
+  sh.setRowHeight(snote, 32);
 
   // ---- 3b. 當日數據（J4:K9）----
   // 「今日已出貨」不能直接拿更新時間的前10碼比對日期：那個欄位存的是UTC的ISO字串
@@ -1077,55 +1083,55 @@ function setupDashboardSheet_(){
   // 下半部從第24列開始，不是緊貼著上面。上面的概況區是會長的（每加一個指標就多一列，
   // 說明文字又跟在最後一列的下一列），先前就發生過說明文字長到蓋掉別的內容。
   // 留4列緩衝，概況區還能再加4個指標都不會撞到這裡。
-  sectionTitle('A24:E24', '🟠 目前掃描中（誰正在處理哪張）');
-  sh.getRange('A25:E25').setValues([['訂單號','賣場','認領人','認領時間','已經過(分鐘)']])
+  sectionTitle('A36:E36', '🟠 目前掃描中（誰正在處理哪張）');
+  sh.getRange('A37:E37').setValues([['訂單號','賣場','認領人','認領時間','已經過(分鐘)']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('A26').setFormula(
+  sh.getRange('A38').setFormula(
     `=IFERROR(FILTER({${O}!$A$2:$A,${O}!$B$2:$B,${O}!$H$2:$H,${O}!$I$2:$I},LEFT(${O}!$G$2:$G,3)="掃描中"),"目前沒有人在掃描")`
   );
   // 認領時間存的是 ISO 字串（2026-08-07T04:58:45.545Z），拆出日期跟時間再組回來，
   // 加 8/24 換成台灣時間，跟 NOW() 相減得到已經過幾分鐘。格式不合就顯示空白不要噴錯。
   // 用分鐘不用小時：時限是30分鐘，顯示「0.3小時」看不出離逾時還有多久。
-  sh.getRange('E26').setFormula(
-    '=ARRAYFORMULA(IF(D26:D41="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D26:D41,10))+TIMEVALUE(MID(D26:D41,12,8))+8/24))*1440,0),"")))'
+  sh.getRange('E38').setFormula(
+    '=ARRAYFORMULA(IF(D38:D53="","",IFERROR(ROUND((NOW()-(DATEVALUE(LEFT(D38:D53,10))+TIMEVALUE(MID(D38:D53,12,8))+8/24))*1440,0),"")))'
   );
 
   // ---- 5. 今日包貨人員（G13 起，往下長）----
-  sectionTitle('G24:H24', '👤 本日包貨人員出貨張數');
-  sh.getRange('G25:H25').setValues([['包貨人員','出貨張數']])
+  sectionTitle('G36:H36', '👤 本日包貨人員出貨張數');
+  sh.getRange('G37:H37').setValues([['包貨人員','出貨張數']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('G26').setFormula(
+  sh.getRange('G38').setFormula(
     `=IFERROR(UNIQUE(FILTER(${G}!$L$2:$L,${G}!$R$2:$R>0)),"（尚無出貨）")`
   );
   // 這裡的 G26:G41 一定要跟上面 G26 的清單起點對齊。先前把整個下半部往下移4列時
   // 漏改這一行（還停在 G22:G37），結果姓名在26列起、張數卻從28列起，
   // 每個人被配到別人的數字——而且看起來完全正常，不會有任何錯誤訊息。
-  sh.getRange('H26').setFormula(
-    `=ARRAYFORMULA(IF(G26:G41="","",COUNTIFS(${G}!$L$2:$L,G26:G41,${G}!$R$2:$R,">0")))`
+  sh.getRange('H38').setFormula(
+    `=ARRAYFORMULA(IF(G38:G53="","",COUNTIFS(${G}!$L$2:$L,G38:G53,${G}!$R$2:$R,">0")))`
   );
 
   // ---- 6. 需要注意的出貨紀錄（J13 起，往下長）----
   // 直接用核對結果裡的燈號來篩：紅燈(錯誤)或橘燈(有人工介入)的才列出來，
   // 不用再自己組一堆條件，燈號本身就是既有的分類結果。
-  sectionTitle('J24:O24', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
-  sh.getRange('J25:M25').setValues([['訂單號','包貨人員','核對結果','差異明細']])
+  sectionTitle('J4:O4', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
+  sh.getRange('J5:M5').setValues([['訂單號','包貨人員','核對結果','差異明細']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  // 限制最多15列（第22~36列）。這一區的FILTER本來是無上限往下長的，
-  // 下面第44列還有另一個區塊，出貨異常多的那天會直接被它蓋掉。
-  sh.getRange('J26').setFormula(
+  // 限制最多12列（第6~17列）。這一區的FILTER本來是無上限往下長的，
+  // 下面第22列就是各賣場區塊，出貨異常多的那天會直接被它蓋掉。
+  sh.getRange('J6').setFormula(
     `=ARRAY_CONSTRAIN(IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
-    + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄"),15,4)`
+    + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄"),12,4)`
   );
-  sh.getRange('J41').setValue('（超過15筆時只顯示前15筆，完整內容請看「出貨紀錄」分頁）')
+  sh.getRange('J18').setValue('（超過12筆時只顯示前12筆，完整內容請看「出貨紀錄」分頁）')
     .setFontSize(9).setFontColor('#999999');
 
   // ---- 6. 本日訂單修改（J40 起）----
   // 人工改過的訂單要能一眼看到是誰、改了什麼、為什麼——這是所有「出貨內容跟原訂單不一樣」
   // 的源頭，客訴回頭查的第一站。資料直接讀系統紀錄，不另外存一份，避免兩邊對不起來。
-  sectionTitle('J44:O44', '✏️ 本日訂單修改（缺貨／改單／盤差）');
-  sh.getRange('J45:L45').setValues([['時間','訂單號','修改內容（含原因）']])
+  sectionTitle('J36:O36', '✏️ 本日訂單修改（缺貨／改單／盤差）');
+  sh.getRange('J37:L37').setValues([['時間','訂單號','修改內容（含原因）']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('J46').setFormula(
+  sh.getRange('J38').setFormula(
     `=ARRAY_CONSTRAIN(IFERROR(CHOOSECOLS(FILTER(${SY}!$A$2:$E,${SY}!$B$2:$B="訂單品項人工修改",`
     + `LEFT(${SY}!$A$2:$A,10)=TEXT(TODAY(),"yyyy/MM/dd")),1,3,5),"（今日尚無訂單修改）"),20,3)`
   );
@@ -1137,8 +1143,7 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(6, 24);
   sh.setColumnWidth(7, 145); sh.setColumnWidth(8, 100); // G欄放出貨品質標籤
   sh.setColumnWidth(9, 24);
-  sh.setColumnWidth(10, 105); sh.setColumnWidth(11, 85); sh.setColumnWidth(12, 85); sh.setColumnWidth(13, 80);
-  sh.setColumnWidth(14, 75); sh.setColumnWidth(15, 75); // J~O：賣場、今日訂單、今日已出、待出貨（今日／前期）
+  sh.setColumnWidth(10, 105); sh.setColumnWidth(11, 85); sh.setColumnWidth(14, 75); sh.setColumnWidth(15, 75);
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B13').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
