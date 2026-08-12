@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.76';
+const BACKEND_VERSION = '2026-08-12.78';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -471,7 +471,11 @@ function mergeOrders(incoming){
 function isHandledRoutingStatus_(status){
   const s = String(status||'').trim();
   if(!s) return true;
-  return s === '文山' || s.indexOf('調') === 0;
+  // 「缺貨」也要收。這是實際踩到的問題：2026/8/12 的 2608114FD2T48C 在來源是「缺貨」，
+  // 被這個篩選當成非本倉訂單擋掉，整張單在系統裡憑空消失，人員只好手動CSV貼進來再出。
+  // 缺貨的單本質上還是文山的單，只是這一刻沒貨——它需要的是進到系統裡走缺貨不出／
+  // 換貨／訂單修改的流程，而不是被丟掉。真正不屬於本倉的是山物出／中華宅配。
+  return s === '文山' || s === '缺貨' || s.indexOf('調') === 0;
 }
 const MIRROR_ORDER_SHEET_NAME = '文山出貨V2';
 function autoSyncOrders_(){
@@ -496,6 +500,7 @@ function autoSyncOrders_(){
   }
 
   const parsed = {};
+  const skippedByStatus = {};   // 訂單狀態 → 被擋掉的訂單號（去重），寫進系統紀錄用
   let skippedRows = 0, skippedOtherWarehouse = 0;
   for(let i = 1; i < values.length; i++){
     const row = values[i];
@@ -503,7 +508,13 @@ function autoSyncOrders_(){
     const sku = String(row[iSku]||'').trim();
     const qty = parseInt(row[iQty], 10);
     if(!orderNo || !sku || isNaN(qty)){ skippedRows++; continue; }
-    if(iStatus >= 0 && !isHandledRoutingStatus_(row[iStatus])){ skippedOtherWarehouse++; continue; }
+    if(iStatus >= 0 && !isHandledRoutingStatus_(row[iStatus])){
+      const st = String(row[iStatus]||'').trim() || '(空白)';
+      if(!skippedByStatus[st]) skippedByStatus[st] = [];
+      if(skippedByStatus[st].indexOf(orderNo) < 0) skippedByStatus[st].push(orderNo);
+      skippedOtherWarehouse++;
+      continue;
+    }
     const spec = iSpec>=0 ? String(row[iSpec]||'').trim() : '';
     const baseName = iName>=0 ? String(row[iName]||'').trim() : sku;
     const name = spec ? `${baseName}（${spec}）` : baseName;
@@ -528,6 +539,26 @@ function autoSyncOrders_(){
       parsed[orderNo].items.push({sku, name, baseName, spec, qty, location, stockWs, stockMain,
         allocWs, allocSp, allocZh, allocOm, shortQty});
     }
+  }
+
+  // 被篩掉的訂單要留紀錄。這次就是因為沒有紀錄，才得從來源鏡像一路回推才知道
+  // 「它被當成非本倉訂單擋掉了」。訂單號只留前20筆，避免一次寫進幾百筆把系統紀錄洗版。
+  if(Object.keys(skippedByStatus).length){
+    const summary = Object.keys(skippedByStatus).map(function(k){
+      return k + ' ' + skippedByStatus[k].length + ' 張';
+    }).join('、');
+    const sample = [];
+    Object.keys(skippedByStatus).forEach(function(k){
+      skippedByStatus[k].slice(0, 20).forEach(function(no){ sample.push(k + ':' + no); });
+    });
+    // 這裡要跟「被擋掉的訂單張數」比，不能跟 skippedOtherWarehouse 比——
+    // 那是被擋掉的「資料列數」，一張單有幾個品項就有幾列，永遠大於張數，
+    // 結果是明明全部列出來了卻標成「僅列部分」，看的人會以為還有沒顯示的單。
+    const skippedOrderCount = Object.keys(skippedByStatus).reduce(function(n, k){
+      return n + skippedByStatus[k].length;
+    }, 0);
+    appendSysLog_('同步略過非本倉訂單', '', '',
+      summary + '　｜　' + sample.join('、') + (sample.length < skippedOrderCount ? '…（僅列部分）' : ''));
   }
 
   const result = mergeOrders(parsed);
