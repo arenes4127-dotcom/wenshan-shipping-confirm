@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.73';
+const BACKEND_VERSION = '2026-08-12.75';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -163,6 +163,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   closeBasketConfirmedPending_: () => closeBasketConfirmedPending_(),
   batchCloseOrdersBefore_: (arg) => batchCloseOrdersBefore_(arg),
   setupAmendSheet_: () => setupAmendSheet_(),
+  importProductImages_: () => importProductImages_(),
+  checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
   testAmendFlow_: () => testAmendFlow_(),
   testOnEditWiring_: () => testOnEditWiring_(),
@@ -1583,6 +1585,109 @@ function syncSpecialNotes_(){
   });
   Logger.log('特殊註記同步：來源'+sourceCount+'筆，更新'+updated+'張訂單。');
   return {ok:true, 來源筆數:sourceCount, 已更新:updated};
+}
+
+// ================= 商品主圖對照 =================
+// 用途：無條碼商品沒辦法用掃描確認，只能靠人眼比對，光看品名很容易拿錯
+// （同款不同色、同色不同尺寸的品名幾乎一樣）。揀貨和出貨確認畫面帶一張圖，
+// 現場可以直接對照實體商品。
+//
+// 來源是賣場後台匯出的「商品規格_價格_主圖」四賣場合併檔（Google雲端硬碟）。
+// 只取兩欄：貨號 → 圖片ID。刻意不存完整網址：21552列每列都存一次
+// 「https://s-cf-tw.shopeesz.com/file/」等於白白多傳 700KB 給每一台裝置，
+// 網址前綴在APP端補回去就好。
+const PRODUCT_IMAGE_SOURCE_ID = '1vkMgsfaesSQ2Arn9DwwO1KS5bnKdPZW8';
+const PRODUCT_IMAGE_PREFIX = 'https://s-cf-tw.shopeesz.com/file/';
+const SHEET_PRODUCT_IMAGE = '商品主圖';
+
+// 來源是一份原生的 Google 試算表（實測 openById 開得起來），所以直接用 SpreadsheetApp 讀，
+// 不要走 CSV。第一版是抓 export?format=csv 回來自己逐字元解析，6MB 的字串在 Apps Script 裡
+// 跑不完——請求直接超時、分頁也沒建出來。直接讀儲存格快得多，而且只讀需要的那幾欄。
+const PRODUCT_IMAGE_TAB = '商品規格對照';
+function importProductImages_(){
+  const src = SpreadsheetApp.openById(PRODUCT_IMAGE_SOURCE_ID);
+  const sh0 = src.getSheetByName(PRODUCT_IMAGE_TAB) || src.getSheets()[0];
+  const lastRow = sh0.getLastRow();
+  if(lastRow < 2) return {ok:false, error:'來源分頁沒有資料列'};
+  const header = sh0.getRange(1, 1, 1, sh0.getLastColumn()).getValues()[0]
+                    .map(function(x){ return String(x||'').trim(); });
+  const iOpt = header.indexOf('商品選項貨號');
+  const iMain = header.indexOf('主商品貨號');
+  const iImg = header.indexOf('主商品圖片');
+  if(iImg < 0 || (iOpt < 0 && iMain < 0)){
+    return {ok:false, error:'來源欄位不符（需要 主商品圖片 與 商品選項貨號/主商品貨號）'};
+  }
+  // 只讀用得到的欄位範圍，不要整張 getDataRange()——那會把21474×12格全部拉進記憶體
+  const from = Math.min.apply(null, [iOpt, iMain, iImg].filter(function(x){ return x >= 0; })) + 1;
+  const to = Math.max(iOpt, iMain, iImg) + 1;
+  const values = sh0.getRange(2, from, lastRow - 1, to - from + 1).getValues();
+  const col = function(row, idx){ return idx < 0 ? '' : row[idx + 1 - from]; };
+
+  const map = {};
+  let skipped = 0, foreign = 0;
+  values.forEach(function(row){
+    const img = String(col(row, iImg)||'').trim();
+    if(!img){ skipped++; return; }
+    if(img.indexOf(PRODUCT_IMAGE_PREFIX) !== 0){ foreign++; return; } // 網域不同就跳過，不然APP拼出來的網址是壞的
+    const id = img.slice(PRODUCT_IMAGE_PREFIX.length);
+    // 選項貨號優先：那是訂單上實際會出現的貨號。主商品貨號只在選項貨號沒對到時當備援，
+    // 而且不覆蓋既有的，免得同一個主貨號的其中一個選項把別的選項蓋掉。
+    [col(row, iOpt), col(row, iMain)].forEach(function(v){
+      const sku = String(v||'').trim();
+      if(sku && !map[sku]) map[sku] = id;
+    });
+  });
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_PRODUCT_IMAGE);
+  if(!sh) sh = ss.insertSheet(SHEET_PRODUCT_IMAGE);
+  sh.clear();
+  const out = Object.keys(map).map(function(k){ return [k, map[k]]; });
+  sh.getRange(1, 1, 1, 2).setValues([['貨號','圖片ID']]).setFontWeight('bold');
+  if(out.length){
+    // 貨號欄設成文字格式：有些貨號是純數字，被當數字會掉前導零、長的還會變科學記號
+    sh.getRange(2, 1, out.length, 1).setNumberFormat('@');
+    sh.getRange(2, 1, out.length, 2).setValues(out);
+  }
+  sh.setColumnWidth(1, 180); sh.setColumnWidth(2, 320);
+  sh.setFrozenRows(1);
+  return {ok:true, 貨號數: out.length, 無圖片略過: skipped, 網域不符略過: foreign,
+          分頁: SHEET_PRODUCT_IMAGE, gid: sh.getSheetId()};
+}
+
+// 檢查對照表對「實際會用到的貨號」涵蓋到什麼程度。
+// 涵蓋率低的話這個功能等於沒用，而且是那種不會報錯、只是圖片一直不出現的沉默失效，
+// 所以要能隨時量得出來。
+function checkProductImageCoverage_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_PRODUCT_IMAGE);
+  if(!sh) return {error:'還沒建立「' + SHEET_PRODUCT_IMAGE + '」分頁'};
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return {error:'對照表是空的'};
+  const map = {};
+  sh.getRange(2, 1, lastRow - 1, 2).getValues().forEach(function(r){
+    const k = String(r[0]||'').trim(); if(k) map[k] = String(r[1]||'').trim();
+  });
+  const rows = readOrderRows();
+  const skuQty = {};
+  rows.forEach(function(r){
+    safeParse(r.itemsJson, []).forEach(function(it){
+      const sku = String(it.sku||'').trim(); if(!sku) return;
+      skuQty[sku] = (skuQty[sku]||0) + (Number(it.qty)||0);
+    });
+  });
+  const all = Object.keys(skuQty);
+  const hit = all.filter(function(s){ return map[s]; });
+  const missQty = all.filter(function(s){ return !map[s]; })
+                     .reduce(function(n,s){ return n + skuQty[s]; }, 0);
+  const hitQty = hit.reduce(function(n,s){ return n + skuQty[s]; }, 0);
+  return {
+    對照表貨號數: Object.keys(map).length,
+    訂單涉及貨號數: all.length,
+    有圖貨號數: hit.length,
+    貨號涵蓋率: all.length ? Math.round(hit.length / all.length * 100) + '%' : '-',
+    件數涵蓋率: (hitQty + missQty) ? Math.round(hitQty / (hitQty + missQty) * 100) + '%' : '-',
+    無圖貨號樣本: all.filter(function(s){ return !map[s]; }).slice(0, 10)
+  };
 }
 
 // ================= 訂單品項人工修改（缺貨／客人改單／盤差） =================

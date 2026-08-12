@@ -113,6 +113,22 @@
   .progress-num{font-size:40px;font-weight:800;}
   .progress-num span{color:var(--muted2);font-size:24px;}
 
+  /* ---- 商品縮圖 ---- */
+  /* 無條碼商品沒辦法用掃描確認，只能靠人眼比對，光看品名很容易拿錯
+     （同款不同色的品名幾乎一樣）。縮圖就是給這種情況用的。 */
+  .thumb{width:52px;height:52px;flex:0 0 52px;border-radius:6px;object-fit:cover;
+    background:var(--panel2);border:1px solid var(--border);cursor:zoom-in;}
+  .thumb.miss{display:flex;align-items:center;justify-content:center;font-size:10px;
+    color:var(--muted2);cursor:default;line-height:1.2;text-align:center;}
+  td .thumb{width:44px;height:44px;flex-basis:44px;}
+  /* 放大檢視：整頁遮罩，點任何地方關閉。倉庫是觸控裝置，不做關閉鈕容易誤觸別的東西 */
+  .imgview{position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:1000;
+    display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;padding:20px;}
+  .imgview.show{display:flex;}
+  .imgview img{max-width:100%;max-height:78vh;border-radius:8px;}
+  .imgview .cap{color:#fff;font-size:15px;text-align:center;max-width:640px;line-height:1.5;}
+  .imgview .hintline{color:rgba(255,255,255,.6);font-size:12px;}
+
   /* ---- flash overlay ---- */
   .flash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;
     z-index:999;pointer-events:none;opacity:0;transition:opacity .08s;text-align:center;padding:20px;}
@@ -147,6 +163,12 @@
     <div class="badge" id="pendingBadge">0 張待出貨</div>
     <div class="staff-chip">包貨：<b id="headerStaffName">未選擇</b></div>
   </header>
+
+  <div class="imgview" id="imgView" onclick="closeImgView()">
+    <img id="imgViewImg" alt="">
+    <div class="cap" id="imgViewCap"></div>
+    <div class="hintline">點畫面任一處關閉</div>
+  </div>
 
   <main>
 
@@ -232,7 +254,7 @@
 
           <div class="tbl-wrap" style="margin-top:14px;">
             <table id="itemTable">
-              <thead><tr><th>貨號</th><th>品名</th><th>應出</th><th>已掃</th><th>狀態</th><th></th></tr></thead>
+              <thead><tr><th>圖</th><th>貨號</th><th>品名</th><th>應出</th><th>已掃</th><th>狀態</th><th></th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
@@ -421,6 +443,18 @@
         </div>
       </div>
 
+      <div class="card">
+        <h2>商品主圖</h2>
+        <p class="hint">無條碼商品沒辦法用掃描確認，只能靠人眼比對，光看品名很容易拿錯（同款不同色的品名幾乎一樣）。
+          揀貨清單和掃描出貨的品項表會顯示縮圖，點縮圖看大圖。<br>
+          注意：主圖是「商品層級」的，同一款不同顏色/尺寸共用同一張圖，所以看圖之外一定要再對規格文字。</p>
+        <input id="settingProductImageUrl" type="text" placeholder="商品主圖對照表連結（後端試算表的「商品主圖」分頁）">
+        <div class="row">
+          <button class="btn gray" id="btnLoadProductImages">立即載入商品主圖</button>
+          <span class="tag" id="productImageStatus">尚未載入</span>
+        </div>
+      </div>
+
       <div class="section-label">包貨/出貨人員</div>
       <div class="card">
         <h2>人員名單</h2>
@@ -505,7 +539,10 @@ const DEFAULT_SETTINGS = {
   lastSyncAt: '',
   backendUrl: 'https://script.google.com/macros/s/AKfycbxdzii_g-Dv59KDLIiWa2B7adWyv_JuLoBQBfP42INKYv7L6kOFtN7vseYFwHsa1RJG/exec',
   barcodeSheetUrl: 'https://docs.google.com/spreadsheets/d/1ogk_YvgJvFhjlnlF0QFiy1LaNMd89Qoe49slswk7Ubs/export?format=csv&gid=53784796',
-  barcodeMapLoadedAt: ''
+  barcodeMapLoadedAt: '',
+  // 商品主圖對照表（後端試算表的「商品主圖」分頁，由 importProductImages_ 產生）
+  productImageSheetUrl: 'https://docs.google.com/spreadsheets/d/1ogk_YvgJvFhjlnlF0QFiy1LaNMd89Qoe49slswk7Ubs/export?format=csv&gid=1258928146',
+  productImageLoadedAt: ''
 };
 // 舊版預設值：只自動升級「還在用系統原本內建預設值」的使用者，使用者自己手動改過的連結不動它
 const OLD_DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1vCCJS_iHZDUnoFFjnqiT-ZySwCoKFxx4HXRwqrmtVmU/export?format=csv&gid=0';
@@ -548,6 +585,87 @@ function isHandledStatus(status){
 // 條碼對照表（國際碼）：條碼 → 品號。掃描商品時如果掃到的是外包裝條碼而不是內部品號，
 // 用這份表轉換過去再比對，跟「文山核對 工作區」原生系統的「轉換品號」欄位同樣邏輯。
 let barcodeMap = {};
+
+// 商品主圖：貨號 → 圖片ID。無條碼商品要靠人眼確認樣式，這是唯一的依據。
+// 存的是圖片ID不是完整網址：21552筆每筆都存一次網域前綴等於白白多傳700KB，
+// 前綴在這裡補回去就好。縮圖加 _tn（約40KB），放大才載原圖（約450KB）——
+// 揀貨清單一次要顯示幾十張，載原圖會直接把現場的網路吃光。
+const PRODUCT_IMAGE_PREFIX = 'https://s-cf-tw.shopeesz.com/file/';
+let productImages = {};
+function productImageUrl(sku, thumb){
+  const id = productImages[String(sku||'').trim()];
+  if(!id) return '';
+  return PRODUCT_IMAGE_PREFIX + id + (thumb ? '_tn' : '');
+}
+// 縮圖的 HTML。沒有對照到的貨號顯示「無圖」而不是破圖——
+// 破圖會讓人以為是網路壞了而一直重整，「無圖」才看得出是這個商品沒有資料。
+function thumbHtml(sku, name){
+  const url = productImageUrl(sku, true);
+  if(!url) return '<div class="thumb miss">無圖</div>';
+  const arg = "'" + String(sku).replace(/'/g, "\\'") + "'";
+  return '<img class="thumb" loading="lazy" src="' + url + '" alt=""'
+    + ' onclick="event.stopPropagation();openImgView(' + arg + ')">';
+}
+function openImgView(sku){
+  const url = productImageUrl(sku, false);
+  if(!url) return;
+  const el = document.getElementById('imgView');
+  document.getElementById('imgViewImg').src = url;
+  // 說明文字要帶規格：主圖是「商品層級」的，同款不同色共用同一張圖，
+  // 只看圖分不出顏色/尺寸，一定要把規格寫在旁邊一起看。
+  const item = findItemBySku(sku);
+  document.getElementById('imgViewCap').textContent =
+    item ? (item.name || item.baseName || sku) : sku;
+  el.classList.add('show');
+}
+function closeImgView(){
+  document.getElementById('imgView').classList.remove('show');
+  document.getElementById('imgViewImg').src = '';
+}
+// 從目前掃描中的訂單、或所有訂單裡找這個貨號的品項，只為了取品名/規格來顯示
+function findItemBySku(sku){
+  if(current && current.items){
+    const hit = current.items.find(function(i){ return i.sku === sku; });
+    if(hit) return hit;
+  }
+  const all = Object.values(orders);
+  for(let i = 0; i < all.length; i++){
+    const hit = (all[i].items||[]).find(function(x){ return x.sku === sku; });
+    if(hit) return hit;
+  }
+  return null;
+}
+async function loadProductImages(silent){
+  const url = toExportCsvUrl(settings.productImageSheetUrl);
+  if(!url){ if(!silent) throw new Error('商品主圖對照表連結看起來無效'); return false; }
+  try{
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const table = parseCsvRFC4180(await res.text());
+    const header = table[0] || [];
+    const iSku = header.indexOf('貨號'), iId = header.indexOf('圖片ID');
+    if(iSku < 0 || iId < 0) throw new Error('找不到貨號/圖片ID欄');
+    const map = {};
+    table.slice(1).forEach(function(row){
+      const sku = (row[iSku]||'').trim(), id = (row[iId]||'').trim();
+      if(sku && id) map[sku] = id;
+    });
+    productImages = map;
+    settings.productImageLoadedAt = new Date().toLocaleString('zh-TW');
+    saveJSON(LS.settings, settings);
+    renderProductImageStatus();
+    return true;
+  }catch(err){
+    if(!silent) throw err;
+    return false;
+  }
+}
+function renderProductImageStatus(){
+  const el = document.getElementById('productImageStatus');
+  if(!el) return;
+  const n = Object.keys(productImages).length;
+  el.textContent = n ? ('已載入 ' + n + ' 筆（' + (settings.productImageLoadedAt||'') + '）') : '尚未載入';
+}
 
 // 同步時從來源整份資料數出來的訂單狀態分佈（含不屬於本倉的山物出／中華宅配）。
 // {at:'同步時間', byStatus:{狀態:張數}} —— 沒同步過就是空的，首頁顯示「-」而不是0，
@@ -1227,6 +1345,7 @@ function renderPickList(){
     html += '<div class="card" style="padding:12px;margin-bottom:8px;' + (r.picked?'opacity:.5;':'') + '"' +
       ' onclick="togglePick(\'' + escapeHtml(r.orderNo) + '\',\'' + escapeHtml(r.sku) + '\')">' +
       '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
+        thumbHtml(r.sku, r.baseName) +
         '<div style="flex:1;min-width:0;">' +
           '<div style="font-weight:700;' + (r.picked?'text-decoration:line-through;':'') + '">' +
             escapeHtml(r.baseName) + (r.spec?'（'+escapeHtml(r.spec)+'）':'') + '</div>' +
@@ -1624,7 +1743,8 @@ function renderItemTable(){
     else if(i.scanned===i.qty){ cls='ok'; label='<span class="tag ok">OK</span>'; }
     tr.className=cls;
     const skuEsc = i.sku.replace(/'/g,"\\'");
-    tr.innerHTML = `<td>${i.sku}</td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
+    tr.innerHTML = `<td>${thumbHtml(i.sku, i.baseName || i.name)}</td>`+
+      `<td>${i.sku}</td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
       `<td style="white-space:nowrap;">`+
       `<button class="btn gray sm" onclick="adjustScanned('${skuEsc}')">修改</button> `+
       `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button> `+
@@ -1989,6 +2109,9 @@ document.getElementById('btnAddStaff').addEventListener('click', async ()=>{
 // 設定
 // ============================================================
 function renderSettings(){
+  const pi = document.getElementById('settingProductImageUrl');
+  if(pi) pi.value = settings.productImageSheetUrl || '';
+  renderProductImageStatus();
   document.getElementById('settingSheetUrl').value = settings.sheetUrl || '';
   document.getElementById('settingHandledStatus').value = settings.handledStatus || DEFAULT_SETTINGS.handledStatus;
   document.getElementById('settingBackendUrl').value = settings.backendUrl || '';
@@ -2007,6 +2130,21 @@ function renderBarcodeMapStatus(){
     el.textContent = '尚未載入';
   }
 }
+document.getElementById('btnLoadProductImages').addEventListener('click', async ()=>{
+  settings.productImageSheetUrl = document.getElementById('settingProductImageUrl').value.trim();
+  saveJSON(LS.settings, settings);
+  const el = document.getElementById('productImageStatus');
+  el.className = 'tag'; el.textContent = '載入中…';
+  try{
+    await loadProductImages();
+    renderProductImageStatus();
+    renderItemTable && current && renderItemTable();
+  }catch(err){
+    el.className = 'tag danger';
+    el.textContent = `載入失敗：${err.message}`;
+  }
+});
+
 document.getElementById('btnLoadBarcodeMap').addEventListener('click', async ()=>{
   settings.barcodeSheetUrl = document.getElementById('settingBarcodeUrl').value.trim();
   saveJSON(LS.settings, settings);
@@ -2196,6 +2334,16 @@ if(hasBackend()){
 }
 if(settings.barcodeSheetUrl){
   loadBarcodeMap(true).then(()=>renderBarcodeMapStatus());
+}
+// 圖片對照表1MB左右，載入時不擋畫面：沒載完之前縮圖顯示「無圖」，載完再重畫一次。
+// 揀貨/掃描本來就不依賴圖片，圖只是輔助確認，所以慢一點到沒關係，但不能拖慢開啟速度。
+if(settings.productImageSheetUrl){
+  loadProductImages(true).then(function(ok){
+    renderProductImageStatus();
+    if(!ok) return;
+    if(current) renderItemTable();
+    if(document.getElementById('view-pick') && document.getElementById('view-pick').classList.contains('active')) renderPickList();
+  });
 }
 
 // 有設定共用後端時，每20秒背景刷新一次，讓多人多裝置看得到彼此的最新狀態
