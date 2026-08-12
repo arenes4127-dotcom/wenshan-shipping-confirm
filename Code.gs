@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.75';
+const BACKEND_VERSION = '2026-08-12.76';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1614,19 +1614,27 @@ function importProductImages_(){
   const iOpt = header.indexOf('商品選項貨號');
   const iMain = header.indexOf('主商品貨號');
   const iImg = header.indexOf('主商品圖片');
-  if(iImg < 0 || (iOpt < 0 && iMain < 0)){
-    return {ok:false, error:'來源欄位不符（需要 主商品圖片 與 商品選項貨號/主商品貨號）'};
+  // 優先用「商品圖片1」——那才是賣場頁面的第一張圖，也就是實際的商品照。
+  // 「主商品圖片」是行銷用的封面（滿版標語、免運貼紙、模特兒情境照），
+  // 拿來對照實體商品反而看不清楚東西長什麼樣。實測21474列裡兩欄有21458列不同。
+  const iImg1 = header.indexOf('商品圖片1');
+  if((iImg < 0 && iImg1 < 0) || (iOpt < 0 && iMain < 0)){
+    return {ok:false, error:'來源欄位不符（需要 商品圖片1/主商品圖片 與 商品選項貨號/主商品貨號）'};
   }
-  // 只讀用得到的欄位範圍，不要整張 getDataRange()——那會把21474×12格全部拉進記憶體
-  const from = Math.min.apply(null, [iOpt, iMain, iImg].filter(function(x){ return x >= 0; })) + 1;
-  const to = Math.max(iOpt, iMain, iImg) + 1;
+  // 只讀用得到的欄位範圍，不要整張 getDataRange()——那會把兩萬多列×十幾欄全部拉進記憶體
+  const cols = [iOpt, iMain, iImg, iImg1].filter(function(x){ return x >= 0; });
+  const from = Math.min.apply(null, cols) + 1;
+  const to = Math.max.apply(null, cols) + 1;
   const values = sh0.getRange(2, from, lastRow - 1, to - from + 1).getValues();
   const col = function(row, idx){ return idx < 0 ? '' : row[idx + 1 - from]; };
 
   const map = {};
-  let skipped = 0, foreign = 0;
+  let skipped = 0, foreign = 0, usedFallback = 0;
   values.forEach(function(row){
-    const img = String(col(row, iImg)||'').trim();
+    // 商品圖片1 為主，空白時才退回主商品圖片（實測有16列沒有圖片1）。
+    // 退回也比沒有圖好：行銷封面至少還看得出是哪一款商品。
+    let img = String(col(row, iImg1)||'').trim();
+    if(!img){ img = String(col(row, iImg)||'').trim(); if(img) usedFallback++; }
     if(!img){ skipped++; return; }
     if(img.indexOf(PRODUCT_IMAGE_PREFIX) !== 0){ foreign++; return; } // 網域不同就跳過，不然APP拼出來的網址是壞的
     const id = img.slice(PRODUCT_IMAGE_PREFIX.length);
@@ -1651,7 +1659,8 @@ function importProductImages_(){
   }
   sh.setColumnWidth(1, 180); sh.setColumnWidth(2, 320);
   sh.setFrozenRows(1);
-  return {ok:true, 貨號數: out.length, 無圖片略過: skipped, 網域不符略過: foreign,
+  return {ok:true, 貨號數: out.length, 用商品圖片1: out.length - usedFallback, 退回主商品圖片: usedFallback,
+          無圖片略過: skipped, 網域不符略過: foreign,
           分頁: SHEET_PRODUCT_IMAGE, gid: sh.getSheetId()};
 }
 
