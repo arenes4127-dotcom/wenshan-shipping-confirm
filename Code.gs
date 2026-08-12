@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.84';
+const BACKEND_VERSION = '2026-08-12.86';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -2158,21 +2158,21 @@ function testAmendFlow_(){
   try{
     sh.getRange('B2').setValue(orderNo);
     const loadMsg = loadOrderIntoAmendSheet_(sh, orderNo);
-    const loaded = sh.getRange(AMEND_FIRST_ROW, 1, 3, 3).getValues();
-    steps.push((loaded[0][0]==='TSKU-A' && loaded[2][2]===5 ? '✅ ' : '❌ ') + '帶出原始品項：' + loadMsg);
+    const loaded = sh.getRange(AMEND_FIRST_ROW, 1, 3, 4).getValues();
+    steps.push((loaded[0][0]==='TSKU-A' && loaded[2][3]===5 ? '✅ ' : '❌ ') + '帶出原始品項：' + loadMsg);
 
     // 沒選原因就要被擋下來——原因是要寫進出貨紀錄的，漏了等於這筆修改事後查不出所以然
-    sh.getRange(AMEND_FIRST_ROW, 5).setValue(0);
+    sh.getRange(AMEND_FIRST_ROW, 7).setValue(0);
     const noReason = applyAmendSheet_(sh, orderNo);
     steps.push((noReason.indexOf('❌')===0 && noReason.indexOf('原因')>0 ? '✅ ' : '❌ ')
       + '沒選原因被擋下：' + noReason);
 
     // 第1列：整件不出；第3列：換成別的貨號並改數量
-    sh.getRange(AMEND_FIRST_ROW, 6).setValue('缺貨不出');
-    sh.getRange(AMEND_FIRST_ROW + 2, 4).setValue('TSKU-Z');
-    sh.getRange(AMEND_FIRST_ROW + 2, 5).setValue(3);
-    sh.getRange(AMEND_FIRST_ROW + 2, 6).setValue('客人改單');
-    sh.getRange(AMEND_FIRST_ROW + 2, 7).setValue('客人來電改成綠色');
+    sh.getRange(AMEND_FIRST_ROW, 8).setValue('缺貨不出');
+    sh.getRange(AMEND_FIRST_ROW + 2, 5).setValue('TSKU-Z');
+    sh.getRange(AMEND_FIRST_ROW + 2, 7).setValue(3);
+    sh.getRange(AMEND_FIRST_ROW + 2, 8).setValue('客人改單');
+    sh.getRange(AMEND_FIRST_ROW + 2, 9).setValue('客人來電改成綠色');
     const applyMsg = applyAmendSheet_(sh, orderNo);
     steps.push((applyMsg.indexOf('✅')===0 ? '✅ ' : '❌ ') + '套用：' + applyMsg);
 
@@ -2211,7 +2211,7 @@ function testAmendFlow_(){
     steps.push('❌ 例外：' + err);
   }finally{
     ordersSh.deleteRow(testRow);
-    sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).clearContent();
+    clearAmendGrid_(sh);
     sh.getRange('B2').clearContent();
     sh.getRange('D2:D3').clearContent();
     sh.getRange('B3').setValue(false);
@@ -2250,16 +2250,16 @@ function testOnEditWiring_(){
     // 1) 模擬「在B2貼上訂單號」
     sh.getRange('B2').setValue(orderNo);
     onEdit({range: sh.getRange('B2')});
-    const loaded = sh.getRange(AMEND_FIRST_ROW, 1, 2, 3).getValues();
+    const loaded = sh.getRange(AMEND_FIRST_ROW, 1, 2, 4).getValues();
     const d2 = String(sh.getRange('D2').getValue()||'');
-    steps.push((loaded[0][0]==='TSKU-A' && loaded[1][2]===4 ? '✅ ' : '❌ ')
+    steps.push((loaded[0][0]==='TSKU-A' && loaded[1][3]===4 ? '✅ ' : '❌ ')
       + 'B2 貼訂單號 → 自動帶出品項（狀態訊息：'+d2+'）');
 
     // 2) 模擬「填好修改內容後勾選套用」
-    sh.getRange(AMEND_FIRST_ROW, 5).setValue(1);        // 甲 2→1 件
-    sh.getRange(AMEND_FIRST_ROW, 6).setValue('盤差調整');
-    sh.getRange(AMEND_FIRST_ROW + 1, 4).setValue('TSKU-Y'); // 乙 換成 Y
-    sh.getRange(AMEND_FIRST_ROW + 1, 6).setValue('商品瑕疵更換');
+    sh.getRange(AMEND_FIRST_ROW, 7).setValue(1);        // 甲 2→1 件
+    sh.getRange(AMEND_FIRST_ROW, 8).setValue('盤差調整');
+    sh.getRange(AMEND_FIRST_ROW + 1, 5).setValue('TSKU-Y'); // 乙 換成 Y
+    sh.getRange(AMEND_FIRST_ROW + 1, 8).setValue('商品瑕疵更換');
     sh.getRange('B3').setValue(true);
     onEdit({range: sh.getRange('B3')});
     const d3 = String(sh.getRange('D3').getValue()||'');
@@ -2275,9 +2275,9 @@ function testOnEditWiring_(){
     steps.push((y && y.qty===4 && y.location==='' ? '✅ ' : '❌ ') + '貨號已換且沿用原數量4、儲位已清空');
 
     // 3) 套用後工作區應該已經重新帶出改後內容、輸入欄清空（避免手滑重複套用）
-    const regrid = sh.getRange(AMEND_FIRST_ROW, 1, 2, 7).getValues();
+    const regrid = sh.getRange(AMEND_FIRST_ROW, 1, 2, 9).getValues();
     const inputsCleared = [0,1].every(function(i){
-      return [3,4,5,6].every(function(c){ return !String(regrid[i][c]||'').trim(); });
+      return [4,6,7,8].every(function(c){ return !String(regrid[i][c]||'').trim(); });
     });
     steps.push((inputsCleared ? '✅ ' : '❌ ') + '套用後四個輸入欄都已清空，不會被重複套用');
 
@@ -2289,7 +2289,7 @@ function testOnEditWiring_(){
     steps.push('❌ 例外：' + err);
   }finally{
     ordersSh.deleteRow(testRow);
-    sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).clearContent();
+    clearAmendGrid_(sh);
     sh.getRange('B2').clearContent();
     sh.getRange('D2:D3').clearContent();
     sh.getRange('B3').setValue(false);
@@ -2377,9 +2377,13 @@ function setupAmendSheet_(){
   sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
   sh.clear();
   sh.clearNotes();
+  // clear() 不會清掉資料驗證。欄位一旦挪動位置，舊的下拉選單會留在原本那一欄，
+  // 然後擋下寫進去的新內容——實際踩到的錯：原因欄從F移到H之後，
+  // 舊的驗證還留在F，寫圖片公式進F直接噴「請從清單選一個原因」，整個重建中途失敗。
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).clearDataValidations();
   try{ sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).removeCheckboxes(); }catch(e){}
 
-  sh.getRange('A1:G1').merge();
+  sh.getRange('A1:I1').merge();
   sh.getRange('A1').setValue('✏️ 訂單品項人工修改（缺貨不出／客人改單／盤差）')
     .setFontSize(14).setFontWeight('bold').setBackground('#fff2cc');
 
@@ -2390,7 +2394,7 @@ function setupAmendSheet_(){
   sh.getRange('B3').insertCheckboxes().setValue(false);
   sh.getRange('C3').setValue('← 填好右邊三欄之後勾選，勾完會自動取消勾選並顯示結果')
     .setFontColor('#666666');
-  sh.getRange('A4:G4').merge();
+  sh.getRange('A4:I4').merge();
   sh.getRange('A4').setValue([
       '填法：只改數量 → 只填「改成數量」；換商品 → 填「改成貨號」（要改數量再填數量）；',
       '整件不出 → 「改成數量」填 0；客人加購 → 直接在空白列填「改成貨號」和「改成數量」。',
@@ -2399,35 +2403,57 @@ function setupAmendSheet_(){
     .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
   sh.setRowHeight(4, 52);
 
-  const header = ['原貨號','原品名','原數量','改成貨號','改成數量','原因（下拉）','備註'];
+  // 圖片欄擺在對應貨號的右邊：換貨號時看著圖挑，不是憑貨號字串猜。
+  // 今天四筆修改全部都是「缺貨改出替代品」，正是最需要看圖的情境。
+  const header = ['原貨號','圖','原品名','原數量','改成貨號','圖','改成數量','原因（下拉）','備註'];
   sh.getRange(5, 1, 1, header.length).setValues([header])
     .setFontWeight('bold').setBackground('#f3f3f3');
   // 原因欄裝下拉選單。setAllowInvalid(false) 是刻意的：允許亂填就等於沒有選單，
   // 之後在儀表板上按原因分類統計會又回到各寫各的。
-  sh.getRange(AMEND_FIRST_ROW, 6, AMEND_MAX_ROWS, 1).setDataValidation(
+  sh.getRange(AMEND_FIRST_ROW, 8, AMEND_MAX_ROWS, 1).setDataValidation(
     SpreadsheetApp.newDataValidation()
       .requireValueInList(AMEND_REASONS, true)
       .setAllowInvalid(false)
       .setHelpText('請從清單選一個原因；細節寫在右邊的「備註」欄')
       .build()
   );
-  sh.getRange(AMEND_FIRST_ROW, 3, AMEND_MAX_ROWS, 1).setNumberFormat('0');
-  sh.getRange(AMEND_FIRST_ROW, 5, AMEND_MAX_ROWS, 1).setNumberFormat('0');
+  // 圖片用公式即時查對照表，不要在載入品項時把網址寫死進儲存格：
+  // 寫死的話「改成貨號」改了圖不會跟著換，看著舊圖做決定比沒有圖更危險。
+  // 對照表查不到就留白（IFERROR），不要顯示破圖。
+  // 用陣列拼再 join，不要一路 '+' 串：這條公式裡同時有雙引號（Excel字串）跟單引號（分頁名），
+  // 混在一起的跳脫很容易寫錯，而且錯了是公式壞掉、不是程式報錯。
+  const Q = '"';
+  const imgFormula = function(row, skuCol){
+    const cell = '$' + skuCol + row;
+    return [
+      '=IF(', cell, '=', Q, Q, ',', Q, Q, ',',
+      'IFERROR(IMAGE(', Q, PRODUCT_IMAGE_PREFIX, Q, '&',
+      'VLOOKUP(', cell, ",'", SHEET_PRODUCT_IMAGE, "'!$A:$B,2,FALSE)&", Q, '_tn', Q,
+      ',1),', Q, Q, '))'
+    ].join('');
+  };
+  for(let r = AMEND_FIRST_ROW; r < AMEND_FIRST_ROW + AMEND_MAX_ROWS; r++){
+    sh.getRange(r, 2).setFormula(imgFormula(r, 'A'));
+    sh.getRange(r, 6).setFormula(imgFormula(r, 'E'));
+    sh.setRowHeight(r, 60);   // 縮圖要看得清楚，列高不能是預設的21px
+  }
+  sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 1).setNumberFormat('0');
+  sh.getRange(AMEND_FIRST_ROW, 7, AMEND_MAX_ROWS, 1).setNumberFormat('0');
   // 貨號欄一律文字格式：有些貨號是純數字，被當成數字會掉前導零、也會變科學記號
   sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 1).setNumberFormat('@');
-  sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 1).setNumberFormat('@');
-  // 要填的四欄給底色，一眼看得出哪裡是輸入區
-  sh.getRange(AMEND_FIRST_ROW, 4, AMEND_MAX_ROWS, 4).setBackground('#fff9e6');
+  sh.getRange(AMEND_FIRST_ROW, 5, AMEND_MAX_ROWS, 1).setNumberFormat('@');
+  // 要填的四欄給底色，一眼看得出哪裡是輸入區（圖片欄是公式算的，不上底色）
+  sh.getRange(AMEND_FIRST_ROW, 5, AMEND_MAX_ROWS, 1).setBackground('#fff9e6');
+  sh.getRange(AMEND_FIRST_ROW, 7, AMEND_MAX_ROWS, 3).setBackground('#fff9e6');
 
-  [140, 300, 70, 160, 80, 200, 220].forEach(function(w, i){ sh.setColumnWidth(i+1, w); });
+  [140, 70, 300, 70, 160, 70, 80, 200, 220].forEach(function(w, i){ sh.setColumnWidth(i+1, w); });
   sh.setFrozenRows(5);
   return {ok:true, 分頁: SHEET_AMEND};
 }
 
 // 把某張訂單目前的品項帶進工作區。回傳訊息字串，直接寫在狀態欄給人看。
 function loadOrderIntoAmendSheet_(sh, orderNo){
-  const clearRange = sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7);
-  clearRange.clearContent();
+  clearAmendGrid_(sh);
   if(!orderNo) return '';
   const rows = readOrderRows();
   const row = rows.find(function(r){ return String(r.orderNo||'').trim() === orderNo; });
@@ -2435,16 +2461,28 @@ function loadOrderIntoAmendSheet_(sh, orderNo){
   if(row.status === 'shipped') return '❌ 這張訂單已經出貨，不能再改品項';
   const items = safeParse(row.itemsJson, []);
   if(!items.length) return '⚠️ 這張訂單沒有品項資料';
-  const out = items.slice(0, AMEND_MAX_ROWS).map(function(it){
-    return [it.sku||'', it.baseName || it.name || '', it.qty || 0, '', '', '', ''];
+  // B欄跟F欄是圖片公式，不能被覆蓋掉——所以分段寫入，跳過那兩欄
+  const out = items.slice(0, AMEND_MAX_ROWS);
+  out.forEach(function(it, i){
+    const row = AMEND_FIRST_ROW + i;
+    sh.getRange(row, 1).setValue(it.sku || '');
+    sh.getRange(row, 3, 1, 2).setValues([[it.baseName || it.name || '', it.qty || 0]]);
+    sh.getRange(row, 5, 1, 5).setValues([['', '', '', '', '']]);
   });
-  sh.getRange(AMEND_FIRST_ROW, 1, out.length, 7).setValues(out);
   const warn = row.status === 'scanning'
     ? '⚠️ 這張訂單正在被「'+(row.claimedBy||'?')+'」掃描中，改之前請先請他中止'
     : '';
   const prev = String(row.itemsOverrideJson||'').trim();
   const prevNote = prev && prev !== '[]' ? '（這張先前已經改過 '+safeParse(prev,[]).length+' 項，下面顯示的是改過之後的內容）' : '';
   return ('✅ 已帶出 '+out.length+' 個品項　'+warn+prevNote).trim();
+}
+
+// 清工作區但保留B、F兩欄的圖片公式。用 clearContent() 掃過整片會把公式也清掉，
+// 圖就再也不會出現了——而且畫面上只是「沒有圖」，不會有任何錯誤訊息。
+function clearAmendGrid_(sh){
+  sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 1).clearContent();
+  sh.getRange(AMEND_FIRST_ROW, 3, AMEND_MAX_ROWS, 3).clearContent();
+  sh.getRange(AMEND_FIRST_ROW, 7, AMEND_MAX_ROWS, 3).clearContent();
 }
 
 // 讀工作區、組出修改指令、寫回訂單。回傳給使用者看的結果訊息。
@@ -2460,15 +2498,16 @@ function applyAmendSheet_(sh, orderNo){
     return '❌ 這張訂單正在被「'+(row.claimedBy||'?')+'」掃描中。'
       + '現在改的話他手機上那份不會跟著變，掃到最後會對不起來——請先請他中止再改。';
   }
-  const grid = sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 7).getValues();
+  const grid = sh.getRange(AMEND_FIRST_ROW, 1, AMEND_MAX_ROWS, 9).getValues();
   const nameMap = skuNameMap_();
   const ops = [], notes = [], missingReason = [];
   grid.forEach(function(r){
+    // 欄位對應：A原貨號 B圖 C原品名 D原數量 E改成貨號 F圖 G改成數量 H原因 I備註
     const from = String(r[0]||'').trim();
-    const toSku = String(r[3]||'').trim();
-    const qtyRaw = String(r[4]===0 ? '0' : (r[4]||'')).trim();
-    const reason = String(r[5]||'').trim();
-    const memo = String(r[6]||'').trim();
+    const toSku = String(r[4]||'').trim();
+    const qtyRaw = String(r[6]===0 ? '0' : (r[6]||'')).trim();
+    const reason = String(r[7]||'').trim();
+    const memo = String(r[8]||'').trim();
     if(!toSku && qtyRaw === '') return;            // 這一列沒動過
     const qty = qtyRaw === '' ? null : Number(qtyRaw);
     if(qtyRaw !== '' && (isNaN(qty) || qty < 0)){

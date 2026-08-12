@@ -154,6 +154,19 @@
   .confirm-box .warn-line{color:#d98324;font-size:13px;line-height:1.5;margin:10px 0 16px;}
   .confirm-box .row{display:flex;gap:10px;}
   .confirm-box .row .btn{flex:1;}
+  /* 兩張圖並排：換貨、商品不符都是「這個 vs 那個」的判斷，
+     分開看要靠記憶比對，並排看一眼就知道是不是同一款。 */
+  .confirm-pair{display:flex;gap:10px;margin-bottom:12px;}
+  .confirm-pair > div{flex:1;min-width:0;text-align:center;}
+  .confirm-pair .cap{font-size:12px;color:var(--muted);margin-bottom:4px;}
+  .confirm-pair img{width:100%;aspect-ratio:1/1;object-fit:contain;
+    border-radius:8px;background:var(--panel2);}
+  .confirm-pair .miss{width:100%;aspect-ratio:1/1;border-radius:8px;background:var(--panel2);
+    display:flex;align-items:center;justify-content:center;color:var(--muted2);font-size:12px;
+    text-align:center;padding:8px;}
+  .confirm-pair .name{font-size:12px;color:var(--text);margin-top:5px;line-height:1.4;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
+  .confirm-box input[type=number]{width:100%;font-size:20px;text-align:center;margin-bottom:12px;}
 
   /* ---- flash overlay ---- */
   .flash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;
@@ -194,7 +207,9 @@
     <div class="confirm-box">
       <h3 id="confirmTitle"></h3>
       <div id="confirmPic"></div>
+      <div class="confirm-pair" id="confirmPair" style="display:none;"></div>
       <div class="meta" id="confirmMeta"></div>
+      <input type="number" id="confirmQty" style="display:none;" min="1" step="1">
       <div class="warn-line" id="confirmWarn"></div>
       <div class="row">
         <button class="btn gray" id="confirmCancel">取消</button>
@@ -668,6 +683,13 @@ function closeImgView(){
   document.getElementById('imgView').classList.remove('show');
   document.getElementById('imgViewImg').src = '';
 }
+// 只要品名字串。替換商品通常不在這張訂單上，得從其他訂單裡找；
+// 都找不到就回空字串，讓畫面顯示貨號本身，不要硬掰一個名字出來。
+function findItemNameBySku(sku){
+  const hit = findItemBySku(sku);
+  return hit ? (hit.baseName || hit.name || '') : '';
+}
+
 // 從目前掃描中的訂單、或所有訂單裡找這個貨號的品項，只為了取品名/規格來顯示
 function findItemBySku(sku){
   if(current && current.items){
@@ -1755,6 +1777,7 @@ inputBarcode.addEventListener('keydown', e=>{
     current.issueLog.push(`商品不符：條碼「${code}」不屬於此訂單`);
     errorBeep();
     flash('err','商品不符', `條碼「${code}」不屬於此訂單，請確認拿錯商品`, 1200);
+    showMismatchHelp(code);
     return;
   }
   if(item.scanned >= item.qty){
@@ -1821,7 +1844,7 @@ function checkComplete(silent){
   }
 }
 
-function confirmShortShip(sku){
+async function confirmShortShip(sku){
   if(!current) return;
   const item = current.items.find(i=>i.sku===sku);
   if(!item) return;
@@ -1842,7 +1865,23 @@ function confirmShortShip(sku){
     flash('err','這件已經掃齊了', `「${item.name}」數量已足額，不需要標記缺貨`, 1400);
     return;
   }
-  if(!confirm(`「${item.sku}／${item.spec||'-'}／${item.baseName||item.name}」\n這件缺 ${missing} 件出不了嗎？\n（標記後這張單就能完成出貨，紀錄會註明缺貨未出，不會算成掃描疏失）`)) return;
+  // 標缺貨跟「找不到條碼」是同一類的人為判定，而且錯的方向更糟：
+  // 找錯商品就宣告缺貨的話，客人平白少收一件，而紀錄上寫的是「缺貨未出」，看起來完全合理，
+  // 事後沒有人查得出來。放圖等於問一句「你剛剛找的是這個嗎？」
+  const ok = await confirmWithImage({
+    title: '標記缺貨不出',
+    sku: item.sku,
+    lines: [
+      {text: item.baseName || item.name, strong: true},
+      {text: '規格：' + (item.spec || '-')},
+      {text: '貨號：' + item.sku},
+      {text: '應出 ' + item.qty + ' 件，已掃 ' + item.scanned + ' 件，缺 ' + missing + ' 件'}
+    ],
+    warn: '請先確認貨架上找的是上圖這一款——找錯商品而標成缺貨的話，客人會平白少收一件，'
+        + '而且紀錄上看起來完全正常，事後查不出來。標記後這張單就能完成出貨，紀錄會註明缺貨未出。',
+    okText: '確定這件缺 ' + missing + ' 件'
+  });
+  if(!ok) return;
   item.shortShip = true;
   item.shortShipQty = missing;
   okBeep();
@@ -1861,7 +1900,7 @@ function confirmShortShip(sku){
 // 定位是「現場回報實際出了什麼」，不是「修改訂單」——訂單內容的權威在蝦皮/ERP，
 // 我們改了那邊也不會跟著動。所以核對基準（需求件數）維持原訂單不變，
 // 核對結果標成「換貨出貨（待客服補正）」橘燈而不是綠燈完成，提醒這張還沒真的結束。
-function confirmSubstitute(sku){
+async function confirmSubstitute(sku){
   if(!current) return;
   const item = current.items.find(i=>i.sku===sku);
   if(!item) return;
@@ -1883,14 +1922,26 @@ function confirmSubstitute(sku){
     flash('err','替換商品不能跟原商品相同', '', 1800);
     return;
   }
-  const qtyStr = prompt(`替換商品 ${subSku}\n改出幾件？`, String(item.shortShipQty||1));
-  if(qtyStr === null) return;
-  const qty = parseInt(qtyStr, 10);
-  if(isNaN(qty) || qty <= 0){
-    errorBeep();
-    flash('err','數量不正確', '', 1400);
-    return;
-  }
+  // 原本這裡是直接跳 prompt 問數量，替換商品從頭到尾沒有任何確認畫面——
+  // 掃到什麼就寫進紀錄。這是替客人做的決定，錯了是直接寄錯東西。
+  // 改成原商品與替換商品並排顯示，數量也併進同一個對話框，一次看完再決定。
+  const subName = findItemNameBySku(subSku);
+  const qty = await confirmWithImage({
+    title: '換貨：確認改出的商品',
+    pair: [
+      {caption: '原本要出（缺貨）', sku: item.sku, name: item.baseName || item.name},
+      {caption: '改出這個', sku: subSku, name: subName || subSku}
+    ],
+    lines: [
+      {text: item.sku + '　→　' + subSku, strong: true},
+      {text: '原商品缺 ' + (item.shortShipQty || 0) + ' 件'}
+    ],
+    warn: '請確認右邊是實際要寄出的商品。這筆會記成「換貨出貨（待客服補正）」，'
+        + '客服要另外到蝦皮改訂單——寄錯了客服補的也是錯的。',
+    okText: '確認改出',
+    qty: {value: item.shortShipQty || 1, min: 1}
+  });
+  if(!qty) return;
   item.substitutes = item.substitutes || [];
   item.substitutes.push({sku: subSku, qty: qty});
   current.hadSubstitute = true;
@@ -1920,6 +1971,39 @@ function adjustScanned(sku){
 // 商品本身沒貼條碼掃不到時的手動核對：一次只確認一件（跟正常掃描一樣一件一件累加，
 // 不是直接把數量設到滿），避免包貨人員一次按太多次不小心多算。會記錄進差異明細方便事後稽核，
 // 跟真的掃描出錯（hadIssue）分開用 hadNoBarcodeConfirm 標記，不會混在一起稀釋「曾觸發警示」的意義。
+// 掃到不屬於這張訂單的條碼時，把「你掃到的」跟「這張單還沒掃完的」並排給人看。
+// 起因是今天的實例：掃 4715463030582 被判商品不符，實際上那是 3065PK230 / 3065PC230
+// ——同一罐瓦斯的兩個貨號。看得到圖的話一秒就知道是同款、可以走無條碼核對，
+// 而不是當成拿錯商品、最後留下一筆🔴錯誤紀錄。
+// 只在「掃到的條碼查得出是什麼商品」時才跳，查不出來就維持原本的錯誤提示就好：
+// 沒有圖可比的對話框只是多一個要關掉的東西。
+function showMismatchHelp(code){
+  const scannedSkus = barcodeMap[code] || [];
+  const scannedSku = scannedSkus.find(function(x){ return productImageUrl(x, false); }) || scannedSkus[0];
+  if(!scannedSku && !productImageUrl(code, false)) return;
+  const shownSku = scannedSku || code;
+  // 訂單上還沒掃齊的品項才有比對的意義——已經掃完的不可能是他現在手上這件
+  const pending = current.items.filter(function(i){ return i.scanned < i.qty && !i.shortShip; });
+  const target = pending[0] || current.items[0];
+  if(!target) return;
+  confirmWithImage({
+    title: '商品不符：是不是同一款的不同貨號？',
+    pair: [
+      {caption: '你掃到的', sku: shownSku, name: findItemNameBySku(shownSku) || shownSku},
+      {caption: '這張單還缺', sku: target.sku, name: target.baseName || target.name}
+    ],
+    lines: [
+      {text: '掃到條碼：' + code},
+      {text: '對應貨號：' + shownSku},
+      {text: pending.length > 1 ? ('這張單還有 ' + pending.length + ' 項未掃完，右邊只是其中一項') : ''}
+    ].filter(function(l){ return l.text; }),
+    warn: '如果兩邊其實是同一款商品（同款不同貨號），請關掉這個視窗、改用該品項的「找不到條碼」手動核對。'
+        + '如果不是同一款，就是拿錯商品，請放回去重拿。',
+    okText: '我知道了',
+    hideCancel: true
+  });
+}
+
 // 帶商品圖的確認對話框。回傳 Promise<boolean>，用法跟 confirm() 一樣但是非同步。
 // 圖用原圖不用縮圖：這個對話框的整個目的就是讓人看清楚商品長什麼樣，
 // 縮圖在這裡剛好把要判斷的細節糊掉。
@@ -1928,19 +2012,52 @@ function confirmWithImage(opt){
     const mask = document.getElementById('confirmMask');
     document.getElementById('confirmTitle').textContent = opt.title || '請確認';
     const picBox = document.getElementById('confirmPic');
+    const pairBox = document.getElementById('confirmPair');
+    const qtyInput = document.getElementById('confirmQty');
     picBox.textContent = '';
-    const url = productImageUrl(opt.sku, false);
-    if(url){
-      const img = document.createElement('img');
-      img.className = 'pic';
-      img.src = url;
-      img.alt = '';
-      picBox.appendChild(img);
-    } else {
-      const box = document.createElement('div');
-      box.className = 'pic miss';
-      box.textContent = '（這個商品沒有圖片資料）';
-      picBox.appendChild(box);
+    pairBox.textContent = '';
+    pairBox.style.display = 'none';
+    qtyInput.style.display = 'none';
+    // 單張圖（opt.sku）跟並排兩張圖（opt.pair）二擇一
+    if(opt.pair && opt.pair.length){
+      pairBox.style.display = 'flex';
+      opt.pair.forEach(function(p){
+        const wrap = document.createElement('div');
+        const cap = document.createElement('div');
+        cap.className = 'cap';
+        cap.textContent = p.caption || '';
+        wrap.appendChild(cap);
+        const url = productImageUrl(p.sku, false);
+        if(url){
+          const img = document.createElement('img');
+          img.src = url; img.alt = '';
+          wrap.appendChild(img);
+        } else {
+          const miss = document.createElement('div');
+          miss.className = 'miss';
+          miss.textContent = p.sku ? '無圖片資料' : '（未知商品）';
+          wrap.appendChild(miss);
+        }
+        const nm = document.createElement('div');
+        nm.className = 'name';
+        nm.textContent = p.name || p.sku || '';
+        wrap.appendChild(nm);
+        pairBox.appendChild(wrap);
+      });
+    } else if(opt.sku !== undefined){
+      const url = productImageUrl(opt.sku, false);
+      if(url){
+        const img = document.createElement('img');
+        img.className = 'pic';
+        img.src = url;
+        img.alt = '';
+        picBox.appendChild(img);
+      } else {
+        const box = document.createElement('div');
+        box.className = 'pic miss';
+        box.textContent = '（這個商品沒有圖片資料）';
+        picBox.appendChild(box);
+      }
     }
     // 用 DOM 組不用 innerHTML：品名/規格是外部資料，拼進 innerHTML 等於當程式碼看待
     const meta = document.getElementById('confirmMeta');
@@ -1958,6 +2075,17 @@ function confirmWithImage(opt){
     const okBtn = document.getElementById('confirmOk');
     const cancelBtn = document.getElementById('confirmCancel');
     okBtn.textContent = opt.okText || '確定';
+    // 純提示用的對話框只有一個出口，不要擺一顆「取消」在旁邊——
+    // 兩顆按鈕會讓人以為有得選，實際上按哪顆結果都一樣。
+    cancelBtn.style.display = opt.hideCancel ? 'none' : '';
+    // 需要輸入數量時（換貨改出幾件）就把數字欄叫出來，用同一個對話框，
+    // 不要再跳一個 prompt()——那等於把剛看完圖的判斷跟數字輸入拆成兩個畫面。
+    if(opt.qty){
+      qtyInput.style.display = '';
+      qtyInput.value = String(opt.qty.value || 1);
+      qtyInput.min = String(opt.qty.min || 1);
+      if(opt.qty.max) qtyInput.max = String(opt.qty.max);
+    }
     function close(answer){
       mask.classList.remove('show');
       okBtn.onclick = null; cancelBtn.onclick = null; mask.onclick = null;
@@ -1965,12 +2093,25 @@ function confirmWithImage(opt){
       setTimeout(function(){ if(inputBarcode && current) inputBarcode.focus(); }, 30);
       resolve(answer);
     }
-    okBtn.onclick = function(){ close(true); };
+    okBtn.onclick = function(){
+      if(opt.qty){
+        const n = parseInt(qtyInput.value, 10);
+        if(isNaN(n) || n <= 0 || (opt.qty.max && n > opt.qty.max)){
+          errorBeep();
+          flash('err', '數量不正確', opt.qty.max ? ('請輸入 1 ~ ' + opt.qty.max + ' 之間的數字') : '請輸入大於0的數字', 1600);
+          return;   // 不關對話框，讓人直接改
+        }
+        close(n);   // 有數量時回傳數字，沒有時回傳 true
+        return;
+      }
+      close(true);
+    };
     cancelBtn.onclick = function(){ close(false); };
     // 點外框關閉＝取消。不做成點外框確認，誤觸的代價不對等：
     // 誤按確定會讓一件沒真的核對過的商品被記成已核對。
     mask.onclick = function(e){ if(e.target === mask) close(false); };
     mask.classList.add('show');
+    if(opt.qty) setTimeout(function(){ qtyInput.focus(); qtyInput.select(); }, 60);
   });
 }
 
