@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.78';
+const BACKEND_VERSION = '2026-08-12.81';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -180,6 +180,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   testStaleClaimRelease_: () => testStaleClaimRelease_(),
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
   archiveShippedOrders_: () => archiveShippedOrders_(),
+  appendDailyStats_: () => appendDailyStats_(),
   previewArchiveShippedOrders_: () => previewArchiveShippedOrders_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
@@ -591,6 +592,110 @@ function parseOrderDate_(raw){
 // 「訂單」分頁裡還沒出貨的訂單完全不受影響，繼續留著等下一個營業日被掃描（週末/假日也一樣）。
 // 同名檔案已存在就先丟垃圾桶再建新的，同一天重跑不會留下好幾份重複的備份檔。
 const SHIPPING_LOG_BACKUP_FOLDER_ID = '1fC7kFv-6ozYmrY1S_up55R_yslcu2qYE';
+// ---------------- 每日統計：把當天的儀表板數字留成一列 ----------------
+// 儀表板只看得到「現在」。出貨紀錄每晚清空、來源鏡像每晚重置，所以今天的數字
+// 過了20:30就永遠問不到了——想知道上週三出了幾張、品質如何，現在完全查不出來。
+// 每天備份出貨紀錄的同時，把當天的儀表板數字追加一列，久了就是一張趨勢表。
+//
+// 取值方式刻意用「找標籤」而不是寫死儲存格位置：這張儀表板的版面今天就搬過兩次，
+// 寫死列號的話搬完照抄還是會抄到，而且抄到的是別的指標的數字——不會報錯、只是靜靜地錯。
+// 找不到標籤就留白，寧可少一格也不要填一個錯的數字進歷史紀錄。
+const SHEET_DAILY_STATS = '每日統計';
+// 標籤 → 這一欄在每日統計表裡的名稱。順序就是欄位順序。
+const DAILY_STAT_FIELDS = [
+  ['今日新進訂單', '新進訂單'],
+  ['今日已出貨（張）', '已出貨(張)'],
+  ['今日出貨（件）', '出貨(件)'],
+  ['今日掃描品項列數', '掃描品項列數'],
+  ['今日已進物流籃', '已進物流籃'],
+  ['今日未進物流籃', '未進物流籃'],
+  ['今日換貨待補正', '換貨待補正'],
+  ['今日應出（單）', '應出(單)'],
+  ['未出（單）-文山 ⚠含前期', '未出-文山(含前期)'],
+  ['未出（單）-調撥 ⚠含前期', '未出-調撥(含前期)'],
+  ['今日山物出（單）', '山物出(單)'],
+  ['今日中華宅配（單）', '中華宅配(單)'],
+  ['完成 🟢', '品質-完成'],
+  ['錯誤 🔴', '品質-錯誤'],
+  ['待核對 🔵', '品質-待核對'],
+  ['人工修正數量', '品質-人工修正數量'],
+  // 出貨總張數是從「出貨紀錄」算的，已出貨(張)是從「訂單」分頁算的，兩個來源不同。
+  // 兩者通常相等，不等的時候差額是有意義的：出貨後才被標人工結案的訂單會算進前者、
+  // 不算進後者（實例：260807QQ9EFPVJ 今天出貨後被標了「出貨完成」）。
+  // 兩個都留著，之後看歷史才查得出哪一天有這種情況、差了幾張。
+  ['出貨總張數', '出貨總張數(紀錄)'],
+  ['待出貨', '收盤待出貨'],
+  ['　└ 文山', '收盤待出貨-文山'],
+  ['　└ 調撥（待調入）', '收盤待出貨-調撥'],
+  ['　└ 缺貨', '收盤待出貨-缺貨'],
+  ['掃描中', '收盤掃描中'],
+  ['已進物流籃未結案', '已進物流籃未結案']
+];
+
+// 掃描儀表板上「標籤在左、數字在右」的那幾組欄位，做成 標籤→值 的對照。
+// 概況區(A/B)、當日數據(D/E)、出貨品質(G/H) 三組都是這個結構。
+function readDashboardLabels_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_DASHBOARD);
+  if(!sh) return null;
+  SpreadsheetApp.flush(); // 先讓公式算完，不然可能讀到上一次的值
+  const rows = Math.min(sh.getLastRow(), 40);
+  if(rows < 2) return null;
+  const values = sh.getRange(1, 1, rows, 8).getDisplayValues();
+  const map = {};
+  values.forEach(function(row){
+    [[0,1], [3,4], [6,7]].forEach(function(pair){
+      const label = String(row[pair[0]]||'').trim();
+      const value = String(row[pair[1]]||'').trim();
+      if(label && value !== '' && map[label] === undefined) map[label] = value;
+    });
+  });
+  return map;
+}
+
+function appendDailyStats_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const labels = readDashboardLabels_();
+  if(!labels) return {ok:false, error:'讀不到儀表板'};
+  const tz = ss.getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd');
+
+  let sh = ss.getSheetByName(SHEET_DAILY_STATS);
+  if(!sh){
+    sh = ss.insertSheet(SHEET_DAILY_STATS);
+    sh.getRange(1, 1, 1, DAILY_STAT_FIELDS.length + 2)
+      .setValues([['日期', '記錄時間'].concat(DAILY_STAT_FIELDS.map(function(f){ return f[1]; }))])
+      .setFontWeight('bold').setBackground('#f3f3f3');
+    sh.setFrozenRows(1);
+    sh.setFrozenColumns(1);
+    sh.setColumnWidth(1, 100); sh.setColumnWidth(2, 80);
+  }
+  // 同一天重複執行就覆蓋那一列，不要多寫一列——手動補跑或觸發器重試都可能發生，
+  // 一天兩列會讓之後任何加總、平均都默默算錯。
+  const lastRow = sh.getLastRow();
+  const existing = lastRow >= 2
+    ? sh.getRange(2, 1, lastRow - 1, 1).getDisplayValues().map(function(r){ return String(r[0]||'').trim(); })
+    : [];
+  const hitIdx = existing.indexOf(today);
+  const targetRow = hitIdx >= 0 ? hitIdx + 2 : lastRow + 1;
+
+  const missing = [];
+  const row = [today, Utilities.formatDate(new Date(), tz, 'HH:mm')].concat(
+    DAILY_STAT_FIELDS.map(function(f){
+      // 標籤兩邊都要用同一套 trim 再比：儀表板上的子項目是用全形空格縮排的
+      // （「　└ 文山」），而 JS 的 trim() 會把全形空格也吃掉，
+      // 兩邊不一致就會三個子項目全部抓不到值——第一次跑就踩到了。
+      const v = labels[f[0].trim()];
+      if(v === undefined){ missing.push(f[0]); return ''; }
+      const n = Number(String(v).replace(/,/g, ''));
+      return isNaN(n) ? v : n;   // 數字就存成數字，之後才畫得出圖
+    })
+  );
+  sh.getRange(targetRow, 1, 1, row.length).setValues([row]);
+  sh.getRange(targetRow, 1).setNumberFormat('@');
+  return {ok:true, 日期: today, 覆蓋既有列: hitIdx >= 0, 列: targetRow,
+          找不到的標籤: missing};
+}
+
 function backupAndClearShippingLog_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(SHEET_LOG);
@@ -598,6 +703,17 @@ function backupAndClearShippingLog_(){
   const lastRow = sh.getLastRow();
   const lastCol = sh.getLastColumn();
   if(lastRow < 2){ Logger.log('出貨紀錄目前沒有資料，略過備份與清空'); return; }
+
+  // 順序很重要：一定要在清空出貨紀錄「之前」把當天數字記下來。
+  // 本日出貨張數/件數/品質分佈全都是從出貨紀錄算的，清掉之後這些數字就永遠回不來了。
+  // 包在 try 裡：統計失敗不該連帶讓備份跟清空也不做，那會讓明天的資料疊在今天的上面。
+  try{
+    const stats = appendDailyStats_();
+    Logger.log('每日統計：' + JSON.stringify(stats));
+  }catch(err){
+    Logger.log('每日統計寫入失敗（不影響備份）：' + err);
+    try{ appendSysLog_('每日統計寫入失敗', '', '', String(err)); }catch(e){}
+  }
 
   const tz = ss.getSpreadsheetTimeZone();
   const fileName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_已出貨備份';
@@ -611,6 +727,25 @@ function backupAndClearShippingLog_(){
   const backupSh = backupSs.getSheets()[0];
   backupSh.setName(SHEET_LOG);
   backupSh.getRange(1, 1, allValues.length, lastCol).setValues(allValues);
+  // 備份檔另開一頁放當天的儀表板數字：光看幾百列出貨明細看不出「這天整體如何」，
+  // 而備份檔常常是事後唯一還留著的東西。
+  try{
+    const labels = readDashboardLabels_();
+    if(labels){
+      const statSh = backupSs.insertSheet('當日儀表板');
+      const rows = [['指標', '數值']].concat(
+        DAILY_STAT_FIELDS.map(function(f){
+          const v = labels[f[0].trim()];
+          return [f[1], v === undefined ? '' : v];
+        })
+      );
+      statSh.getRange(1, 1, rows.length, 2).setValues(rows);
+      statSh.getRange(1, 1, 1, 2).setFontWeight('bold').setBackground('#f3f3f3');
+      statSh.setColumnWidth(1, 200);
+    }
+  }catch(err){
+    Logger.log('備份檔的儀表板頁寫入失敗（不影響出貨紀錄備份）：' + err);
+  }
   const backupFile = DriveApp.getFileById(backupSs.getId());
   folder.addFile(backupFile);
   DriveApp.getRootFolder().removeFile(backupFile); // 只留在指定資料夾，不要同時出現在雲端硬碟根目錄
