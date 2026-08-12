@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.83';
+const BACKEND_VERSION = '2026-08-12.84';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1321,29 +1321,32 @@ function setupDashboardSheet_(){
   sh.getRange('J6').setFormula(
     `=ARRAY_CONSTRAIN(IFERROR(${flagged},"目前沒有需要注意的紀錄"),12,4)`
   );
-  // 續接區。用 QUERY 的 offset 跳過前12筆——CHOOSEROWS 在筆數不足時會整個回錯誤，
+  // 續接區：第13筆以後全部列出來，不設上限。Q欄以右往下沒有別的區塊，
+  // 愛長多長都不會蓋到東西——左邊那一區之所以要限制12列，是因為第22列就是別的區塊。
+  // 用 QUERY 的 offset 跳過前12筆：CHOOSEROWS 在筆數不足時會整個回錯誤，
   // offset 少於總筆數時只是回空的，剛好是這裡要的行為（沒有第13筆就什麼都不顯示）。
-  sectionTitle('Q4:T4', '　（續）13~24 筆');
+  sectionTitle('Q4:T4', '　（續）第 13 筆以後');
   sh.getRange('Q5:T5').setValues(flaggedHeader).setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('Q6').setFormula(
-    `=ARRAY_CONSTRAIN(IFERROR(QUERY(${flagged},"offset 12",0),""),12,4)`
-  );
-  // 超過24筆才出現的提示。寫成公式而不是固定文字：沒有溢位時整格是空的，
+  sh.getRange('Q6').setFormula(`=IFERROR(QUERY(${flagged},"offset 12",0),"")`);
+  // 左邊滿12筆時指路到右邊。寫成公式而不是固定文字：沒有溢位時整格是空的，
   // 不會有一行永遠掛在那裡講一件今天沒發生的事。
   sh.getRange('J18').setFormula(
-    `=IF(IFERROR(ROWS(${flagged}),0)>24,"⚠ 還有 "&(ROWS(${flagged})-24)&" 筆未顯示，完整內容請看「出貨紀錄」分頁","")`
+    `=IF(IFERROR(ROWS(${flagged}),0)>12,"↗ 第13筆以後接在右邊（Q欄起），共 "&ROWS(${flagged})&" 筆","")`
   );
   sh.getRange('J18').setFontSize(9).setFontColor('#999999');
 
   // ---- 6. 本日訂單修改（J40 起）----
   // 人工改過的訂單要能一眼看到是誰、改了什麼、為什麼——這是所有「出貨內容跟原訂單不一樣」
   // 的源頭，客訴回頭查的第一站。資料直接讀系統紀錄，不另外存一份，避免兩邊對不起來。
-  sectionTitle('J36:O36', '✏️ 本日訂單修改（缺貨／改單／盤差）');
-  sh.getRange('J37:L37').setValues([['時間','訂單號','修改內容（含原因）']])
+  // 位置跟左邊的「各賣場」對齊（同樣第22列起）：兩區都是「當天的分解」，
+  // 擺在同一條水平線上，一眼掃過去是同一層資訊。
+  // 這一區底下（J欄第24列以後）沒有別的區塊，所以也不用限制筆數。
+  sectionTitle('J22:O22', '✏️ 本日訂單修改（缺貨／改單／盤差）');
+  sh.getRange('J23:L23').setValues([['時間','訂單號','修改內容（含原因）']])
     .setFontWeight('bold').setBackground('#f3f3f3');
-  sh.getRange('J38').setFormula(
-    `=ARRAY_CONSTRAIN(IFERROR(CHOOSECOLS(FILTER(${SY}!$A$2:$E,${SY}!$B$2:$B="訂單品項人工修改",`
-    + `LEFT(${SY}!$A$2:$A,10)=TEXT(TODAY(),"yyyy/MM/dd")),1,3,5),"（今日尚無訂單修改）"),20,3)`
+  sh.getRange('J24').setFormula(
+    `=IFERROR(CHOOSECOLS(FILTER(${SY}!$A$2:$E,${SY}!$B$2:$B="訂單品項人工修改",`
+    + `LEFT(${SY}!$A$2:$A,10)=TEXT(TODAY(),"yyyy/MM/dd")),1,3,5),"（今日尚無訂單修改）")`
   );
 
   // ---- 版面 ----
