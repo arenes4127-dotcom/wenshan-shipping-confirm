@@ -135,6 +135,26 @@
   .imgview .cap{color:#fff;font-size:15px;text-align:center;max-width:640px;line-height:1.5;}
   .imgview .hintline{color:rgba(255,255,255,.6);font-size:12px;}
 
+  /* ---- 帶圖片的確認對話框 ---- */
+  /* 「找不到條碼」是整套流程裡唯一沒有機器把關的一步——按下去就等於用肉眼認定
+     手上這件就是訂單上那件。原生 confirm() 只能顯示文字，而同款不同色的品名幾乎一樣，
+     光讀文字很容易按錯。這裡把商品圖一起放進對話框，讓人「看著圖」做這個決定。 */
+  .confirm-mask{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1100;
+    display:none;align-items:center;justify-content:center;padding:20px;}
+  .confirm-mask.show{display:flex;}
+  .confirm-box{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+    padding:18px;max-width:460px;width:100%;max-height:92vh;overflow:auto;}
+  .confirm-box h3{margin:0 0 12px;font-size:17px;}
+  .confirm-box .pic{display:block;width:100%;max-height:44vh;object-fit:contain;
+    border-radius:8px;background:var(--panel2);margin-bottom:12px;}
+  .confirm-box .pic.miss{display:flex;align-items:center;justify-content:center;
+    height:120px;color:var(--muted2);font-size:13px;}
+  .confirm-box .meta{font-size:14px;line-height:1.6;margin-bottom:6px;}
+  .confirm-box .meta b{font-size:16px;}
+  .confirm-box .warn-line{color:#d98324;font-size:13px;line-height:1.5;margin:10px 0 16px;}
+  .confirm-box .row{display:flex;gap:10px;}
+  .confirm-box .row .btn{flex:1;}
+
   /* ---- flash overlay ---- */
   .flash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;
     z-index:999;pointer-events:none;opacity:0;transition:opacity .08s;text-align:center;padding:20px;}
@@ -169,6 +189,19 @@
     <div class="badge" id="pendingBadge">0 張待出貨</div>
     <div class="staff-chip">包貨：<b id="headerStaffName">未選擇</b></div>
   </header>
+
+  <div class="confirm-mask" id="confirmMask">
+    <div class="confirm-box">
+      <h3 id="confirmTitle"></h3>
+      <div id="confirmPic"></div>
+      <div class="meta" id="confirmMeta"></div>
+      <div class="warn-line" id="confirmWarn"></div>
+      <div class="row">
+        <button class="btn gray" id="confirmCancel">取消</button>
+        <button class="btn" id="confirmOk">確定</button>
+      </div>
+    </div>
+  </div>
 
   <div class="imgview" id="imgView" onclick="closeImgView()">
     <img id="imgViewImg" alt="">
@@ -1887,7 +1920,61 @@ function adjustScanned(sku){
 // 商品本身沒貼條碼掃不到時的手動核對：一次只確認一件（跟正常掃描一樣一件一件累加，
 // 不是直接把數量設到滿），避免包貨人員一次按太多次不小心多算。會記錄進差異明細方便事後稽核，
 // 跟真的掃描出錯（hadIssue）分開用 hadNoBarcodeConfirm 標記，不會混在一起稀釋「曾觸發警示」的意義。
-function confirmNoBarcode(sku){
+// 帶商品圖的確認對話框。回傳 Promise<boolean>，用法跟 confirm() 一樣但是非同步。
+// 圖用原圖不用縮圖：這個對話框的整個目的就是讓人看清楚商品長什麼樣，
+// 縮圖在這裡剛好把要判斷的細節糊掉。
+function confirmWithImage(opt){
+  return new Promise(function(resolve){
+    const mask = document.getElementById('confirmMask');
+    document.getElementById('confirmTitle').textContent = opt.title || '請確認';
+    const picBox = document.getElementById('confirmPic');
+    picBox.textContent = '';
+    const url = productImageUrl(opt.sku, false);
+    if(url){
+      const img = document.createElement('img');
+      img.className = 'pic';
+      img.src = url;
+      img.alt = '';
+      picBox.appendChild(img);
+    } else {
+      const box = document.createElement('div');
+      box.className = 'pic miss';
+      box.textContent = '（這個商品沒有圖片資料）';
+      picBox.appendChild(box);
+    }
+    // 用 DOM 組不用 innerHTML：品名/規格是外部資料，拼進 innerHTML 等於當程式碼看待
+    const meta = document.getElementById('confirmMeta');
+    meta.textContent = '';
+    (opt.lines || []).forEach(function(line){
+      const div = document.createElement('div');
+      if(line.strong){
+        const b = document.createElement('b');
+        b.textContent = line.text;
+        div.appendChild(b);
+      } else div.textContent = line.text;
+      meta.appendChild(div);
+    });
+    document.getElementById('confirmWarn').textContent = opt.warn || '';
+    const okBtn = document.getElementById('confirmOk');
+    const cancelBtn = document.getElementById('confirmCancel');
+    okBtn.textContent = opt.okText || '確定';
+    function close(answer){
+      mask.classList.remove('show');
+      okBtn.onclick = null; cancelBtn.onclick = null; mask.onclick = null;
+      // 對話框關掉之後要把焦點還給條碼輸入框，不然掃描槍掃出來的字會沒地方去
+      setTimeout(function(){ if(inputBarcode && current) inputBarcode.focus(); }, 30);
+      resolve(answer);
+    }
+    okBtn.onclick = function(){ close(true); };
+    cancelBtn.onclick = function(){ close(false); };
+    // 點外框關閉＝取消。不做成點外框確認，誤觸的代價不對等：
+    // 誤按確定會讓一件沒真的核對過的商品被記成已核對。
+    mask.onclick = function(e){ if(e.target === mask) close(false); };
+    mask.classList.add('show');
+  });
+}
+
+async function confirmNoBarcode(sku){
   if(!current) return;
   const item = current.items.find(i=>i.sku===sku);
   if(!item) return;
@@ -1896,7 +1983,20 @@ function confirmNoBarcode(sku){
     flash('err','數量超過', `「${item.name}」已達應出數量，請勿重複確認`, 1200);
     return;
   }
-  if(!confirm(`「${item.sku}／${item.spec||'-'}／${item.baseName||item.name}」\n確定要手動核對這一件嗎？\n（商品沒貼條碼才用這個，會記錄在差異明細供事後稽核）`)) return;
+  const ok = await confirmWithImage({
+    title: '找不到條碼：手動核對這一件',
+    sku: item.sku,
+    lines: [
+      {text: item.baseName || item.name, strong: true},
+      {text: '規格：' + (item.spec || '-')},
+      {text: '貨號：' + item.sku},
+      {text: '應出 ' + item.qty + ' 件，已核 ' + item.scanned + ' 件'}
+    ],
+    warn: '請比對實體商品與上圖是否為同一款，並確認規格（顏色／尺寸）相符——'
+        + '同款不同色共用同一張圖，圖片只能確認款式。確定後會記錄在差異明細供事後稽核。',
+    okText: '確認是這一件'
+  });
+  if(!ok) return;
   item.scanned++;
   item.noBarcodeCount = (item.noBarcodeCount||0) + 1; // 這個品項本身被無條碼手動核對過幾件，差異明細會記在它自己那一列
   current.hadNoBarcodeConfirm = true;
