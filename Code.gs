@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-11.69';
+const BACKEND_VERSION = '2026-08-12.72';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -160,6 +160,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   testAmendFlow_: () => testAmendFlow_(),
   testOnEditWiring_: () => testOnEditWiring_(),
   cleanupTestSysLogRows_: () => cleanupTestSysLogRows_(),
+  testFlaggedSpill_: () => testFlaggedSpill_(),
   dailyMaintenance_: () => dailyMaintenance_(),
   findScriptProjects_: () => findScriptProjects_(),
   inspectSourceSpreadsheet_: (arg) => inspectSourceSpreadsheet_(arg),
@@ -1113,17 +1114,30 @@ function setupDashboardSheet_(){
   // ---- 6. 需要注意的出貨紀錄（J13 起，往下長）----
   // 直接用核對結果裡的燈號來篩：紅燈(錯誤)或橘燈(有人工介入)的才列出來，
   // 不用再自己組一堆條件，燈號本身就是既有的分類結果。
-  sectionTitle('J4:O4', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）');
-  sh.getRange('J5:M5').setValues([['訂單號','包貨人員','核對結果','差異明細']])
-    .setFontWeight('bold').setBackground('#f3f3f3');
-  // 限制最多12列（第6~17列）。這一區的FILTER本來是無上限往下長的，
-  // 下面第22列就是各賣場區塊，出貨異常多的那天會直接被它蓋掉。
+  // 這一區只有12列的高度可用（第6~17列，第22列就是各賣場區塊，長過頭會直接蓋掉它），
+  // 但出貨異常多的那天不只12筆。與其叫人自己去翻「出貨紀錄」分頁，不如往右邊接著排：
+  // 第13~24筆放在 Q~T 欄，同樣12列。想看的人往右捲就好，不用切分頁、不用自己再篩一次。
+  const flagged = `FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
+    + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U)))`;
+  const flaggedHeader = [['訂單號','包貨人員','核對結果','差異明細']];
+  sectionTitle('J4:O4', '⚠️ 本日需注意的出貨紀錄（紅燈／橘燈）　1~12 筆');
+  sh.getRange('J5:M5').setValues(flaggedHeader).setFontWeight('bold').setBackground('#f3f3f3');
   sh.getRange('J6').setFormula(
-    `=ARRAY_CONSTRAIN(IFERROR(FILTER({${G}!$B$2:$B,${G}!$L$2:$L,${G}!$U$2:$U,${G}!$W$2:$W},${G}!$R$2:$R>0,`
-    + `ISNUMBER(SEARCH("🔴",${G}!$U$2:$U))+ISNUMBER(SEARCH("🟠",${G}!$U$2:$U))),"目前沒有需要注意的紀錄"),12,4)`
+    `=ARRAY_CONSTRAIN(IFERROR(${flagged},"目前沒有需要注意的紀錄"),12,4)`
   );
-  sh.getRange('J18').setValue('（超過12筆時只顯示前12筆，完整內容請看「出貨紀錄」分頁）')
-    .setFontSize(9).setFontColor('#999999');
+  // 續接區。用 QUERY 的 offset 跳過前12筆——CHOOSEROWS 在筆數不足時會整個回錯誤，
+  // offset 少於總筆數時只是回空的，剛好是這裡要的行為（沒有第13筆就什麼都不顯示）。
+  sectionTitle('Q4:T4', '　（續）13~24 筆');
+  sh.getRange('Q5:T5').setValues(flaggedHeader).setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange('Q6').setFormula(
+    `=ARRAY_CONSTRAIN(IFERROR(QUERY(${flagged},"offset 12",0),""),12,4)`
+  );
+  // 超過24筆才出現的提示。寫成公式而不是固定文字：沒有溢位時整格是空的，
+  // 不會有一行永遠掛在那裡講一件今天沒發生的事。
+  sh.getRange('J18').setFormula(
+    `=IF(IFERROR(ROWS(${flagged}),0)>24,"⚠ 還有 "&(ROWS(${flagged})-24)&" 筆未顯示，完整內容請看「出貨紀錄」分頁","")`
+  );
+  sh.getRange('J18').setFontSize(9).setFontColor('#999999');
 
   // ---- 6. 本日訂單修改（J40 起）----
   // 人工改過的訂單要能一眼看到是誰、改了什麼、為什麼——這是所有「出貨內容跟原訂單不一樣」
@@ -1144,6 +1158,8 @@ function setupDashboardSheet_(){
   sh.setColumnWidth(7, 145); sh.setColumnWidth(8, 100); // G欄放出貨品質標籤
   sh.setColumnWidth(9, 24);
   sh.setColumnWidth(10, 105); sh.setColumnWidth(11, 85); sh.setColumnWidth(14, 75); sh.setColumnWidth(15, 75);
+  sh.setColumnWidth(16, 24); // P：續接區前面的間隔欄
+  sh.setColumnWidth(17, 105); sh.setColumnWidth(18, 85); sh.setColumnWidth(19, 260); sh.setColumnWidth(20, 340); // Q~T：需注意續接區
   sh.setColumnWidth(12, 260); sh.setColumnWidth(13, 340);
   sh.getRange('B5:B13').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('E5:E16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
@@ -1181,15 +1197,21 @@ function setupDashboardSheet_(){
 // 驗證用：把儀表板算完的實際顯示值原封不動回傳，用來確認公式有沒有算錯／標題有沒有掉。
 // （用試算表的CSV匯出檢查會踩到型別推斷的坑：整欄是數字時，同一欄的文字標題會被匯出成空白，
 // 看起來像標題不見了，其實只是匯出格式的問題——所以要直接讀儲存格才算數。）
+// 1→A、27→AA。debug輸出用，欄號超過26時用 String.fromCharCode(65+j) 會跑出 [ \ ] 之類的符號。
+function colLetter_(n){
+  let out = '';
+  while(n > 0){ const r = (n - 1) % 26; out = String.fromCharCode(65 + r) + out; n = (n - 1 - r) / 26; }
+  return out;
+}
 function debugReadDashboard_(){
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_DASHBOARD);
   if(!sh) return {error:'找不到儀表板分頁'};
-  const values = sh.getRange(1, 1, 50, 16).getDisplayValues();
+  const values = sh.getRange(1, 1, 50, 20).getDisplayValues();
   const out = [];
   values.forEach((row, i)=>{
     const cells = [];
     row.forEach((v, j)=>{
-      if(String(v).trim()) cells.push(String.fromCharCode(65+j) + (i+1) + '=' + v);
+      if(String(v).trim()) cells.push(colLetter_(j+1) + (i+1) + '=' + v);
     });
     if(cells.length) out.push(cells.join('  |  '));
   });
@@ -1853,6 +1875,61 @@ function cleanupTestSysLogRows_(){
     if(String(values[i][0]||'').indexOf('TEST-') === 0){ sh.deleteRow(i + 2); removed++; }
   }
   return removed;
+}
+
+// 「需注意」改成往右續接之後，第13~24筆用 QUERY 的 offset 取。
+// 這種公式最容易在邊界出事：沒有資料時 QUERY 會不會噴 #VALUE、剛好12筆時續接區
+// 是不是真的空的、超過24筆時提示會不會出現——用真的資料在暫存分頁上跑一遍，
+// 不要等某天出貨爆量才在正式儀表板上發現。跑完把暫存分頁刪掉。
+function testFlaggedSpill_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const name = '__spill_test';
+  const old = ss.getSheetByName(name);
+  if(old) ss.deleteSheet(old);
+  const sh = ss.insertSheet(name);
+  const steps = [];
+  try{
+    const src = `FILTER($A$2:$D,$A$2:$A<>"")`;
+    sh.getRange('F1').setFormula(`=ARRAY_CONSTRAIN(IFERROR(${src},"目前沒有需要注意的紀錄"),12,4)`);
+    sh.getRange('L1').setFormula(`=ARRAY_CONSTRAIN(IFERROR(QUERY(${src},"offset 12",0),""),12,4)`);
+    sh.getRange('R1').setFormula(
+      `=IF(IFERROR(ROWS(${src}),0)>24,"⚠ 還有 "&(ROWS(${src})-24)&" 筆未顯示","")`
+    );
+    // 期望值：[第一區筆數, 續接區筆數, 提示文字有沒有出現]
+    const cases = [[0,1,0,false], [5,5,0,false], [12,12,0,false],
+                   [13,12,1,false], [24,12,12,false], [30,12,12,true]];
+    cases.forEach(function(c){
+      const n = c[0];
+      sh.getRange('A2:D100').clearContent();
+      if(n > 0){
+        const rows = [];
+        for(let i = 1; i <= n; i++) rows.push(['單'+i, '人'+i, '結果'+i, '差異'+i]);
+        sh.getRange(2, 1, n, 4).setValues(rows);
+      }
+      SpreadsheetApp.flush();
+      const left  = sh.getRange('F1:F12').getDisplayValues().filter(function(r){ return String(r[0]).trim(); }).length;
+      const right = sh.getRange('L1:L12').getDisplayValues().filter(function(r){ return String(r[0]).trim(); }).length;
+      const hint  = String(sh.getRange('R1').getDisplayValue()||'').trim();
+      const hintShown = hint.length > 0;
+      const ok = left === c[1] && right === c[2] && hintShown === c[3];
+      steps.push((ok ? '✅ ' : '❌ ') + n + ' 筆 → 左區' + left + '（期望' + c[1] + '）'
+        + '／右區' + right + '（期望' + c[2] + '）'
+        + '／提示' + (hintShown ? ('「' + hint + '」') : '無') + (c[3] ? '（期望有）' : '（期望無）'));
+      // 任何一格出現錯誤值都要抓出來——公式回 #VALUE 但筆數剛好對得上是有可能的
+      const cells = sh.getRange('F1:R12').getDisplayValues();
+      const bad = [];
+      cells.forEach(function(r){ r.forEach(function(v){
+        if(/^#(REF|N\/A|ERROR|VALUE|NAME|DIV)/.test(String(v))) bad.push(String(v));
+      }); });
+      if(bad.length) steps.push('❌ ' + n + ' 筆時出現錯誤值：' + bad.slice(0,3).join(','));
+    });
+  }catch(err){
+    steps.push('❌ 例外：' + err);
+  }finally{
+    const t = ss.getSheetByName(name);
+    if(t) ss.deleteSheet(t);
+  }
+  return {全部通過: steps.every(function(x){ return x.indexOf('✅') === 0; }), 明細: steps};
 }
 
 function setupAmendSheet_(){
