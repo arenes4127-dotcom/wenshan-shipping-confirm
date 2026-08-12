@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.72';
+const BACKEND_VERSION = '2026-08-12.73';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -50,6 +50,13 @@ const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'
 // 存成「指令」而不是「改完的結果」，來源之後又變動（客服改了數量）也還套得上去。
 const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote','itemsOverrideJson'];
 const SHEET_PICKLOG = '揀貨紀錄';
+// APP 的兩個入口。正式網頁版（GitHub Pages）是倉庫裝置在用的；
+// Drive 那份是同一支 index.html 的副本，網路連不到 GitHub 時的備援。
+// 集中放在這裡，儀表板上的連結跟以後任何要顯示網址的地方都引用這兩個常數，
+// 不要各自寫死一份——網址改掉時會漏改。
+const APP_WEB_URL = 'https://arenes4127-dotcom.github.io/wenshan-shipping-confirm/';
+const APP_DRIVE_FOLDER_ID = '1quwo_65K5YQMZtuLD-vkheg-g97kYond';
+const APP_DRIVE_URL = 'https://drive.google.com/drive/folders/' + APP_DRIVE_FOLDER_ID;
 const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action'];
 // 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
 const MANUAL_CLOSE_OPTIONS = ['出貨完成', '缺貨取消', '取消訂單'];
@@ -223,7 +230,7 @@ function uploadFileToDrive(folderId, fileName, content, mimeType){
 function authorizeDriveAccess_(){
   // 一定要真的「寫」一次（不能只是讀），Google才會請求完整的drive寫入權限範圍，
   // 只讀資料夾名稱那種操作只會拿到唯讀權限，之後createFile()還是會失敗。
-  const folder = DriveApp.getFolderById('1quwo_65K5YQMZtuLD-vkheg-g97kYond');
+  const folder = DriveApp.getFolderById(APP_DRIVE_FOLDER_ID);
   const testFile = folder.createFile('_授權測試_可刪除', '測試寫入權限', MimeType.PLAIN_TEXT);
   testFile.setTrashed(true);
   Logger.log('雲端硬碟授權成功（讀寫都已確認）');
@@ -837,6 +844,24 @@ function setupDashboardSheet_(){
     '="資料即時連動，開啟或來源異動時自動更新　｜　本頁最後計算時間："&TEXT(NOW(),"yyyy/MM/dd HH:mm:ss")'
   );
   sh.getRange('A2:O2').merge().setFontColor('#666666').setHorizontalAlignment('center');
+
+  // APP 連結。用 HYPERLINK() 而不是 setValue 一段網址文字：
+  // 網址本身又長又醜，而且貼進儲存格後 Google 不一定會自動轉成可點的連結。
+  // 兩個都放：正式網頁版是倉庫裝置在用的，Drive副本是網路連不到 GitHub 時的備援。
+  sh.getRange('A3').setFormula(`=HYPERLINK("${APP_WEB_URL}","📱 開啟出貨確認APP（網頁版）")`);
+  sh.getRange('A3:E3').merge().setFontSize(12).setFontWeight('bold')
+    .setBackground('#e8f0fe').setVerticalAlignment('middle');
+  sh.getRange('G3').setFormula(`=HYPERLINK("${APP_DRIVE_URL}","📄 APP備份檔（雲端硬碟）")`);
+  sh.getRange('G3:H3').merge().setFontSize(10).setFontColor('#666666').setVerticalAlignment('middle');
+  // 同一份試算表內跳分頁：gid 在執行時查，不要寫死——分頁被刪掉重建後 gid 會變，
+  // 寫死的話連結會靜靜指到一個不存在的分頁。查不到就整格留白，不要留一個壞連結。
+  const amendSheet = ss.getSheetByName(SHEET_AMEND);
+  if(amendSheet){
+    const amendUrl = ss.getUrl() + '#gid=' + amendSheet.getSheetId();
+    sh.getRange('J3').setFormula(`=HYPERLINK("${amendUrl}","✏️ 前往「訂單修改」分頁")`);
+    sh.getRange('J3:M3').merge().setFontSize(10).setFontColor('#666666').setVerticalAlignment('middle');
+  }
+  sh.setRowHeight(3, 26);
 
   // ---- 區塊標題樣式 ----
   // 一定要用 merge()，不能只 setValue：對多格範圍呼叫 setValue 會把同一段文字
