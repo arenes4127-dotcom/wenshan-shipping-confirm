@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.81';
+const BACKEND_VERSION = '2026-08-12.83';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -159,6 +159,9 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   syncNativeOrderSheet_: () => syncNativeOrderSheet_(),
   syncLogisticsConfirm_: () => syncLogisticsConfirm_(),
   syncSpecialNotes_: () => syncSpecialNotes_(),
+  closeCancelledByNote_: () => closeCancelledByNote_(),
+  testCancelByNote_: () => testCancelByNote_(),
+  previewCancelledByNote_: () => previewCancelledByNote_(),
   batchCloseOtherWarehouseOrders_: () => batchCloseOtherWarehouseOrders_(),
   closeBasketConfirmedPending_: () => closeBasketConfirmedPending_(),
   batchCloseOrdersBefore_: (arg) => batchCloseOrdersBefore_(arg),
@@ -1749,8 +1752,135 @@ function syncSpecialNotes_(){
     ordersSh.getRange(r._row, col).setValue(hit);
     updated++;
   });
-  Logger.log('特殊註記同步：來源'+sourceCount+'筆，更新'+updated+'張訂單。');
-  return {ok:true, 來源筆數:sourceCount, 已更新:updated};
+  const closed = closeCancelledByNote_();
+  Logger.log('特殊註記同步：來源'+sourceCount+'筆，更新'+updated+'張訂單。'+JSON.stringify(closed));
+  return {ok:true, 來源筆數:sourceCount, 已更新:updated, 依註記自動結案:closed};
+}
+
+// 這個功能會讓真實訂單從待出貨清單消失，所以四種情況都要先用測試資料驗過：
+// 該結的有沒有結、不該碰的有沒有被碰。實際資料裡目前三張含「取消」的單都已經人工標過了，
+// 光跑正式資料只驗得到「略過」那條路，其他三條完全沒被執行到。
+function testCancelByNote_(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const stamp = Date.now();
+  const cases = [
+    {key:'待出貨＋註記取消 → 應結案', status:'pending', note:'客取消', manualClose:'', expect:'取消訂單'},
+    {key:'待出貨＋註記沒取消 → 不動', status:'pending', note:'缺 已通知客 換貨', manualClose:'', expect:''},
+    {key:'已有人工結案值 → 不覆蓋', status:'pending', note:'客取消', manualClose:'缺貨取消', expect:'缺貨取消'},
+    {key:'掃描中 → 不動（不從人手上抽單）', status:'scanning', note:'客取消', manualClose:'', expect:''},
+    {key:'已出貨 → 不動（貨都出去了）', status:'shipped', note:'客取消', manualClose:'', expect:''}
+  ];
+  const firstRow = sh.getLastRow() + 1;
+  cases.forEach(function(c, i){
+    const orderNo = 'TEST-CANCEL-' + stamp + '-' + i;
+    c.orderNo = orderNo;
+    const items = [{sku:'TSKU-X', name:'測試品', baseName:'測試品', spec:'', qty:1}];
+    const sum = summarizeItems(items);
+    const o = {
+      orderNo: orderNo, store:'測試', date:'2026/8/12', itemsJson: JSON.stringify(items),
+      skuSummary: sum.skuSummary, nameSummary: sum.nameSummary,
+      status: statusToText(c.status), claimedBy: c.status === 'scanning' ? 'TEST01' : '',
+      claimedAt: c.status === 'scanning' ? new Date().toISOString() : '',
+      updatedAt: new Date().toISOString(), shipMethod:'', routingStatus:'文山',
+      manualClose: c.manualClose, logisticsConfirmed:'', logisticsTime:'',
+      pickedJson:'', specialNote: c.note, itemsOverrideJson:''
+    };
+    sh.getRange(firstRow + i, 1, 1, ORDERS_HEADER.length)
+      .setValues([ORDERS_HEADER.map(function(h){ return o[h]; })]);
+  });
+
+  const steps = [];
+  try{
+    const result = closeCancelledByNote_();
+    const after = readOrderRows();
+    cases.forEach(function(c){
+      const r = after.find(function(x){ return x.orderNo === c.orderNo; });
+      const got = r ? String(r.manualClose||'').trim() : '(找不到)';
+      steps.push((got === c.expect ? '✅ ' : '❌ ') + c.key + ' → 人工結案=「' + got + '」（期望「' + c.expect + '」）');
+    });
+    steps.push((result.已結案 === 1 ? '✅ ' : '❌ ') + '回報已結案 ' + result.已結案 + ' 張（期望1）');
+    steps.push((result.已出貨需人工處理 === 1 ? '✅ ' : '❌ ') + '回報已出貨需人工處理 ' + result.已出貨需人工處理 + ' 張（期望1）');
+    steps.push((result.掃描中略過 === 1 ? '✅ ' : '❌ ') + '回報掃描中略過 ' + result.掃描中略過 + ' 張（期望1）');
+  }catch(err){
+    steps.push('❌ 例外：' + err);
+  }finally{
+    // 由後往前刪，才不會刪掉一列之後後面的列號整個往上位移
+    for(let i = cases.length - 1; i >= 0; i--) sh.deleteRow(firstRow + i);
+    cleanupTestSysLogRows_();
+  }
+  return {全部通過: steps.every(function(x){ return x.indexOf('✅') === 0; }), 明細: steps};
+}
+
+// ---------------- 特殊註記寫「取消」的訂單自動結案 ----------------
+// 客服在來源的特殊註記欄寫「客取消」之類的字，代表這張單不用出了。
+// 沒有自動處理的話它會一直留在待出貨清單裡，揀貨員照樣去揀、包貨員照樣去包，
+// 等於白做一趟；主管得自己一張一張看註記再去下拉選單標結案。
+//
+// 三個刻意不碰的情況：
+//   已經有人工結案值 —— 那是人挑的，程式不覆蓋。
+//   掃描中 —— 有人正在處理，從他手上把單抽走會讓他掃到一半突然失效。
+//   已出貨 —— 貨都出去了，這時候標「取消訂單」等於在紀錄上說謊。
+//              但這種情況要另外提出來：客人取消了而貨已經寄出，是要處理的事，
+//              不是可以靜靜跳過的事。
+const CANCEL_NOTE_KEYWORD = '取消';
+// 試跑：只列出「會被自動結案的是哪幾張、註記寫什麼」，不寫入任何東西。
+// 這個動作會讓訂單從待出貨清單消失，跑之前先看一眼清單比較安全。
+function previewCancelledByNote_(){
+  const rows = readOrderRows();
+  const out = {將結案:[], 已出貨需人工處理:[], 掃描中略過:[], 已有結案值略過:[]};
+  rows.forEach(function(r){
+    const note = String(r.specialNote||'').trim();
+    if(note.indexOf(CANCEL_NOTE_KEYWORD) < 0) return;
+    const line = r.orderNo + '｜' + note;
+    if(String(r.manualClose||'').trim()) out.已有結案值略過.push(line + '（現值：' + r.manualClose + '）');
+    else if(r.status === 'shipped') out.已出貨需人工處理.push(line);
+    else if(r.status === 'scanning') out.掃描中略過.push(line);
+    else out.將結案.push(line);
+  });
+  return out;
+}
+function closeCancelledByNote_(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const col = colOf(ORDERS_HEADER, 'manualClose');
+  const done = [], shippedConflict = [], scanningSkipped = [];
+  rows.forEach(function(r){
+    const note = String(r.specialNote||'').trim();
+    if(note.indexOf(CANCEL_NOTE_KEYWORD) < 0) return;
+    if(String(r.manualClose||'').trim()) return;
+    if(r.status === 'shipped'){ shippedConflict.push({orderNo:r.orderNo, note:note}); return; }
+    if(r.status === 'scanning'){ scanningSkipped.push({orderNo:r.orderNo, note:note}); return; }
+    // 一律標「取消訂單」。註記裡看不出該用「取消訂單」還是「缺貨取消」——
+    // 實際資料裡同樣是「客取消」三個字，人工標的結果兩種都有，代表這件事沒辦法從文字推。
+    // 標一個一致的值、把原文寫進系統紀錄，主管要改成「缺貨取消」在下拉選單點一下就好。
+    sh.getRange(r._row, col).setValue('取消訂單');
+    done.push({orderNo:r.orderNo, note:note});
+  });
+
+  if(done.length || shippedConflict.length || scanningSkipped.length){
+    const logSh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
+    const now = nowStamp_();
+    const entries = [];
+    done.forEach(function(x){
+      entries.push({logTime:now, event:'依註記自動結案', orderNo:x.orderNo, claimedBy:'',
+        detail:'特殊註記含「'+CANCEL_NOTE_KEYWORD+'」→ 自動標記為「取消訂單」。註記原文：'+x.note
+             + '　｜　如果實際只是取消其中一項商品、整張單仍要出，請把「人工結案」欄清空還原。'});
+    });
+    shippedConflict.forEach(function(x){
+      entries.push({logTime:now, event:'⚠ 已出貨卻註記取消', orderNo:x.orderNo, claimedBy:'',
+        detail:'這張訂單已經出貨，但特殊註記寫著取消，需要人工處理（攔件／退貨）。註記原文：'+x.note});
+    });
+    scanningSkipped.forEach(function(x){
+      entries.push({logTime:now, event:'註記取消但掃描中，未處理', orderNo:x.orderNo, claimedBy:'',
+        detail:'掃描中的訂單不自動結案，以免人員掃到一半失效。請人員中止後會在下次同步自動結案。註記原文：'+x.note});
+    });
+    const start = logSh.getLastRow() + 1;
+    logSh.getRange(start, colOf(SYSLOG_HEADER,'logTime'), entries.length, 1).setNumberFormat('@');
+    logSh.getRange(start, 1, entries.length, SYSLOG_HEADER.length)
+      .setValues(entries.map(function(o){ return SYSLOG_HEADER.map(function(h){ return o[h]; }); }));
+  }
+  return {已結案: done.length, 已出貨需人工處理: shippedConflict.length, 掃描中略過: scanningSkipped.length,
+          訂單號: done.map(function(x){ return x.orderNo; })};
 }
 
 // ================= 商品主圖對照 =================
