@@ -104,6 +104,9 @@
   .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;}
   .stat-tile{background:var(--panel2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;}
   .stat-tile .num{font-size:28px;font-weight:800;line-height:1.1;}
+  /* 時間戳放不進28px的格子（「下午5:16」比兩三位數的數字長得多，之前直接撐破版面），
+     這一格改用小一號的字，日期另外放到下面的備註列。 */
+  .stat-tile .num.sm{font-size:19px;line-height:1.25;}
   .stat-tile .lbl{font-size:12px;color:var(--muted);margin-top:4px;}
   /* 備註：這個數字算的是哪個時間範圍。含前期累積的一定要標，不然會被當成當日數字看。 */
   .stat-tile .note{font-size:11px;color:var(--muted2);margin-top:3px;line-height:1.35;}
@@ -186,7 +189,8 @@
           <div class="note">僅今日</div></div>
         <div class="stat-tile"><div class="num" id="statIssue">0</div><div class="lbl">曾觸發警示</div>
           <div class="note">僅今日（紀錄每晚清空）</div></div>
-        <div class="stat-tile"><div class="num" id="statLastSync">-</div><div class="lbl">最後同步</div></div>
+        <div class="stat-tile"><div class="num sm" id="statLastSync">—</div><div class="lbl">最後同步</div>
+          <div class="note" id="statLastSyncNote"></div></div>
       </div>
 
       <!-- 待出貨的組成：卡在哪裡比總數更能決定現在要做什麼。
@@ -218,6 +222,7 @@
       <div class="card">
         <div class="stack">
           <button class="btn gray block" id="homeBtnSync">從雲端同步訂單</button>
+          <button class="btn block" data-goto="pick">開始揀貨</button>
           <button class="btn block" data-goto="scan">開始掃描出貨</button>
           <button class="btn gray block" data-goto="orders">訂單資料管理</button>
         </div>
@@ -2218,9 +2223,35 @@ function renderHome(){
   document.getElementById('statNewToday').textContent = all.filter(isTodayOrderDate).length;
   document.getElementById('statShippedToday').textContent = countShippedToday();
   document.getElementById('statIssue').textContent = log.filter(l=>l.hadIssue).length;
-  document.getElementById('statLastSync').textContent = settings.lastSyncAt ? settings.lastSyncAt.split(' ')[0] : '尚未同步';
+  renderLastSync();
   renderHomeBreakdown(pending);
   renderStaffSelects();
+}
+
+// 最後同步：時間放主格、日期放備註。原本只顯示日期，看不出「今天早上同步的」還是
+// 「剛剛同步的」——差幾小時就差幾十張訂單，那正是要判斷的事。
+// 日期不是今天就標橘色：那代表現在畫面上的訂單是舊的，比顯示一個看起來正常的日期重要。
+function renderLastSync(){
+  const el = document.getElementById('statLastSync');
+  const note = document.getElementById('statLastSyncNote');
+  if(!el) return;
+  const raw = String(settings.lastSyncAt || '').trim();
+  if(!raw){
+    el.textContent = '—';
+    if(note){ note.textContent = '尚未同步'; note.className = 'note warn'; }
+    return;
+  }
+  // toLocaleString('zh-TW') 給的是「2026/8/12 下午5:16:45」，秒在這裡沒有意義，去掉
+  const parts = raw.split(' ');
+  const datePart = parts[0] || '';
+  const timePart = (parts.slice(1).join(' ') || '').replace(/:\d{1,2}$/, '');
+  el.textContent = timePart || raw;
+  if(!note) return;
+  const now = new Date();
+  const [y, m, d] = datePart.split('/').map(Number);
+  const isToday = y === now.getFullYear() && m === (now.getMonth()+1) && d === now.getDate();
+  note.textContent = isToday ? '今天' : (datePart + '（不是今天）');
+  note.className = isToday ? 'note' : 'note warn';
 }
 
 // 待出貨的組成。前三格算的是本機訂單資料（＝我們自己要出的貨，含前期累積）；
