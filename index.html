@@ -1658,6 +1658,7 @@ function renderTransferSection(transferRows, scope){
   transferRows.forEach(function(r){
     html += '<div class="card" style="padding:12px;margin-bottom:8px;opacity:.85;">' +
       '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
+        thumbHtml(r.sku, r.baseName) +
         '<div style="flex:1;min-width:0;">' +
           '<div class="sku-badge">' + escapeHtml(r.sku) + '</div>' +
           (r.spec ? specHtml(r.sku, r.spec) : '') +
@@ -1687,6 +1688,7 @@ function renderSortView(scope){
       html += '<div class="card" style="padding:10px;margin-bottom:6px;' + (it.picked?'':'border-color:var(--danger);') + '"' +
         ' onclick="togglePick(\'' + escapeHtml(o.orderNo) + '\',\'' + escapeHtml(it.sku) + '\')">' +
         '<div style="display:flex;justify-content:space-between;gap:10px;">' +
+          thumbHtml(it.sku, it.baseName || it.name) +
           '<div style="flex:1;min-width:0;">' +
             '<div class="sku-text">' + escapeHtml(it.sku) +
               '<span class="loc-chip">' + escapeHtml(it.location||'無儲位') + '</span></div>' +
