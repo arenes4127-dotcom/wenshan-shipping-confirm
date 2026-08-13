@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.95';
+const BACKEND_VERSION = '2026-08-13.98';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -59,7 +59,9 @@ const APP_DRIVE_FOLDER_ID = '1quwo_65K5YQMZtuLD-vkheg-g97kYond';
 const APP_DRIVE_URL = 'https://drive.google.com/drive/folders/' + APP_DRIVE_FOLDER_ID;
 // kind：文山／調撥。同樣是「打勾」，在文山貨架上揀到、跟等別的門店把貨送來，
 // 是兩種完全不同的作業，效率也要分開看——沒有這一欄就只知道「今天打了幾個勾」。
-const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action','kind'];
+// result/differenceDetails 只填在「揀貨完成」那一列，跟出貨紀錄同一個做法：
+// 逐件的動作列不需要重複整張單的結論，填了反而看不出哪一列才是結案。
+const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action','kind','result','differenceDetails'];
 // 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
 const MANUAL_CLOSE_OPTIONS = ['出貨完成', '缺貨取消', '取消訂單'];
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
@@ -89,7 +91,7 @@ const HEADER_LABELS = {
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
   logTime:'時間', event:'事件', detail:'說明',
   logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
-  pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作', kind:'類型',
+  pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作', kind:'類型', result:'揀貨結果',
   itemsOverrideJson:'品項修改(JSON)',
   pickDoneAt:'揀貨完成時間', pickDoneBy:'揀貨完成人'
 };
@@ -116,6 +118,7 @@ function doPost(e){
       case 'logNetFailures': result = logNetFailures(body.entries || []); break;
       case 'markPickedBatch': result = markPickedBatch(body.ops || []); break;
       case 'markPickDone': result = markPickDone(body); break;
+      case 'logPickScanMiss': result = logPickScanMiss(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -1404,6 +1407,46 @@ function setupDashboardSheet_(){
     sh.getRange(5+i, 8).setFormula(r[1]);
   });
 
+  // ---- 2b. 本日揀貨品質（G11:H16）----
+  // 跟出貨品質同一欄、擺在它下面：兩個都是「今天做得好不好」，看的人視線不用跳。
+  // 揀貨紀錄是累積的（不像出貨紀錄每晚清空），所以每一條都要自己篩今天。
+  // 日期比對用 LEFT(...,10) 會踩到「2026/8/13」不補零的問題，改用 TEXT(DATEVALUE(...)) 正規化。
+  const PL = "'" + SHEET_PICKLOG + "'";
+  const plToday = `(IFERROR(INT(DATEVALUE(LEFT(${PL}!$A$2:$A,10)))=TODAY(),0))`;
+  const plDone = `(${PL}!$I$2:$I="揀貨完成")`;
+  sectionTitle('G11:H11', '🧺 本日揀貨品質');
+  const pickStats = [
+    ['完成 🟢', `=SUMPRODUCT(${plToday}*${plDone}*(LEFT(${PL}!$K$2:$K,2)="完成")*(ISERROR(SEARCH("修正",${PL}!$K$2:$K))))`],
+    ['過程有修正 🟠', `=SUMPRODUCT(${plToday}*${plDone}*(ISNUMBER(SEARCH("修正",${PL}!$K$2:$K))))`],
+    ['待調入 🟠', `=SUMPRODUCT(${plToday}*${plDone}*(LEFT(${PL}!$K$2:$K,3)="待調入"))`],
+    ['漏點完成 🔴', `=SUMPRODUCT(${plToday}*${plDone}*(LEFT(${PL}!$K$2:$K,4)="漏點完成"))`],
+    ['揀貨完成張數', `=SUMPRODUCT(${plToday}*${plDone})`]
+  ];
+  pickStats.forEach(function(r, i){
+    sh.getRange(12 + i, 7).setValue(r[0]);
+    sh.getRange(12 + i, 8).setFormula(r[1]);
+  });
+  sh.getRange('H12:H16').setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center');
+
+  // ---- 2c. 本日需注意的揀貨紀錄（V4起）----
+  // 放在最右邊獨立一區：Q~T 是「需注意的出貨紀錄」的續接區、會往下長，
+  // 兩個都無上限的區塊不能放同一欄。
+  const V = 22; // V欄
+  sectionTitle('V4:Y4', '⚠️ 本日需注意的揀貨紀錄');
+  sh.getRange(5, V, 1, 4).setValues([['訂單號','揀貨人','揀貨結果','差異明細']])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange(6, V).setFormula(
+    `=IFERROR(FILTER({${PL}!$B$2:$B,${PL}!$H$2:$H,${PL}!$K$2:$K,${PL}!$L$2:$L},`
+    + `${PL}!$I$2:$I="揀貨完成",` + plToday.slice(1, -1) + `,`
+    // 結果欄空白的是這個功能上線前留下的舊紀錄，不是「有問題」——
+    // 不排除的話它們會因為「開頭不是完成」而全部被當成需注意，把真正要看的淹掉。
+    + `${PL}!$K$2:$K<>"",`
+    + `(LEFT(${PL}!$K$2:$K,2)<>"完成")+(ISNUMBER(SEARCH("修正",${PL}!$K$2:$K)))),"目前沒有需要注意的揀貨紀錄")`
+  );
+  sh.setColumnWidth(21, 24);                       // U：跟左邊的區塊隔開
+  sh.setColumnWidth(22, 105); sh.setColumnWidth(23, 85);
+  sh.setColumnWidth(24, 150); sh.setColumnWidth(25, 320);
+
   // ---- 3. 各賣場（第22列起，橫跨A~H）----
   // 位置：擺在上面三個區塊的下面、「目前掃描中」的上面，讓由上往下讀的順序是
   // 「整體概況 → 當日數據／品質 → 各賣場分解 → 現在誰在做什麼」。
@@ -1685,7 +1728,7 @@ function colLetter_(n){
 function debugReadDashboard_(){
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_DASHBOARD);
   if(!sh) return {error:'找不到儀表板分頁'};
-  const values = sh.getRange(1, 1, 50, 20).getDisplayValues();
+  const values = sh.getRange(1, 1, 50, 25).getDisplayValues();
   const out = [];
   values.forEach((row, i)=>{
     const cells = [];
@@ -2956,6 +2999,40 @@ function onEdit(e){
 // 而那正是現場塞車時最想知道的兩件事。
 // 狀態刻意不動：訂單狀態的權威在掃描出貨那條路徑，揀貨完成只是多一個時間戳，
 // 兩邊各記各的才不會互相蓋掉。
+// 揀貨結果的分類。順序＝嚴重程度，先命中的優先——跟出貨那邊的 classifyVerifyStatus_ 一樣的思路。
+//   漏點完成：按了完成但還有文山品項沒點，貨到底有沒有進盒子沒人知道，最嚴重
+//   調撥未到齊：文山的部分做完了，但還在等別的門店，屬於正常狀態但不能直接包
+//   有取消：過程中點錯又改，通常沒事，但重複發生代表流程或標示有問題
+function classifyPickResult_(d){
+  if(d.unpicked > 0) return '漏點完成 🔴';
+  if(d.transferPending > 0) return '待調入 🟠';
+  if(d.cancelCount > 0 || d.scanMiss > 0) return '完成（過程有修正） 🟠';
+  return '完成 🟢';
+}
+function buildPickDifference_(d){
+  const parts = [];
+  if(d.unpicked > 0) parts.push('未點到 ' + d.unpicked + ' 件（文山）');
+  if(d.transferPending > 0) parts.push('調撥未到 ' + d.transferPending + ' 件');
+  if(d.cancelCount > 0) parts.push('取消揀貨 ' + d.cancelCount + ' 次');
+  if(d.scanMiss > 0) parts.push('掃到不屬於此單 ' + d.scanMiss + ' 次');
+  return parts.length ? parts.join('；') : '無差異';
+}
+
+// 這張單在揀貨紀錄裡出現過幾次「取消揀貨」「掃描不符」。
+// 從紀錄算而不是靠前端傳：人員可能中途重整頁面、換裝置，前端記的次數會歸零，
+// 而紀錄不會。
+function countPickEvents_(orderNo){
+  const rows = readRows(SHEET_PICKLOG, PICKLOG_HEADER);
+  let cancel = 0, miss = 0;
+  rows.forEach(function(r){
+    if(String(r.orderNo||'').trim() !== orderNo) return;
+    const a = String(r.action||'');
+    if(a === '取消揀貨') cancel++;
+    else if(a === '掃描不符') miss++;
+  });
+  return {cancelCount: cancel, scanMiss: miss};
+}
+
 function markPickDone(body){
   const orderNo = String((body && body.orderNo) || '').trim();
   if(!orderNo) return {ok:false, error:'missing orderNo'};
@@ -2975,17 +3052,48 @@ function markPickDone(body){
 
   // 揀貨紀錄留一筆，跟逐件的紀錄放同一張表，事後看得出整張單的完整過程
   const logSh = getSheet(SHEET_PICKLOG, PICKLOG_HEADER);
+  const counts = countPickEvents_(orderNo);
+  const detail = {
+    unpicked: Number((body && body.unpicked) || 0),
+    transferPending: Number((body && body.transferPending) || 0),
+    cancelCount: counts.cancelCount,
+    scanMiss: counts.scanMiss
+  };
   const o = {
     logTime: undo ? nowStamp_() : time, orderNo: orderNo, sku: '', baseName: '（整張訂單）',
     location: '', qty: '', pickerId: String((body && body.pickerId) || ''),
     pickerName: String((body && body.pickerName) || ''),
     action: undo ? '取消揀貨完成' : '揀貨完成',
-    kind: '整單'
+    kind: '整單',
+    result: undo ? '' : classifyPickResult_(detail),
+    differenceDetails: undo ? '' : buildPickDifference_(detail)
   };
   const start = logSh.getLastRow() + 1;
   logSh.getRange(start, 1, 1, PICKLOG_HEADER.length)
        .setValues([PICKLOG_HEADER.map(function(h){ return o[h]; })]);
-  return {ok:true, orderNo: orderNo, pickDoneAt: time, pickDoneBy: who};
+  return {ok:true, orderNo: orderNo, pickDoneAt: time, pickDoneBy: who,
+          揀貨結果: o.result, 差異明細: o.differenceDetails};
+}
+
+// 掃到不屬於這張單的條碼也要留下來。原本只在畫面上閃一下就沒了，
+// 於是「這個人今天掃錯幾次」「哪個商品最常被掃錯」完全查不到，
+// 而那正是判斷「是不是兩款商品長太像」的線索。
+function logPickScanMiss(body){
+  const code = String((body && body.code) || '').trim();
+  if(!code) return {ok:false, error:'missing code'};
+  const sh = getSheet(SHEET_PICKLOG, PICKLOG_HEADER);
+  const o = {
+    logTime: String((body && body.time) || '') || nowStamp_(),
+    orderNo: String((body && body.orderNo) || ''), sku: code,
+    baseName: '（掃到不屬於此' + (body && body.mode === 'batch' ? '批次' : '訂單') + '的條碼）',
+    location: '', qty: '', pickerId: String((body && body.pickerId) || ''),
+    pickerName: String((body && body.pickerName) || ''),
+    action: '掃描不符', kind: '', result: '', differenceDetails: ''
+  };
+  const start = sh.getLastRow() + 1;
+  sh.getRange(start, 1, 1, PICKLOG_HEADER.length)
+    .setValues([PICKLOG_HEADER.map(function(h){ return o[h]; })]);
+  return {ok:true};
 }
 
 // ---------------- 已進物流籃卻還掛在待出貨的訂單，自動結案 ----------------

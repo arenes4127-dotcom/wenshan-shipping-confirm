@@ -1725,6 +1725,16 @@ function handlePickScan(code){
   if(!hits.length){
     errorBeep();
     flash('err','不在這批裡', '條碼「' + raw + '」不屬於' + (pickMode==='single' ? '這張訂單' : '這個批次'), 1800);
+    // 掃錯要留紀錄。原本只在畫面上閃一下就沒了，於是「今天掃錯幾次」「哪個商品最常被掃錯」
+    // 完全查不到，而那正是判斷「是不是兩款商品長太像」的線索。
+    if(hasBackend()){
+      const staffSel = document.getElementById('pickStaffSelect');
+      const pid = staffSel ? staffSel.value : '';
+      const sObj = staff.find(function(x){ return x.id === pid; });
+      apiPost('logPickScanMiss', {code: raw, orderNo: pickMode==='single' ? pickCurrentOrder : '',
+        mode: pickMode, pickerId: pid, pickerName: sObj ? sObj.name : '',
+        time: new Date().toLocaleString('zh-TW')}).catch(function(){});   // 記錄失敗不該擋住現場
+    }
     return;
   }
   const target = hits.find(function(h){ return !h.item.picked; });
@@ -1795,8 +1805,15 @@ async function markPickDone(orderNo, undo){
 
   if(!hasBackend()) return;
   try{
+    // 未點與調撥未到只有前端算得出來（要用 itemAlloc 判斷每件的分配）；
+    // 取消次數與掃錯次數則交給後端從揀貨紀錄數——人員中途重整頁面的話前端會歸零，紀錄不會。
+    const transferPending = (o.items||[]).filter(function(it){
+      const a = itemAlloc(it);
+      return a.pickQty <= 0 && a.transferQty > 0 && !it.picked;
+    }).length;
     await apiPost('markPickDone', {orderNo: orderNo, undo: !!undo,
-      pickerId: pickerId, pickerName: staffObj ? staffObj.name : '', time: time});
+      pickerId: pickerId, pickerName: staffObj ? staffObj.name : '', time: time,
+      unpicked: unpickedCount(o), transferPending: transferPending});
   }catch(err){
     o.pickDoneAt = prevAt; o.pickDoneBy = prevBy;
     saveJSON(LS.orders, orders);
