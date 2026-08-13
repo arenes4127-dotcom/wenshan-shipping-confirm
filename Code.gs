@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.106';
+const BACKEND_VERSION = '2026-08-13.108';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -126,6 +126,8 @@ function doPost(e){
       case 'logPickScanMiss': result = logPickScanMiss(body); break;
       case 'lookupLocation': result = lookupLocation(body); break;
       case 'changeLocation': result = changeLocation(body); break;
+      case 'lookupLocations': result = lookupLocations(body); break;
+      case 'changeLocationBatch': result = changeLocationBatch(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -2296,7 +2298,7 @@ const LOCMAP_SOURCE_ID = '1hZ6fJU7CZyx79NRqSErmJBPkRssegublxK0TgniXbs4';
 const LOCMAP_TAB = ' 文山倉儲位';
 const LOCMAP_COL = {sku:1, name:2, location:3, updated:4, note:12};
 const SHEET_LOCLOG = '儲位異動紀錄';
-const LOCLOG_HEADER = ['logTime','sku','baseName','fromLocation','toLocation','kind','staffId','staffName','note','writeBack'];
+const LOCLOG_HEADER = ['logTime','sku','baseName','fromLocation','toLocation','kind','staffId','staffName','note','writeBack','mode'];
 // 異動類型。跟原因下拉同樣的理由：自由填寫的話同一件事會有十種寫法，之後統計不出東西。
 const LOC_CHANGE_KINDS = ['上架', '移櫃', '揀貨時發現', '盤點調整', '其他'];
 
@@ -2322,6 +2324,84 @@ function locUpdateStamp_(staffName){
   return d + (n.length >= 2 ? n.charAt(1) : n);
 }
 
+// ---- 多儲位 ----
+// 同一件商品放在兩個以上的地方，這在現場本來就有：全表 7,088 列裡已經有 243 列
+// 用「、」串兩個儲位（例 C04-1、K08-1），另有兩百多列是「R04-2 牌面」「2樓 F03-1」
+// 「pa 5」這種人手寫的變體。這些格式不是我們定的，也沒有人幫我們保證它的規則。
+//
+// 所以這裡的原則是：**解析只拿來顯示跟「移除其中一個存放點」，回寫一律做字串加減，
+// 絕不把整格重新組裝**。重組等於把我們看不懂的寫法（「pa 5」「二樓」）默默改掉，
+// 那是在破壞別人維護了很久的資料。
+const LOC_SPLIT_RE = /[、,，/／]+/;
+const LOC_TOKEN_RE = /^[A-Za-z]{1,2}\s*\d{1,3}(?:\s*-\s*\d{1,2})?$/;
+
+function parseLocList_(cell){
+  const raw = String(cell||'').trim();
+  if(!raw) return {list: [], extra: '', raw: ''};
+  const list = [], extra = [];
+  raw.split(LOC_SPLIT_RE).map(function(x){ return x.trim(); })
+     .filter(function(x){ return x; })
+     .forEach(function(seg){
+    if(LOC_TOKEN_RE.test(seg)){ list.push(seg); return; }
+    // 一段裡面可能是「儲位＋現場註記」：R04-2 牌面 / 2樓 F03-1
+    const parts = seg.split(/\s+/);
+    const locs = parts.filter(function(x){ return LOC_TOKEN_RE.test(x); });
+    if(locs.length){
+      locs.forEach(function(x){ list.push(x); });
+      parts.filter(function(x){ return !LOC_TOKEN_RE.test(x); })
+           .forEach(function(x){ extra.push(x); });
+    } else extra.push(seg);
+  });
+  // 一個都認不出來（例如整格就是「pa 5」）時，整格當成單一存放點。
+  // 認不得不代表它不是儲位，寧可原樣保留也不要把資料丟掉。
+  if(!list.length) return {list: [raw], extra: '', raw: raw, opaque: true};
+  return {list: list, extra: extra.join(' '), raw: raw};
+}
+
+function locEscapeRe_(t){ return String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// 加一個存放點：純粹接在後面，前面原本是什麼樣子完全不動。
+function addLocToCell_(raw, add){
+  const s = String(raw||'').trim();
+  return s ? (s + '、' + add) : add;
+}
+// 移除一個存放點：連著它旁邊的分隔符一起拿掉，免得留下「、」開頭或「、、」。
+// 後面的 (?![0-9A-Za-z-]) 是為了不讓「A01」誤砍到「A01-1」。
+function removeLocFromCell_(raw, target){
+  const s = String(raw||'');
+  const esc = locEscapeRe_(String(target).trim());
+  let out = s.replace(new RegExp('\\s*[、,，/／]\\s*' + esc + '(?![0-9A-Za-z-])'), '');
+  if(out === s) out = s.replace(new RegExp(esc + '(?![0-9A-Za-z-])\\s*[、,，/／]\\s*'), '');
+  if(out === s) out = s.replace(new RegExp(esc + '(?![0-9A-Za-z-])'), '');
+  return out.trim().replace(/^[、,，/／]+|[、,，/／]+$/g, '').trim();
+}
+
+// 品號→列號索引。整欄只讀一次，批次移動N件才不會變成N次全表掃描
+//（7,088列，一次讀就要一秒級，批次20件逐件查會慢到不能用）。
+function locIndex_(sh){
+  const lastRow = sh.getLastRow();
+  const skus = sh.getRange(2, LOCMAP_COL.sku, lastRow - 1, 1).getValues();
+  const idx = {};
+  for(let i = 0; i < skus.length; i++){
+    const k = String(skus[i][0]||'').trim();
+    if(k && idx[k] === undefined) idx[k] = i + 2;
+  }
+  return idx;
+}
+
+function readLocRow_(sh, row, sku){
+  const v = sh.getRange(row, 1, 1, LOCMAP_COL.note).getValues()[0];
+  const cell = String(v[LOCMAP_COL.location-1]||'').trim();
+  const parsed = parseLocList_(cell);
+  return {ok:true, sku: sku, row: row,
+          baseName: String(v[LOCMAP_COL.name-1]||'').trim(),
+          location: cell,
+          locations: parsed.list,
+          locationExtra: parsed.extra,
+          updated: String(v[LOCMAP_COL.updated-1]||'').trim(),
+          note: String(v[LOCMAP_COL.note-1]||'').trim()};
+}
+
 // 查一個品號現在登記在哪。給APP在送出前顯示「原儲位」用——
 // 讓人看到「從哪搬到哪」再按確定，比直接填一個新位置安全得多。
 function lookupLocation(body){
@@ -2329,19 +2409,25 @@ function lookupLocation(body){
   if(!sku) return {ok:false, error:'missing sku'};
   const sh = getLocMapSheet_();
   if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
-  const lastRow = sh.getLastRow();
-  const skus = sh.getRange(2, LOCMAP_COL.sku, lastRow - 1, 1).getValues();
-  for(let i = 0; i < skus.length; i++){
-    if(String(skus[i][0]||'').trim() !== sku) continue;
-    const row = i + 2;
-    const v = sh.getRange(row, 1, 1, LOCMAP_COL.note).getValues()[0];
-    return {ok:true, sku: sku, row: row,
-            baseName: String(v[LOCMAP_COL.name-1]||'').trim(),
-            location: String(v[LOCMAP_COL.location-1]||'').trim(),
-            updated: String(v[LOCMAP_COL.updated-1]||'').trim(),
-            note: String(v[LOCMAP_COL.note-1]||'').trim()};
-  }
-  return {ok:false, reason:'not_found', sku: sku};
+  const row = locIndex_(sh)[sku];
+  if(!row) return {ok:false, reason:'not_found', sku: sku};
+  return readLocRow_(sh, row, sku);
+}
+
+// 一次查多個品號（批次移動用）：整欄只讀一次
+function lookupLocations(body){
+  const skus = (body && body.skus) || [];
+  const sh = getLocMapSheet_();
+  if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
+  const idx = locIndex_(sh);
+  const found = [], missing = [];
+  skus.forEach(function(raw){
+    const sku = String(raw||'').trim();
+    if(!sku) return;
+    if(idx[sku]) found.push(readLocRow_(sh, idx[sku], sku));
+    else missing.push(sku);
+  });
+  return {ok:true, found: found, missing: missing};
 }
 
 // 我們寫進「重要訊息 備註」的那一段長這樣，之後要靠這個前綴認出「這是系統寫的」。
@@ -2363,140 +2449,291 @@ function mergeLocNote_(existing, mine){
 }
 
 // 這個功能會寫進「文山地圖」——那是別人也在用的正式檔案，不能拿真資料亂試。
-// 做法：挑一個真實品號，把它現在的儲位/更新/備註三格先抄下來，跑完整流程，
-// 檢查每一格是否如預期，最後不管成功失敗都原樣寫回去。
+// 做法：挑真實的列，把儲位/更新/備註三格先抄下來，跑完整流程，檢查每一格是否如預期，
+// 最後不管成功失敗都原樣寫回去，連我們自己寫的異動紀錄列也刪掉。
 function testLocationChange_(){
+  const steps = [];
+  const ck = function(cond, msg){ steps.push((cond ? '\u2705 ' : '\u274c ') + msg); };
+
+  // ---- 純函式先測，這些不碰任何資料 ----
+  const a = parseLocList_('C04-1、K08-1');
+  ck(a.list.length === 2 && a.list[0] === 'C04-1' && a.list[1] === 'K08-1', '解析兩個存放點：' + JSON.stringify(a.list));
+  const b = parseLocList_('R04-2 牌面');
+  ck(b.list.length === 1 && b.list[0] === 'R04-2' && b.extra === '牌面', '儲位+現場註記分開：' + JSON.stringify([b.list, b.extra]));
+  const c = parseLocList_('pa 5');
+  ck(c.list.length === 1 && c.list[0] === 'pa 5', '「pa 5」這種字母+數字的舊寫法照樣認得出來：' + JSON.stringify(c.list));
+  const c2 = parseLocList_('待加工');
+  ck(c2.list.length === 1 && c2.list[0] === '待加工' && c2.opaque,
+     '完全看不懂的寫法整格保留、不把資料丟掉：' + JSON.stringify(c2.list));
+  const d = parseLocList_('');
+  ck(d.list.length === 0, '空白＝沒有存放點');
+  const e = parseLocList_('C04-1、K08-1、B02-3');
+  ck(e.list.length === 3, '三個存放點也解析得出來');
+
+  ck(addLocToCell_('C04-1', 'B02-3') === 'C04-1、B02-3', '新增：接在後面');
+  ck(addLocToCell_('', 'B02-3') === 'B02-3', '原本空白時新增不會多一個頓號');
+  ck(addLocToCell_('R04-2 牌面', 'B02-3') === 'R04-2 牌面、B02-3', '新增時不動原本看不懂的部分');
+  ck(removeLocFromCell_('C04-1、K08-1', 'K08-1') === 'C04-1', '移除後面那個');
+  ck(removeLocFromCell_('C04-1、K08-1', 'C04-1') === 'K08-1', '移除前面那個，不留開頭頓號');
+  ck(removeLocFromCell_('A01、A01-1', 'A01') === 'A01-1', '移除 A01 不會誤砍 A01-1');
+  ck(removeLocFromCell_('R04-2 牌面、B02-3', 'B02-3') === 'R04-2 牌面', '移除時保留現場註記');
+
+  // ---- 以下要動真實資料 ----
   const sh = getLocMapSheet_();
-  if(!sh) return {error:'找不到文山倉儲位分頁'};
+  if(!sh) return {全部通過:false, 明細: steps.concat(['\u274c 找不到文山倉儲位分頁'])};
   const lastRow = sh.getLastRow();
-  // 找一個有儲位、而且備註欄有人寫過字的列——備註保留是這次最需要驗的行為
   const data = sh.getRange(2, 1, lastRow - 1, LOCMAP_COL.note).getValues();
+
+  // 主測試列：要有儲位、而且備註欄有人寫過字——備註保留是最需要驗的行為
   let idx = -1;
   for(let i = 0; i < data.length; i++){
     if(String(data[i][LOCMAP_COL.sku-1]||'').trim()
        && String(data[i][LOCMAP_COL.location-1]||'').trim()
        && String(data[i][LOCMAP_COL.note-1]||'').trim()){ idx = i; break; }
   }
-  if(idx < 0) return {error:'找不到適合的測試列'};
-  const row = idx + 2;
-  const sku = String(data[idx][LOCMAP_COL.sku-1]).trim();
-  const backup = {
-    location: data[idx][LOCMAP_COL.location-1],
-    updated: data[idx][LOCMAP_COL.updated-1],
-    note: data[idx][LOCMAP_COL.note-1]
+  if(idx < 0) return {全部通過:false, 明細: steps.concat(['\u274c 找不到適合的測試列'])};
+
+  // 批次測試列：另外抓3列有儲位的
+  const batchIdx = [];
+  for(let i = 0; i < data.length && batchIdx.length < 3; i++){
+    if(i === idx) continue;
+    if(String(data[i][LOCMAP_COL.sku-1]||'').trim()
+       && String(data[i][LOCMAP_COL.location-1]||'').trim()) batchIdx.push(i);
+  }
+
+  const snap = function(i){
+    return {row: i + 2, sku: String(data[i][LOCMAP_COL.sku-1]).trim(),
+            location: data[i][LOCMAP_COL.location-1],
+            updated: data[i][LOCMAP_COL.updated-1],
+            note: data[i][LOCMAP_COL.note-1]};
   };
-  const steps = [];
-  let logRowsBefore = 0;
+  const main = snap(idx);
+  const batch = batchIdx.map(snap);
+  const restore = [main].concat(batch);
+
+  const logSh = getSheet(SHEET_LOCLOG, LOCLOG_HEADER);
+  const logRowsBefore = logSh.getLastRow();
+  const staff = {staffId:'TEST', staffName:'測試員'};
+
   try{
-    const logSh = getSheet(SHEET_LOCLOG, LOCLOG_HEADER);
-    logRowsBefore = logSh.getLastRow();
+    const look = lookupLocation({sku: main.sku});
+    ck(look.ok && look.location === String(main.location).trim(),
+       '查詢現有儲位：' + main.sku + ' → ' + look.location);
+    ck(Array.isArray(look.locations) && look.locations.length >= 1, '回傳解析後的存放點清單：' + JSON.stringify(look.locations));
 
-    const look = lookupLocation({sku: sku});
-    steps.push((look.ok && look.location === String(backup.location).trim() ? '✅ ' : '❌ ')
-      + '查詢現有儲位：' + sku + ' → ' + look.location);
+    // --- replace ---
+    const r1 = changeLocation(Object.assign({sku: main.sku, toLocation:'ZZ99-9', kind:'移櫃', mode:'replace', note:'自動測試'}, staff));
+    ck(r1.ok, '移動（replace）：' + JSON.stringify(r1).slice(0, 110));
+    let after = sh.getRange(main.row, 1, 1, LOCMAP_COL.note).getValues()[0];
+    ck(String(after[LOCMAP_COL.location-1]).trim() === 'ZZ99-9', '儲位已回寫：' + after[LOCMAP_COL.location-1]);
+    ck(/^\d{6}/.test(String(after[LOCMAP_COL.updated-1]).trim()), '更新欄格式：' + after[LOCMAP_COL.updated-1]);
+    ck(String(after[LOCMAP_COL.note-1]).indexOf(LOC_NOTE_PREFIX) === 0, '備註開頭是異動紀錄');
+    ck(String(after[LOCMAP_COL.note-1]).indexOf(String(main.note).trim()) >= 0,
+       '原本的人工備註有保留：「' + String(main.note).trim() + '」');
 
-    const target = 'ZZ99-9';   // 明顯不會跟真實儲位撞名的測試值
-    const res = changeLocation({sku: sku, toLocation: target, kind: '移櫃',
-      staffId: 'TEST', staffName: '測試員', note: '自動測試'});
-    steps.push((res.ok ? '✅ ' : '❌ ') + '執行異動：' + JSON.stringify(res).slice(0, 120));
+    // --- add：多儲位的核心 ---
+    const r2 = changeLocation(Object.assign({sku: main.sku, toLocation:'ZZ88-8', kind:'上架', mode:'add'}, staff));
+    ck(r2.ok && r2.to === 'ZZ99-9、ZZ88-8', '新增存放點（add）保留原本：' + r2.to);
+    const look2 = lookupLocation({sku: main.sku});
+    ck(look2.locations.length === 2, '查詢回報兩個存放點：' + JSON.stringify(look2.locations));
 
-    const after = sh.getRange(row, 1, 1, LOCMAP_COL.note).getValues()[0];
-    steps.push((String(after[LOCMAP_COL.location-1]).trim() === target ? '✅ ' : '❌ ')
-      + '儲位已回寫：' + after[LOCMAP_COL.location-1]);
-    const stamp = String(after[LOCMAP_COL.updated-1]).trim();
-    steps.push((/^\d{6}/.test(stamp) ? '✅ ' : '❌ ') + '更新欄格式（YYMMDD+人名字）：' + stamp);
-    const newNote = String(after[LOCMAP_COL.note-1]);
-    steps.push((newNote.indexOf(LOC_NOTE_PREFIX) === 0 ? '✅ ' : '❌ ') + '備註開頭是異動紀錄：' + newNote.slice(0, 60));
-    steps.push((newNote.indexOf(String(backup.note).trim()) >= 0 ? '✅ ' : '❌ ')
-      + '原本的人工備註有保留：「' + String(backup.note).trim() + '」');
+    const dupAdd = changeLocation(Object.assign({sku: main.sku, toLocation:'ZZ88-8', kind:'上架', mode:'add'}, staff));
+    ck(!dupAdd.ok && dupAdd.reason === 'exists', '重複新增同一個存放點被擋：' + (dupAdd.error||''));
 
-    // 再搬一次：我們寫的那段要被換掉，人工備註仍在（＝不會愈疊愈長）
-    const res2 = changeLocation({sku: sku, toLocation: 'ZZ88-8', kind: '移櫃',
-      staffId: 'TEST', staffName: '測試員', note: '第二次'});
-    const note2 = String(sh.getRange(row, LOCMAP_COL.note).getValue());
-    const ourCount = note2.split(LOC_NOTE_PREFIX).length - 1;
-    steps.push((res2.ok && ourCount === 1 ? '✅ ' : '❌ ')
-      + '再次移位只覆蓋系統那段（系統段數=' + ourCount + '）：' + note2.slice(0, 70));
-    steps.push((note2.indexOf(String(backup.note).trim()) >= 0 ? '✅ ' : '❌ ') + '人工備註第二次之後仍在');
+    // --- remove ---
+    const r3 = changeLocation(Object.assign({sku: main.sku, toLocation:'ZZ99-9', kind:'盤點調整', mode:'remove'}, staff));
+    ck(r3.ok && r3.to === 'ZZ88-8', '移除存放點（remove）：' + r3.to);
 
-    const same = changeLocation({sku: sku, toLocation: 'ZZ88-8', kind: '移櫃',
-      staffId: 'TEST', staffName: '測試員'});
-    steps.push((!same.ok && same.reason === 'same' ? '✅ ' : '❌ ') + '搬到同一個位置會被擋：' + (same.error||''));
+    const rmLast = changeLocation(Object.assign({sku: main.sku, toLocation:'ZZ88-8', kind:'盤點調整', mode:'remove'}, staff));
+    ck(!rmLast.ok && rmLast.reason === 'last_one', '移除最後一個存放點被擋：' + (rmLast.error||''));
 
-    const bad = changeLocation({sku: sku, toLocation: 'A01-1', kind: '亂填',
-      staffId: 'TEST', staffName: '測試員'});
-    steps.push((!bad.ok ? '✅ ' : '❌ ') + '異動類型不在清單內會被擋');
+    const rmMissing = changeLocation(Object.assign({sku: main.sku, toLocation:'QQ11-1', kind:'盤點調整', mode:'remove'}, staff));
+    ck(!rmMissing.ok && rmMissing.reason === 'not_there', '移除不存在的存放點被擋');
 
-    const nf = changeLocation({sku: '__NO_SUCH_SKU__', toLocation: 'A01-1', kind: '移櫃',
-      staffId: 'TEST', staffName: '測試員'});
-    steps.push((!nf.ok && nf.reason === 'not_found' ? '✅ ' : '❌ ') + '不存在的品號會被擋');
+    // 備註不會愈疊愈長：我們的段落永遠只有一段
+    const noteNow = String(sh.getRange(main.row, LOCMAP_COL.note).getValue());
+    ck(noteNow.split(LOC_NOTE_PREFIX).length - 1 === 1, '改了四次，系統備註仍只有一段');
+    ck(noteNow.indexOf(String(main.note).trim()) >= 0, '人工備註四次之後仍在');
 
+    // --- 各種擋下 ---
+    const same = changeLocation(Object.assign({sku: main.sku, toLocation:'ZZ88-8', kind:'移櫃'}, staff));
+    ck(!same.ok && same.reason === 'same', '搬到同一個位置被擋');
+    ck(!changeLocation(Object.assign({sku: main.sku, toLocation:'A01-1', kind:'亂填'}, staff)).ok, '異動類型不在清單內被擋');
+    ck(!changeLocation(Object.assign({sku: main.sku, toLocation:'A01-1', kind:'移櫃', mode:'亂填'}, staff)).ok, '模式不在清單內被擋');
+    const nf = changeLocation(Object.assign({sku:'__NO_SUCH_SKU__', toLocation:'A01-1', kind:'移櫃'}, staff));
+    ck(!nf.ok && nf.reason === 'not_found', '不存在的品號被擋');
+
+    // --- 批次 ---
+    const bSkus = batch.map(function(x){ return x.sku; });
+    const bres = changeLocationBatch(Object.assign({skus: bSkus.concat(['__NO_SUCH_SKU__']),
+      toLocation:'ZZ77-7', kind:'移櫃', mode:'replace', note:'批次測試'}, staff));
+    ck(bres.ok && bres.okCount === bSkus.length && bres.failCount === 1,
+       '批次移動：成功' + bres.okCount + '／失敗' + bres.failCount + '（期望' + bSkus.length + '／1）');
+    const allMoved = batch.every(function(x){
+      return String(sh.getRange(x.row, LOCMAP_COL.location).getValue()).trim() === 'ZZ77-7';
+    });
+    ck(allMoved, '批次的每一列都真的改到了');
+    ck(bres.results.filter(function(r){ return !r.ok; })[0].reason === 'not_found',
+       '批次中查無品號的那件單獨回報失敗，不影響其他件');
+
+    const bAdd = changeLocationBatch(Object.assign({skus: bSkus, toLocation:'ZZ66-6', kind:'上架', mode:'add'}, staff));
+    ck(bAdd.ok && bAdd.okCount === bSkus.length, '批次新增存放點：' + bAdd.okCount);
+    ck(String(sh.getRange(batch[0].row, LOCMAP_COL.location).getValue()).trim() === 'ZZ77-7、ZZ66-6',
+       '批次新增後是兩個存放點：' + sh.getRange(batch[0].row, LOCMAP_COL.location).getValue());
+
+    // 異動紀錄列數：主測試成功6筆(replace/add/remove + 這三個是1+1+1) + 批次(3+3)
     const added = logSh.getLastRow() - logRowsBefore;
-    steps.push((added === 2 ? '✅ ' : '❌ ') + '異動紀錄新增 ' + added + ' 列（期望2：兩次成功的異動）');
+    ck(added === 9, '異動紀錄新增 ' + added + ' 列（期望9：單筆3＋批次3＋批次3）');
+    const lastLog = logSh.getRange(logSh.getLastRow(), 1, 1, LOCLOG_HEADER.length).getValues()[0];
+    ck(String(lastLog[LOCLOG_HEADER.indexOf('mode')]) === 'add', '紀錄有寫入模式欄：' + lastLog[LOCLOG_HEADER.indexOf('mode')]);
   }catch(err){
-    steps.push('❌ 例外：' + err);
+    steps.push('\u274c 例外：' + err);
   }finally{
     // 一定要還原，這是別人的正式檔案
-    sh.getRange(row, LOCMAP_COL.location).setValue(backup.location);
-    sh.getRange(row, LOCMAP_COL.updated).setValue(backup.updated);
-    sh.getRange(row, LOCMAP_COL.note).setValue(backup.note);
-    // 測試寫的異動紀錄也刪掉，由後往前刪避免列號位移
-    const logSh = getSheet(SHEET_LOCLOG, LOCLOG_HEADER);
+    restore.forEach(function(x){
+      sh.getRange(x.row, LOCMAP_COL.location).setValue(x.location);
+      sh.getRange(x.row, LOCMAP_COL.updated).setValue(x.updated);
+      sh.getRange(x.row, LOCMAP_COL.note).setValue(x.note);
+    });
     const last = logSh.getLastRow();
     if(last > logRowsBefore){
       for(let r = last; r > logRowsBefore; r--) logSh.deleteRow(r);
     }
-    const back = sh.getRange(row, 1, 1, LOCMAP_COL.note).getValues()[0];
-    steps.push((String(back[LOCMAP_COL.location-1]) === String(backup.location)
-             && String(back[LOCMAP_COL.note-1]) === String(backup.note) ? '✅ ' : '❌ ')
-      + '測試列已還原（' + sku + ' 儲位 ' + back[LOCMAP_COL.location-1] + '）');
+    const restored = restore.every(function(x){
+      const v = sh.getRange(x.row, 1, 1, LOCMAP_COL.note).getValues()[0];
+      return String(v[LOCMAP_COL.location-1]) === String(x.location)
+          && String(v[LOCMAP_COL.note-1]) === String(x.note);
+    });
+    ck(restored, '全部 ' + restore.length + ' 個測試列已還原');
+    ck(logSh.getLastRow() === logRowsBefore, '測試寫的異動紀錄已刪乾淨');
   }
-  return {全部通過: steps.every(function(x){ return x.indexOf('✅') === 0; }), 明細: steps};
+  return {全部通過: steps.every(function(x){ return x.indexOf('\u2705') === 0; }), 明細: steps};
+}
+
+
+// 三種模式，差別在於對「原本的儲位」怎麼處理：
+//   replace 搬走了，原本的位置不再有貨（預設）
+//   add     多開一個存放點，原本的位置還是有貨（同商品多色多尺寸分兩區放很常見）
+//   remove  某個存放點清空了，其他的留著
+const LOC_MODES = ['replace', 'add', 'remove'];
+
+// 算出「這一格最後要變成什麼字串」。寫回去之前先算完，
+// 才能在還沒動到任何資料的情況下把不合理的操作擋掉。
+function planLocChange_(hit, mode, target){
+  const cur = hit.location;
+  const list = hit.locations || [];
+  const has = list.some(function(x){ return x === target; });
+  if(mode === 'add'){
+    if(has) return {error:'「' + target + '」已經在存放點裡了（目前：' + cur + '）', reason:'exists'};
+    return {next: addLocToCell_(cur, target)};
+  }
+  if(mode === 'remove'){
+    if(!has) return {error:'「' + target + '」不在目前的存放點裡（目前：' + (cur||'空白') + '）', reason:'not_there'};
+    if(list.length <= 1) return {error:'這是唯一的存放點，移除後會變成沒有儲位。要搬走請改用「移動」', reason:'last_one'};
+    return {next: removeLocFromCell_(cur, target)};
+  }
+  if(cur === target) return {error:'新儲位跟現在一樣（' + target + '），沒有變更', reason:'same'};
+  return {next: target};
+}
+
+// 真正動手的地方。抽出來是因為單筆跟批次要走完全一樣的邏輯——
+// 批次如果另外寫一份，兩邊遲早會長出不一樣的行為。
+function applyLocChange_(sh, hit, opt){
+  const plan = planLocChange_(hit, opt.mode, opt.target);
+  if(plan.error) return {ok:false, sku: hit.sku, reason: plan.reason, error: plan.error};
+  const from = hit.location;
+  try{
+    sh.getRange(hit.row, LOCMAP_COL.location).setValue(plan.next);
+    sh.getRange(hit.row, LOCMAP_COL.updated).setValue(locUpdateStamp_(opt.staffName));
+    sh.getRange(hit.row, LOCMAP_COL.note)
+      .setValue(mergeLocNote_(hit.note, buildLocNote_(from, plan.next, opt.staffName)));
+  }catch(err){
+    return {ok:false, sku: hit.sku, error:'回寫文山地圖失敗：' + err};
+  }
+  return {ok:true, sku: hit.sku, baseName: hit.baseName,
+          from: from || '（原本沒有儲位）', to: plan.next, target: opt.target,
+          mode: opt.mode, row: hit.row, writeBack:'已回寫第' + hit.row + '列'};
+}
+
+function locLogRows_(results, opt){
+  const rows = [];
+  results.forEach(function(r){
+    if(!r.ok) return;
+    const o = {
+      logTime: nowStamp_(), sku: r.sku, baseName: r.baseName,
+      fromLocation: r.from, toLocation: r.to, kind: opt.kind,
+      staffId: opt.staffId, staffName: opt.staffName, note: opt.note,
+      writeBack: r.writeBack, mode: r.mode
+    };
+    rows.push(LOCLOG_HEADER.map(function(h){ return o[h]; }));
+  });
+  if(!rows.length) return 0;
+  const logSh = getSheet(SHEET_LOCLOG, LOCLOG_HEADER);
+  const start = logSh.getLastRow() + 1;
+  logSh.getRange(start, colOf(LOCLOG_HEADER,'logTime'), rows.length, 1).setNumberFormat('@');
+  logSh.getRange(start, 1, rows.length, LOCLOG_HEADER.length).setValues(rows);
+  return rows.length;
+}
+
+function validateLocBody_(body){
+  const kind = String((body && body.kind) || '').trim();
+  const staffName = String((body && body.staffName) || '').trim();
+  const mode = String((body && body.mode) || 'replace').trim();
+  const target = String((body && body.toLocation) || '').trim();
+  if(!target) return {error:'請提供儲位'};
+  if(LOC_MODES.indexOf(mode) < 0) return {error:'模式必須是：' + LOC_MODES.join('／')};
+  if(LOC_CHANGE_KINDS.indexOf(kind) < 0) return {error:'異動類型必須是：' + LOC_CHANGE_KINDS.join('／')};
+  if(!staffName) return {error:'請先選擇人員'};
+  return {ok:true, kind: kind, staffName: staffName, mode: mode, target: target,
+          staffId: String((body && body.staffId) || '').trim(),
+          note: String((body && body.note) || '').trim()};
 }
 
 function changeLocation(body){
   const sku = String((body && body.sku) || '').trim();
-  const to = String((body && body.toLocation) || '').trim();
-  const kind = String((body && body.kind) || '').trim();
-  const staffId = String((body && body.staffId) || '').trim();
-  const staffName = String((body && body.staffName) || '').trim();
-  const note = String((body && body.note) || '').trim();
   if(!sku) return {ok:false, error:'請提供品號'};
-  if(!to) return {ok:false, error:'請提供新儲位'};
-  if(LOC_CHANGE_KINDS.indexOf(kind) < 0) return {ok:false, error:'異動類型必須是：' + LOC_CHANGE_KINDS.join('／')};
-  if(!staffName) return {ok:false, error:'請先選擇人員'};
+  const opt = validateLocBody_(body);
+  if(opt.error) return {ok:false, error: opt.error};
 
-  const hit = lookupLocation({sku: sku});
-  if(!hit.ok) return {ok:false, reason: hit.reason || 'lookup_failed', error:'文山地圖裡找不到品號 ' + sku};
-  const from = hit.location;
-  if(from === to) return {ok:false, reason:'same', error:'新儲位跟現在一樣（' + to + '），沒有變更'};
+  const sh = getLocMapSheet_();
+  if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
+  const row = locIndex_(sh)[sku];
+  if(!row) return {ok:false, reason:'not_found', error:'文山地圖裡找不到品號 ' + sku};
 
-  // 先回寫來源。回寫失敗就整個中止，不要留下一筆「紀錄說搬了、地圖上沒搬」的假資料。
-  let writeBack = '';
-  try{
-    const sh = getLocMapSheet_();
-    sh.getRange(hit.row, LOCMAP_COL.location).setValue(to);
-    sh.getRange(hit.row, LOCMAP_COL.updated).setValue(locUpdateStamp_(staffName));
-    sh.getRange(hit.row, LOCMAP_COL.note)
-      .setValue(mergeLocNote_(hit.note, buildLocNote_(from, to, staffName)));
-    writeBack = '已回寫第' + hit.row + '列';
-  }catch(err){
-    return {ok:false, error:'回寫文山地圖失敗：' + err};
-  }
+  // 先回寫來源、再寫紀錄。回寫失敗就整個中止，
+  // 不要留下一筆「紀錄說搬了、地圖上沒搬」的假資料。
+  const res = applyLocChange_(sh, readLocRow_(sh, row, sku), opt);
+  if(!res.ok) return res;
+  locLogRows_([res], opt);
+  return Object.assign({updated: locUpdateStamp_(opt.staffName)}, res);
+}
 
-  const logSh = getSheet(SHEET_LOCLOG, LOCLOG_HEADER);
-  const o = {
-    logTime: nowStamp_(), sku: sku, baseName: hit.baseName,
-    fromLocation: from || '（原本沒有儲位）', toLocation: to, kind: kind,
-    staffId: staffId, staffName: staffName, note: note, writeBack: writeBack
-  };
-  const start = logSh.getLastRow() + 1;
-  logSh.getRange(start, colOf(LOCLOG_HEADER,'logTime')).setNumberFormat('@');
-  logSh.getRange(start, 1, 1, LOCLOG_HEADER.length)
-       .setValues([LOCLOG_HEADER.map(function(h){ return o[h]; })]);
+// 批次移動：同商品多顏色多尺寸整批搬到同一個位置時，一件一件送要等 N × 2秒。
+// 這裡整欄只讀一次、紀錄一次寫入，整批當一次呼叫處理。
+// 刻意不做成「一件失敗就全部回滾」——回滾要重寫已經改掉的格子，中途再出錯會更難收拾。
+// 改成逐件回報成敗，讓現場看得到哪幾件沒成功、可以只重做那幾件。
+function changeLocationBatch(body){
+  const skus = ((body && body.skus) || []).map(function(x){ return String(x||'').trim(); })
+                                          .filter(function(x){ return x; });
+  if(!skus.length) return {ok:false, error:'請提供至少一個品號'};
+  const opt = validateLocBody_(body);
+  if(opt.error) return {ok:false, error: opt.error};
 
-  return {ok:true, sku: sku, baseName: hit.baseName, from: o.fromLocation, to: to,
-          row: hit.row, updated: locUpdateStamp_(staffName), writeBack: writeBack};
+  const sh = getLocMapSheet_();
+  if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
+  const idx = locIndex_(sh);
+
+  const results = [];
+  skus.forEach(function(sku){
+    const row = idx[sku];
+    if(!row){ results.push({ok:false, sku: sku, reason:'not_found', error:'文山地圖裡找不到這個品號'}); return; }
+    results.push(applyLocChange_(sh, readLocRow_(sh, row, sku), opt));
+  });
+  const logged = locLogRows_(results, opt);
+  const okCount = results.filter(function(r){ return r.ok; }).length;
+  return {ok: okCount > 0, total: skus.length, okCount: okCount,
+          failCount: skus.length - okCount, logged: logged,
+          updated: locUpdateStamp_(opt.staffName), results: results};
 }
 
 // ================= 商品主圖對照 =================

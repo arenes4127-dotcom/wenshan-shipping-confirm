@@ -207,6 +207,32 @@
   .confirm-box .warn-line{color:#d98324;font-size:13px;line-height:1.5;margin:10px 0 16px;}
   .confirm-box .row{display:flex;gap:10px;}
   .confirm-box .row .btn{flex:1;}
+  /* 一次確認多件（批次移動儲位）：件數可能十幾件，要能捲動又要看得到圖，
+     不然「一併移動」等於閉著眼睛按確定。 */
+  .confirm-list{max-height:38vh;overflow:auto;margin-bottom:12px;border:1px solid var(--border);
+    border-radius:8px;}
+  .confirm-list .li{display:flex;gap:10px;align-items:center;padding:8px 10px;
+    border-bottom:1px solid var(--border);}
+  .confirm-list .li:last-child{border-bottom:none;}
+  .confirm-list .li img,.confirm-list .li .noimg{width:44px;height:44px;flex:none;border-radius:6px;
+    object-fit:contain;background:var(--panel2);}
+  .confirm-list .li .noimg{display:flex;align-items:center;justify-content:center;
+    font-size:10px;color:var(--muted2);}
+  .confirm-list .li .txt{flex:1;min-width:0;font-size:12px;line-height:1.45;}
+  .confirm-list .li .txt b{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
+
+  /* 批次待移動清單 */
+  .loc-row{display:flex;gap:10px;align-items:flex-start;padding:10px 0;
+    border-bottom:1px solid var(--border);}
+  .loc-row:last-child{border-bottom:none;}
+  .loc-row .body{flex:1;min-width:0;}
+  .loc-row.pending{opacity:.55;}
+  .loc-row.bad{border-left:3px solid var(--danger);padding-left:8px;}
+  .loc-chip{display:inline-block;font-family:ui-monospace,Menlo,Consolas,monospace;
+    font-size:13px;font-weight:700;color:var(--blue);border:1px solid var(--blue);
+    border-radius:6px;padding:1px 7px;margin:3px 4px 0 0;}
+  .loc-chip.alt{color:var(--muted);border-color:var(--border);}
+
   /* 兩張圖並排：換貨、商品不符都是「這個 vs 那個」的判斷，
      分開看要靠記憶比對，並排看一眼就知道是不是同一款。 */
   .confirm-pair{display:flex;gap:10px;margin-bottom:12px;}
@@ -264,6 +290,7 @@
       <h3 id="confirmTitle"></h3>
       <div id="confirmPic"></div>
       <div class="confirm-pair" id="confirmPair" style="display:none;"></div>
+      <div class="confirm-list" id="confirmList" style="display:none;"></div>
       <div class="meta" id="confirmMeta"></div>
       <input type="number" id="confirmQty" style="display:none;" min="1" step="1">
       <div class="warn-line" id="confirmWarn"></div>
@@ -515,18 +542,36 @@
       <div class="section-label">儲位異動</div>
       <div class="card">
         <p class="hint" style="margin-top:0;">上架、移櫃、盤點調整，或揀貨時發現東西不在標示的位置，都用這裡改。
-          送出後會直接更新「文山地圖」的文山倉儲位，並在後端留一筆異動紀錄。</p>
+          送出後會直接更新「文山地圖」的文山倉儲位，並在後端留一筆異動紀錄。<br>
+          <b>同一批要一起搬的（同商品多顏色、多尺寸）可以連續掃，最後一次送出。</b></p>
         <label class="field" style="margin-bottom:0;">
           <span>掃描或輸入商品條碼／貨號</span>
           <input id="locSkuInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
         </label>
-        <div id="locFound"></div>
+      </div>
+
+      <div class="card" id="locBatchBox" style="display:none;">
+        <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <b id="locBatchCount">待處理 0 件</b>
+          <button class="btn gray sm" id="btnLocClear">清空</button>
+        </div>
+        <div id="locBatchList"></div>
       </div>
 
       <div class="card" id="locFormBox" style="display:none;">
         <label class="field">
-          <span>新儲位</span>
-          <input id="locNewInput" class="scan-input" type="text" placeholder="例如 B01-2" autocomplete="off">
+          <span>要做什麼</span>
+          <select id="locModeSelect">
+            <option value="replace">移動到新儲位（原本的位置不再有貨）</option>
+            <option value="add">新增存放點（原本的位置還是有貨）</option>
+            <option value="remove">移除存放點（清空其中一個位置）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span id="locTargetLabel">新儲位</span>
+          <input id="locNewInput" class="scan-input" type="text" placeholder="例如 B01-2"
+                 autocomplete="off" list="locKnownList">
+          <datalist id="locKnownList"></datalist>
         </label>
         <label class="field">
           <span>異動類型</span>
@@ -1021,7 +1066,7 @@ async function gotoView(name){
   if(name==='loc'){
     renderLocKinds();
     renderStaffSelects();
-    renderLocFound();
+    renderLocBatch();
     renderLocHistory();
     setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 40);
   }
@@ -1684,9 +1729,17 @@ function renderPickList(){
   rows.forEach(function(r){
     if(r.location !== lastLoc){
       lastLoc = r.location;
-      const locText = r.location || '（無儲位）';
-      html += '<div style="margin:18px 0 8px;"><span class="loc-badge' + (r.location ? '' : ' none') + '">'
-        + escapeHtml(locText) + '</span></div>';
+      // 同一件商品可能放在兩個地方（儲位欄用「、」串）。第一個是揀貨路線用的主位置，
+      // 其餘的照樣列出來——架上沒貨時，知道「另一個地方也有」就不用整倉亂找。
+      const locParsed = parseLocList(r.location);
+      const primary = locParsed.list[0] || '';
+      html += '<div style="margin:18px 0 8px;"><span class="loc-badge' + (primary ? '' : ' none') + '">'
+        + escapeHtml(primary || '（無儲位）') + '</span>'
+        + (locParsed.list.length > 1
+            ? '<span class="hint" style="margin-left:8px;">另存於 '
+              + locParsed.list.slice(1).map(escapeHtml).join('、') + '</span>' : '')
+        + (locParsed.extra ? '<span class="hint" style="margin-left:8px;">' + escapeHtml(locParsed.extra) + '</span>' : '')
+        + '</div>';
     }
     // 批次模式一定要顯示訂單號——回到分揀台要靠它把貨分回各張訂單
     const orderTag = pickMode==='batch' ? '　<b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b>' : '';
@@ -1721,10 +1774,49 @@ function renderPickList(){
 // ============================================================
 // 為什麼要「先查、再改」而不是直接填一個新位置：儲位是揀貨路線的唯一依據，
 // 打錯一個字，之後每個人都會被帶到錯的地方，而且沒人會發現是這裡錯的。
-// 所以送出前一定先把「這個貨號現在登記在哪、叫什麼、長什麼樣」攤開來讓人對。
+// 所以送出前一定先把「這幾件現在登記在哪、叫什麼、長什麼樣」攤開來讓人對。
 const LOC_CHANGE_KINDS = ['上架', '移櫃', '揀貨時發現', '盤點調整', '其他'];
-let locCurrent = null;   // 目前查到的品項
+const LOC_MODE_TEXT = {
+  replace: {label:'新儲位',      verb:'移動',     btn:'移動到新儲位'},
+  add:     {label:'要新增的儲位', verb:'新增存放點', btn:'新增存放點'},
+  remove:  {label:'要移除的儲位', verb:'移除存放點', btn:'移除存放點'}
+};
+let locBatch = [];       // 待處理清單（可以是1件，也可以是整批）
 let locChanges = [];     // 這次開啟APP之後改過的，只留在本機供對照
+let locSeq = 0;          // 佔位列的識別碼
+
+// 儲位欄的多存放點寫法（跟後端同一套規則）：'C04-1、K08-1'＝兩個地方都有貨。
+// 只用來顯示，不拿來重組資料——那些「pa 5」「R04-2 牌面」是人長年手寫的，
+// 我們沒有資格把看不懂的寫法默默改掉。
+const LOC_SPLIT_RE = /[、,，/／]+/;
+const LOC_TOKEN_RE = /^[A-Za-z]{1,2}\s*\d{1,3}(?:\s*-\s*\d{1,2})?$/;
+function parseLocList(cell){
+  const raw = String(cell||'').trim();
+  if(!raw) return {list: [], extra: ''};
+  const list = [], extra = [];
+  raw.split(LOC_SPLIT_RE).map(function(x){ return x.trim(); })
+     .filter(function(x){ return x; })
+     .forEach(function(seg){
+    if(LOC_TOKEN_RE.test(seg)){ list.push(seg); return; }
+    const parts = seg.split(/\s+/);
+    const locs = parts.filter(function(x){ return LOC_TOKEN_RE.test(x); });
+    if(locs.length){
+      locs.forEach(function(x){ list.push(x); });
+      parts.filter(function(x){ return !LOC_TOKEN_RE.test(x); }).forEach(function(x){ extra.push(x); });
+    } else extra.push(seg);
+  });
+  if(!list.length) return {list: [raw], extra: ''};
+  return {list: list, extra: extra.join(' ')};
+}
+function locChipsHtml(cell){
+  const p = parseLocList(cell);
+  if(!p.list.length) return '<span class="loc-chip alt">（尚未建立儲位）</span>';
+  return p.list.map(function(x, i){
+    return '<span class="loc-chip' + (i ? ' alt' : '') + '">' + escapeHtml(x) + '</span>';
+  }).join('') + (p.extra ? '<span class="hint">　' + escapeHtml(p.extra) + '</span>' : '');
+}
+
+function locMode(){ return document.getElementById('locModeSelect').value; }
 
 function renderLocKinds(){
   const sel = document.getElementById('locKindSelect');
@@ -1732,27 +1824,71 @@ function renderLocKinds(){
   sel.innerHTML = LOC_CHANGE_KINDS.map(k=>`<option value="${k}">${k}</option>`).join('');
 }
 
-function renderLocFound(){
-  const box = document.getElementById('locFound');
+function renderLocBatch(){
+  const box = document.getElementById('locBatchBox');
+  const list = document.getElementById('locBatchList');
   const form = document.getElementById('locFormBox');
   if(!box) return;
-  if(!locCurrent){
-    box.innerHTML = '';
-    form.style.display = 'none';
-    return;
-  }
-  form.style.display = '';
-  box.innerHTML = '<div style="display:flex;gap:12px;align-items:flex-start;margin-top:12px;">' +
-      thumbHtml(locCurrent.sku, locCurrent.baseName) +
-      '<div style="flex:1;min-width:0;">' +
-        '<div class="sku-badge">' + escapeHtml(locCurrent.sku) + '</div>' +
-        '<div style="font-weight:700;margin-top:4px;">' + escapeHtml(locCurrent.baseName || '（無品名）') + '</div>' +
-        '<div class="hint" style="margin-top:8px;">目前儲位</div>' +
-        '<span class="loc-badge' + (locCurrent.location ? '' : ' none') + '">' +
-          escapeHtml(locCurrent.location || '（尚未建立儲位）') + '</span>' +
-        (locCurrent.updated ? '<div class="hint" style="margin-top:6px;">最後更新：' + escapeHtml(locCurrent.updated) + '</div>' : '') +
-        (locCurrent.note ? '<div class="hint" style="margin-top:2px;">備註：' + escapeHtml(locCurrent.note) + '</div>' : '') +
-      '</div></div>';
+  const ready = locBatch.filter(function(x){ return x.ok; });
+  box.style.display = locBatch.length ? '' : 'none';
+  form.style.display = ready.length ? '' : 'none';
+  const waiting = locBatch.filter(function(x){ return x.pending; }).length;
+  const dead = locBatch.filter(function(x){ return !x.pending && !x.ok; }).length;
+  const failed = ready.filter(function(x){ return x.failNote; }).length;
+  document.getElementById('locBatchCount').textContent = '待處理 ' + ready.length + ' 件'
+    + (waiting ? '（' + waiting + ' 件查詢中）' : '')
+    + (dead ? '（' + dead + ' 件查無資料）' : '')
+    + (failed ? '（' + failed + ' 件上次沒改到）' : '');
+
+  list.innerHTML = locBatch.map(function(it){
+    if(it.pending){
+      return '<div class="loc-row pending"><div class="body"><div class="sku-badge">' + escapeHtml(it.code)
+        + '</div><div class="hint" style="margin-top:4px;">查詢中…</div></div></div>';
+    }
+    if(!it.ok){
+      return '<div class="loc-row bad"><div class="body"><div class="sku-badge">' + escapeHtml(it.code)
+        + '</div><div class="hint" style="margin-top:4px;color:var(--danger);">' + escapeHtml(it.error||'查無資料')
+        + '</div></div>'
+        + '<button class="btn gray sm" onclick="locRemove(' + it.uid + ')">移除</button></div>';
+    }
+    return '<div class="loc-row">' + thumbHtml(it.sku, it.baseName) +
+      '<div class="body">' +
+        '<div class="sku-badge">' + escapeHtml(it.sku) + '</div>' +
+        '<div style="font-weight:700;margin-top:3px;font-size:13px;">' + escapeHtml(it.baseName||'（無品名）') + '</div>' +
+        '<div style="margin-top:2px;">' + locChipsHtml(it.location) + '</div>' +
+        (it.note ? '<div class="hint" style="margin-top:2px;">備註：' + escapeHtml(it.note) + '</div>' : '') +
+        (it.failNote ? '<div class="hint" style="margin-top:2px;color:var(--danger);">上次沒改到：'
+          + escapeHtml(it.failNote) + '</div>' : '') +
+      '</div>' +
+      '<button class="btn gray sm" onclick="locRemove(' + it.uid + ')">移除</button>' +
+    '</div>';
+  }).join('');
+
+  // 已知儲位丟進 datalist：移除存放點時可以直接選，不用手打（打錯就等於沒移除）
+  const known = {};
+  ready.forEach(function(it){ parseLocList(it.location).list.forEach(function(l){ known[l] = 1; }); });
+  document.getElementById('locKnownList').innerHTML =
+    Object.keys(known).map(function(l){ return '<option value="' + escapeHtml(l) + '">'; }).join('');
+  renderLocModeUi();
+}
+
+function renderLocModeUi(){
+  const m = LOC_MODE_TEXT[locMode()] || LOC_MODE_TEXT.replace;
+  const n = locBatch.filter(function(x){ return x.ok; }).length;
+  document.getElementById('locTargetLabel').textContent = m.label;
+  document.getElementById('btnLocSubmit').textContent =
+    n > 1 ? ('把這 ' + n + ' 件一併' + m.btn) : ('確認' + m.btn);
+}
+
+function locRemove(uid){
+  locBatch = locBatch.filter(function(x){ return x.uid !== uid; });
+  renderLocBatch();
+}
+function locClear(){
+  locBatch = [];
+  renderLocBatch();
+  const el = document.getElementById('locSkuInput');
+  if(el) el.focus();
 }
 
 function renderLocHistory(){
@@ -1771,77 +1907,149 @@ function renderLocHistory(){
   }).join('');
 }
 
-async function locLookup(code){
+// 掃一筆。國際條碼一碼可能對到多個貨號（實測13,597個條碼裡有28個是這樣，
+// 其中就有同款三個顏色共用一個條碼的），批次移動時那幾件本來就會一起搬，
+// 所以全部帶進清單、再讓人自己把不搬的移掉，比默默挑一個安全。
+async function locScan(code){
   const raw = String(code||'').trim();
   if(!raw) return;
   if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位異動要連上後端才能用',1800); return; }
-  // 掃到的可能是國際條碼，先用條碼對照轉成貨號再查（跟出貨掃描同一套解析）
-  const skus = [raw].concat(barcodeMap[raw] || []);
-  for(let i = 0; i < skus.length; i++){
-    let res;
-    try{ res = await apiPost('lookupLocation', {sku: skus[i]}); }
-    catch(err){ errorBeep(); flash('err','查詢失敗', err.message||'', 2200); return; }
-    if(res && res.ok){
-      locCurrent = res;
-      okBeep();
-      renderLocFound();
-      setTimeout(function(){ const el = document.getElementById('locNewInput'); if(el) el.focus(); }, 60);
-      return;
-    }
+  const cands = [raw].concat(barcodeMap[raw] || []);
+  if(locBatch.some(function(x){ return x.ok && cands.indexOf(x.sku) >= 0; })){
+    errorBeep(); flash('err','已經在清單裡了', raw, 1400); return;
   }
-  locCurrent = null;
-  renderLocFound();
-  errorBeep();
-  flash('err','文山地圖裡沒有這個貨號', '「' + raw + '」查不到儲位資料，請確認是不是文山倉的商品', 2600);
+  // 先放佔位列：查詢要2秒左右，沒有立即回饋的話人會以為沒掃到而重複掃
+  const uid = ++locSeq;
+  locBatch.push({uid: uid, code: raw, pending: true});
+  renderLocBatch();
+
+  let res;
+  try{ res = await apiPost('lookupLocations', {skus: cands}); }
+  catch(err){
+    const row = locBatch.find(function(x){ return x.uid === uid; });
+    if(row){ row.pending = false; row.ok = false; row.error = '查詢失敗：' + (err.message||''); }
+    renderLocBatch(); errorBeep(); return;
+  }
+  const idx = locBatch.findIndex(function(x){ return x.uid === uid; });
+  if(idx < 0) return;   // 查詢途中被人移掉了
+  const found = (res && res.found) || [];
+  if(!found.length){
+    locBatch[idx] = {uid: uid, code: raw, ok: false, error: '文山地圖裡沒有這個貨號'};
+    renderLocBatch(); errorBeep();
+    flash('err','文山地圖裡沒有這個貨號', '「' + raw + '」查不到儲位資料', 2400);
+    return;
+  }
+  const rows = found.filter(function(f){
+    return !locBatch.some(function(x){ return x.ok && x.sku === f.sku; });
+  }).map(function(f){
+    return {uid: ++locSeq, code: raw, ok: true, sku: f.sku, baseName: f.baseName,
+            location: f.location, locations: f.locations, note: f.note, updated: f.updated};
+  });
+  locBatch.splice(idx, 1);
+  locBatch = locBatch.concat(rows);
+  renderLocBatch();
+  okBeep();
+  if(found.length > 1) flash('ok','這個條碼對到 ' + found.length + ' 個貨號', '都加進清單了，不搬的請自己移掉', 2600);
+  setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 40);
 }
 
 async function locSubmit(){
-  if(!locCurrent) return;
-  const to = String(document.getElementById('locNewInput').value||'').trim();
+  const items = locBatch.filter(function(x){ return x.ok; });
+  if(!items.length) return;
+  const mode = locMode();
+  const m = LOC_MODE_TEXT[mode];
+  const target = String(document.getElementById('locNewInput').value||'').trim();
   const kind = document.getElementById('locKindSelect').value;
   const note = String(document.getElementById('locNoteInput').value||'').trim();
-  const staffId = document.getElementById('locStaffSelect').value;
-  const staffObj = staff.find(s=>s.id===staffId);
-  if(!to){ errorBeep(); flash('err','請填新儲位','',1600); return; }
+  const staffObj = staff.find(s=>s.id===document.getElementById('locStaffSelect').value);
+  if(!target){ errorBeep(); flash('err','請填' + m.label,'',1600); return; }
   if(!staffObj){ errorBeep(); flash('err','請先選擇異動人員','',1600); return; }
-  if(to === locCurrent.location){ errorBeep(); flash('err','新儲位跟現在一樣','沒有需要變更的地方',1800); return; }
 
-  // 這一改會蓋掉全倉共用的地圖，所以送出前看著圖再確認一次
+  // 送出前先在本機把明顯不合理的擋掉，省一趟來回，也讓錯誤訊息更即時
+  if(mode === 'remove'){
+    const notThere = items.filter(function(it){ return parseLocList(it.location).list.indexOf(target) < 0; });
+    if(notThere.length === items.length){
+      errorBeep(); flash('err','這些商品都沒有放在 ' + target, '請確認要移除的是哪個位置', 2600); return;
+    }
+  }
+  if(mode === 'replace' && items.every(function(it){ return it.location === target; })){
+    errorBeep(); flash('err','新儲位跟現在一樣','沒有需要變更的地方',1800); return;
+  }
+
   const ok = await confirmWithImage({
-    title: '確認變更儲位',
-    sku: locCurrent.sku,
+    title: (items.length > 1 ? '確認一併' + m.btn + '（' + items.length + ' 件）' : '確認' + m.btn),
+    items: items.map(function(it){
+      return {sku: it.sku, name: it.baseName,
+              sub: (mode === 'add' ? '目前：' + (it.location||'（無）') + ' ＋ ' + target
+                 : mode === 'remove' ? '目前：' + (it.location||'（無）') + ' － ' + target
+                 : (it.location||'（無）') + ' → ' + target)};
+    }),
     lines: [
-      {text: locCurrent.baseName || locCurrent.sku, strong: true},
-      {text: '貨號：' + locCurrent.sku},
-      {text: (locCurrent.location || '（尚未建立）') + '　→　' + to},
+      {text: m.btn + '：' + target, strong: true},
       {text: '類型：' + kind + '　人員：' + staffObj.name + (note ? '　備註：' + note : '')}
     ],
     warn: '確定後會直接改掉「文山地圖」上的儲位，之後所有人的揀貨路線都照新的走。'
-        + '請確認手上這件商品跟上圖相符，而且新儲位沒有打錯。',
-    okText: '確定變更'
+        + '請確認上面每一件都是真的要' + m.verb + '的，而且儲位沒有打錯。',
+    okText: '確定' + m.verb
   });
   if(!ok) return;
 
+  items.forEach(function(it){ delete it.failNote; });
+  const payload = {toLocation: target, kind: kind, mode: mode,
+                   staffId: staffObj.id, staffName: staffObj.name, note: note};
   let res;
   try{
-    res = await apiPost('changeLocation', {sku: locCurrent.sku, toLocation: to, kind: kind,
-      staffId: staffObj.id, staffName: staffObj.name, note: note});
+    res = items.length === 1
+      ? await apiPost('changeLocation', Object.assign({sku: items[0].sku}, payload))
+      : await apiPost('changeLocationBatch', Object.assign({skus: items.map(function(x){ return x.sku; })}, payload));
   }catch(err){
     errorBeep(); flash('err','變更失敗，儲位沒有被改動', err.message||'', 3000); return;
   }
-  if(!res || !res.ok){
-    errorBeep(); flash('err','變更失敗，儲位沒有被改動', (res && res.error) || '', 3000); return;
+
+  // 單筆跟批次的回應格式不同，統一成同一組結果再處理
+  const results = (res && res.results) ? res.results
+    : [Object.assign({sku: items[0].sku}, res || {ok:false, error:'沒有回應'})];
+  const okList = results.filter(function(r){ return r.ok; });
+  const badList = results.filter(function(r){ return !r.ok; });
+
+  if(!okList.length){
+    errorBeep();
+    flash('err','變更失敗，儲位沒有被改動', (badList[0] && (badList[0].error||'')) || '', 3200);
+    // 失敗的原因標到各列上，人才知道是哪幾件、為什麼
+    badList.forEach(function(r){
+      const row = locBatch.find(function(x){ return x.sku === r.sku; });
+      if(row) row.failNote = r.error || '沒有改到';
+    });
+    renderLocBatch();
+    return;
   }
+
   okBeep();
-  flash('ok','儲位已變更', res.sku + '　' + res.from + ' → ' + res.to, 2200);
-  locChanges.unshift({time: new Date().toLocaleTimeString('zh-TW'), sku: res.sku,
-    from: res.from, to: res.to, kind: kind, staffName: staffObj.name});
+  const now = new Date().toLocaleTimeString('zh-TW');
+  okList.forEach(function(r){
+    locChanges.unshift({time: now, sku: r.sku, from: r.from, to: r.to,
+      kind: kind, staffName: staffObj.name});
+  });
+  flash(badList.length ? 'warn' : 'ok',
+    badList.length ? ('完成 ' + okList.length + ' 件，' + badList.length + ' 件沒改到')
+                   : (okList.length > 1 ? (okList.length + ' 件都已' + m.verb) : '儲位已變更'),
+    okList.length === 1 ? (okList[0].sku + '　' + okList[0].from + ' → ' + okList[0].to)
+                        : (m.btn + '：' + target),
+    badList.length ? 4000 : 2200);
   renderLocHistory();
-  // 清掉表單、焦點回到掃描框，讓人可以一件接一件處理
-  document.getElementById('locNewInput').value = '';
-  document.getElementById('locNoteInput').value = '';
-  locCurrent = null;
-  renderLocFound();
+
+  // 成功的從清單移除，失敗的留著並標上原因——重掃一次很麻煩，留著才能只重做那幾件
+  const okSkus = okList.map(function(r){ return r.sku; });
+  locBatch = locBatch.filter(function(x){ return okSkus.indexOf(x.sku) < 0; });
+  locBatch.forEach(function(x){
+    const bad = badList.find(function(r){ return r.sku === x.sku; });
+    if(bad) x.failNote = bad.error || '沒有改到';
+  });
+  if(!locBatch.length){
+    document.getElementById('locNewInput').value = '';
+    document.getElementById('locNoteInput').value = '';
+  }
+  renderLocBatch();
   setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 60);
 }
 
@@ -1850,7 +2058,7 @@ async function locSubmit(){
 async function locFromPick(sku){
   await gotoView('loc');
   document.getElementById('locSkuInput').value = '';
-  await locLookup(sku);
+  await locScan(sku);
 }
 
 // 「這張揀好了」的區塊。已完成時改成顯示時間與人，並留一個取消的出口——
@@ -2646,10 +2854,49 @@ function confirmWithImage(opt){
     const picBox = document.getElementById('confirmPic');
     const pairBox = document.getElementById('confirmPair');
     const qtyInput = document.getElementById('confirmQty');
+    const listBox = document.getElementById('confirmList');
     picBox.textContent = '';
     pairBox.textContent = '';
+    listBox.textContent = '';
     pairBox.style.display = 'none';
+    listBox.style.display = 'none';
     qtyInput.style.display = 'none';
+    // 一次確認多件：列出每一件的圖與貨號。只顯示件數不列明細的話，
+    // 掃錯的那一件會被「共12件」這個數字蓋過去，沒有人有機會發現。
+    if(opt.items && opt.items.length){
+      listBox.style.display = '';
+      opt.items.forEach(function(it){
+        const li = document.createElement('div');
+        li.className = 'li';
+        const url = productImageUrl(it.sku, true);
+        if(url){
+          const img = document.createElement('img');
+          img.src = url; img.alt = '';
+          li.appendChild(img);
+        } else {
+          const nb = document.createElement('div');
+          nb.className = 'noimg';
+          nb.textContent = '無圖';
+          li.appendChild(nb);
+        }
+        const txt = document.createElement('div');
+        txt.className = 'txt';
+        const b = document.createElement('b');
+        b.textContent = it.sku;
+        txt.appendChild(b);
+        const nm = document.createElement('div');
+        nm.textContent = it.name || '';
+        txt.appendChild(nm);
+        if(it.sub){
+          const sb = document.createElement('div');
+          sb.style.cssText = 'color:var(--muted);';
+          sb.textContent = it.sub;
+          txt.appendChild(sb);
+        }
+        li.appendChild(txt);
+        listBox.appendChild(li);
+      });
+    }
     // 單張圖（opt.sku）跟並排兩張圖（opt.pair）二擇一
     if(opt.pair && opt.pair.length){
       pairBox.style.display = 'flex';
@@ -3266,11 +3513,13 @@ document.getElementById('locSkuInput').addEventListener('keydown', e=>{
   if(e.key !== 'Enter') return;
   const code = e.target.value.trim();
   e.target.value = '';
-  locLookup(code);
+  locScan(code);
 });
 document.getElementById('locNewInput').addEventListener('keydown', e=>{
   if(e.key === 'Enter') locSubmit();
 });
+document.getElementById('locModeSelect').addEventListener('change', renderLocModeUi);
+document.getElementById('btnLocClear').addEventListener('click', locClear);
 document.getElementById('btnLocSubmit').addEventListener('click', locSubmit);
 
 const pickBarcodeInput = document.getElementById('pickBarcodeInput');
