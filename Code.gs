@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-12.86';
+const BACKEND_VERSION = '2026-08-12.87';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1896,6 +1896,13 @@ function closeCancelledByNote_(){
 // 「https://s-cf-tw.shopeesz.com/file/」等於白白多傳 700KB 給每一台裝置，
 // 網址前綴在APP端補回去就好。
 const PRODUCT_IMAGE_SOURCE_ID = '1vkMgsfaesSQ2Arn9DwwO1KS5bnKdPZW8';
+// 第二份來源：規格層級的圖（賣場後台的「貨號對應選項」）。
+// 前一份的「商品圖片1」是商品層級的，同款不同色共用同一張，只能確認款式不能確認顏色。
+// 這一份的「選項圖片」是每個規格自己的圖——實測3293個多規格商品裡有2901個的圖會隨規格變，
+// 深灰/淺灰兩條毛巾拿到的是兩張不同的照片。這是揀貨現場真正需要的東西。
+// 兩份合併成一張對照表：規格圖優先，沒有的退回商品圖。
+const SPEC_IMAGE_SOURCE_ID = '1DeqU2CnmM1XL-J3IudjDzc8OmMuv7Bqz';
+const SPEC_IMAGE_TAB = '貨號對應選項';
 const PRODUCT_IMAGE_PREFIX = 'https://s-cf-tw.shopeesz.com/file/';
 const SHEET_PRODUCT_IMAGE = '商品主圖';
 
@@ -1945,21 +1952,62 @@ function importProductImages_(){
     });
   });
 
+  // ---- 第二份來源：規格層級的圖 ----
+  const specMap = {};
+  let specSkipped = 0, specForeign = 0;
+  try{
+    const src2 = SpreadsheetApp.openById(SPEC_IMAGE_SOURCE_ID);
+    const sh2 = src2.getSheetByName(SPEC_IMAGE_TAB) || src2.getSheets()[0];
+    const last2 = sh2.getLastRow();
+    if(last2 >= 2){
+      const head2 = sh2.getRange(1, 1, 1, sh2.getLastColumn()).getValues()[0]
+                       .map(function(x){ return String(x||'').trim(); });
+      const jSku = head2.indexOf('商品選項貨號');
+      const jImg = head2.indexOf('選項圖片');
+      if(jSku >= 0 && jImg >= 0){
+        const cols2 = [jSku, jImg];
+        const from2 = Math.min.apply(null, cols2) + 1;
+        const to2 = Math.max.apply(null, cols2) + 1;
+        const v2 = sh2.getRange(2, from2, last2 - 1, to2 - from2 + 1).getValues();
+        v2.forEach(function(row){
+          const sku = String(row[jSku + 1 - from2]||'').trim();
+          const img = String(row[jImg + 1 - from2]||'').trim();
+          if(!sku) return;
+          if(!img){ specSkipped++; return; }
+          if(img.indexOf(PRODUCT_IMAGE_PREFIX) !== 0){ specForeign++; return; }
+          if(!specMap[sku]) specMap[sku] = img.slice(PRODUCT_IMAGE_PREFIX.length);
+        });
+      }
+    }
+  }catch(err){
+    // 第二份讀不到就只寫商品圖，不要整個匯入失敗——有商品圖總比完全沒有圖好
+    Logger.log('規格圖來源讀取失敗，只匯入商品圖：' + err);
+  }
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(SHEET_PRODUCT_IMAGE);
   if(!sh) sh = ss.insertSheet(SHEET_PRODUCT_IMAGE);
   sh.clear();
-  const out = Object.keys(map).map(function(k){ return [k, map[k]]; });
-  sh.getRange(1, 1, 1, 2).setValues([['貨號','圖片ID']]).setFontWeight('bold');
+  // 兩份的貨號取聯集：有些貨號只在其中一份出現
+  const allSkus = {};
+  Object.keys(map).forEach(function(k){ allSkus[k] = 1; });
+  Object.keys(specMap).forEach(function(k){ allSkus[k] = 1; });
+  const out = Object.keys(allSkus).map(function(k){ return [k, map[k] || '', specMap[k] || '']; });
+  sh.getRange(1, 1, 1, 3).setValues([['貨號','圖片ID','規格圖ID']]).setFontWeight('bold');
   if(out.length){
     // 貨號欄設成文字格式：有些貨號是純數字，被當數字會掉前導零、長的還會變科學記號
     sh.getRange(2, 1, out.length, 1).setNumberFormat('@');
-    sh.getRange(2, 1, out.length, 2).setValues(out);
+    sh.getRange(2, 1, out.length, 3).setValues(out);
   }
-  sh.setColumnWidth(1, 180); sh.setColumnWidth(2, 320);
+  sh.setColumnWidth(1, 180); sh.setColumnWidth(2, 320); sh.setColumnWidth(3, 320);
   sh.setFrozenRows(1);
-  return {ok:true, 貨號數: out.length, 用商品圖片1: out.length - usedFallback, 退回主商品圖片: usedFallback,
-          無圖片略過: skipped, 網域不符略過: foreign,
+  const bothCount = out.filter(function(r){ return r[1] && r[2]; }).length;
+  return {ok:true, 貨號數: out.length,
+          有商品圖: Object.keys(map).length, 有規格圖: Object.keys(specMap).length, 兩者都有: bothCount,
+          只有規格圖: Object.keys(specMap).length - bothCount,
+          只有商品圖: Object.keys(map).length - bothCount,
+          商品圖用商品圖片1: Object.keys(map).length - usedFallback, 商品圖退回主商品圖片: usedFallback,
+          商品圖無圖略過: skipped, 網域不符略過: foreign + specForeign,
           分頁: SHEET_PRODUCT_IMAGE, gid: sh.getSheetId()};
 }
 
@@ -1971,9 +2019,12 @@ function checkProductImageCoverage_(){
   if(!sh) return {error:'還沒建立「' + SHEET_PRODUCT_IMAGE + '」分頁'};
   const lastRow = sh.getLastRow();
   if(lastRow < 2) return {error:'對照表是空的'};
-  const map = {};
-  sh.getRange(2, 1, lastRow - 1, 2).getValues().forEach(function(r){
-    const k = String(r[0]||'').trim(); if(k) map[k] = String(r[1]||'').trim();
+  const map = {}, specMap = {};
+  sh.getRange(2, 1, lastRow - 1, 3).getValues().forEach(function(r){
+    const k = String(r[0]||'').trim(); if(!k) return;
+    const img = String(r[1]||'').trim(), spec = String(r[2]||'').trim();
+    if(img || spec) map[k] = img || spec;   // 有任何一種圖就算有圖
+    if(spec) specMap[k] = spec;
   });
   const rows = readOrderRows();
   const skuQty = {};
@@ -1988,10 +2039,13 @@ function checkProductImageCoverage_(){
   const missQty = all.filter(function(s){ return !map[s]; })
                      .reduce(function(n,s){ return n + skuQty[s]; }, 0);
   const hitQty = hit.reduce(function(n,s){ return n + skuQty[s]; }, 0);
+  const specHit = all.filter(function(s){ return specMap[s]; });
   return {
     對照表貨號數: Object.keys(map).length,
     訂單涉及貨號數: all.length,
     有圖貨號數: hit.length,
+    有規格圖貨號數: specHit.length,
+    規格圖涵蓋率: all.length ? Math.round(specHit.length / all.length * 100) + '%' : '-',
     貨號涵蓋率: all.length ? Math.round(hit.length / all.length * 100) + '%' : '-',
     件數涵蓋率: (hitQty + missQty) ? Math.round(hitQty / (hitQty + missQty) * 100) + '%' : '-',
     無圖貨號樣本: all.filter(function(s){ return !map[s]; }).slice(0, 10)

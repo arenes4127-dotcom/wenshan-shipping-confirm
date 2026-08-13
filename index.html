@@ -162,6 +162,10 @@
      不會跟藍色（儲位／訂單號）、橘色（警告）、紅色（錯誤）混淆。 */
   .spec-text{font-size:16px;font-weight:700;color:#5fd3ad;line-height:1.35;}
   td .spec-text{font-size:15px;}
+  /* 規格可以點開看該規格的實際圖片。加底線＋放大鏡符號，不然沒人知道它可以點。 */
+  .spec-text.clickable{cursor:zoom-in;text-decoration:underline;text-decoration-style:dotted;
+    text-underline-offset:3px;}
+  .spec-text.clickable::after{content:" 🔍";font-size:12px;text-decoration:none;}
 
   /* 分揀檢視／調撥區的儲位是行內的小徽章，不必跟主清單一樣大 */
   .loc-chip{display:inline-block;font-size:14px;font-weight:700;color:#8ab4f8;
@@ -701,12 +705,28 @@ let barcodeMap = {};
 // 前綴在這裡補回去就好。縮圖加 _tn（約40KB），放大才載原圖（約450KB）——
 // 揀貨清單一次要顯示幾十張，載原圖會直接把現場的網路吃光。
 const PRODUCT_IMAGE_PREFIX = 'https://s-cf-tw.shopeesz.com/file/';
-let productImages = {};
+let productImages = {};   // 貨號 → 商品層級的圖（同款不同色共用同一張）
+let specImages = {};      // 貨號 → 這個規格自己的圖（深灰/淺灰會是兩張不同的照片）
+// 有規格圖就用規格圖：它才回答得了「顏色對不對」這個問題，而那正是揀錯貨的主要來源。
+// 沒有規格圖的才退回商品圖——那種情況下圖片只能確認款式，畫面上要講清楚。
 function productImageUrl(sku, thumb){
-  const id = productImages[String(sku||'').trim()];
+  const key = String(sku||'').trim();
+  const id = specImages[key] || productImages[key];
   if(!id) return '';
   return PRODUCT_IMAGE_PREFIX + id + (thumb ? '_tn' : '');
 }
+function hasSpecImage(sku){ return !!specImages[String(sku||'').trim()]; }
+// 規格的 HTML。有圖就做成可點的（點了看該規格的實際照片），沒圖就是純文字——
+// 點了沒反應比不能點更讓人困惑。
+function specHtml(sku, spec){
+  const can = !!productImageUrl(sku, false);
+  const cls = can ? 'spec-text clickable' : 'spec-text';
+  const onclick = can
+    ? ' onclick="event.stopPropagation();openImgView(\'' + String(sku).replace(/'/g, "\\'") + '\')"'
+    : '';
+  return '<div class="' + cls + '"' + onclick + ' style="margin-top:5px;">' + escapeHtml(spec) + '</div>';
+}
+
 // 縮圖的 HTML。沒有對照到的貨號顯示「無圖」而不是破圖——
 // 破圖會讓人以為是網路壞了而一直重整，「無圖」才看得出是這個商品沒有資料。
 function thumbHtml(sku, name){
@@ -724,8 +744,12 @@ function openImgView(sku){
   // 說明文字要帶規格：主圖是「商品層級」的，同款不同色共用同一張圖，
   // 只看圖分不出顏色/尺寸，一定要把規格寫在旁邊一起看。
   const item = findItemBySku(sku);
-  document.getElementById('imgViewCap').textContent =
-    item ? (item.name || item.baseName || sku) : sku;
+  const base = item ? (item.name || item.baseName || sku) : sku;
+  // 講清楚眼前這張是哪一種圖。以前一律警告「同款不同色共用同一張圖」，
+  // 現在多數品項已經有規格自己的圖，還照著警告就是在講一件不成立的事。
+  document.getElementById('imgViewCap').textContent = base + (hasSpecImage(sku)
+    ? '　—　此為該規格的實際圖片'
+    : '　—　此為商品主圖，同款不同色共用，僅能確認款式');
   el.classList.add('show');
 }
 function closeImgView(){
@@ -761,13 +785,22 @@ async function loadProductImages(silent){
     const table = parseCsvRFC4180(await res.text());
     const header = table[0] || [];
     const iSku = header.indexOf('貨號'), iId = header.indexOf('圖片ID');
+    // 規格圖欄是後來才加的，舊格式的對照表沒有這一欄也要能載入，不要整個失敗
+    const iSpec = header.indexOf('規格圖ID');
     if(iSku < 0 || iId < 0) throw new Error('找不到貨號/圖片ID欄');
-    const map = {};
+    const map = {}, smap = {};
     table.slice(1).forEach(function(row){
-      const sku = (row[iSku]||'').trim(), id = (row[iId]||'').trim();
-      if(sku && id) map[sku] = id;
+      const sku = (row[iSku]||'').trim();
+      if(!sku) return;
+      const id = (row[iId]||'').trim();
+      if(id) map[sku] = id;
+      if(iSpec >= 0){
+        const sid = (row[iSpec]||'').trim();
+        if(sid) smap[sku] = sid;
+      }
     });
     productImages = map;
+    specImages = smap;
     settings.productImageLoadedAt = new Date().toLocaleString('zh-TW');
     saveJSON(LS.settings, settings);
     renderProductImageStatus();
@@ -781,7 +814,10 @@ function renderProductImageStatus(){
   const el = document.getElementById('productImageStatus');
   if(!el) return;
   const n = Object.keys(productImages).length;
-  el.textContent = n ? ('已載入 ' + n + ' 筆（' + (settings.productImageLoadedAt||'') + '）') : '尚未載入';
+  const sn = Object.keys(specImages).length;
+  el.textContent = n
+    ? ('已載入 ' + n + ' 筆（其中 ' + sn + ' 筆有規格圖）　' + (settings.productImageLoadedAt||''))
+    : '尚未載入';
 }
 
 // 同步時從來源整份資料數出來的訂單狀態分佈（含不屬於本倉的山物出／中華宅配）。
@@ -1469,7 +1505,7 @@ function renderPickList(){
           // 由上而下：貨號 → 規格 → 品名 → 賣場/訂單號。
           // 前兩項才是「拿對東西」要看的，品名長又常常好幾款共用開頭，擺在第三行。
           '<div class="sku-badge">' + escapeHtml(r.sku) + '</div>' +
-          (r.spec ? '<div class="spec-text" style="margin-top:5px;">' + escapeHtml(r.spec) + '</div>' : '') +
+          (r.spec ? specHtml(r.sku, r.spec) : '') +
           '<div style="font-weight:700;margin-top:3px;">' + escapeHtml(r.baseName) + '</div>' +
           '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.store) + orderTag + '</div>' +
         '</div>' +
@@ -1498,7 +1534,7 @@ function renderTransferSection(transferRows, scope){
       '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
         '<div style="flex:1;min-width:0;">' +
           '<div class="sku-badge">' + escapeHtml(r.sku) + '</div>' +
-          (r.spec ? '<div class="spec-text" style="margin-top:5px;">' + escapeHtml(r.spec) + '</div>' : '') +
+          (r.spec ? specHtml(r.sku, r.spec) : '') +
           '<div style="font-weight:700;margin-top:3px;">' + escapeHtml(r.baseName) + '</div>' +
           '<div class="hint" style="margin-top:2px;"><b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b></div>' +
         '</div>' +
@@ -1528,7 +1564,7 @@ function renderSortView(scope){
           '<div style="flex:1;min-width:0;">' +
             '<div class="sku-text">' + escapeHtml(it.sku) +
               '<span class="loc-chip">' + escapeHtml(it.location||'無儲位') + '</span></div>' +
-            (it.spec ? '<div class="spec-text" style="margin-top:3px;">' + escapeHtml(it.spec) + '</div>' : '') +
+            (it.spec ? specHtml(it.sku, it.spec) : '') +
             '<div style="font-weight:600;margin-top:3px;">' + escapeHtml(it.baseName||it.name||'') + '</div>' +
           '</div>' +
           '<div style="text-align:right;white-space:nowrap;">' +
@@ -1873,10 +1909,10 @@ function renderItemTable(){
     // 規格擺在貨號下面，品名欄只留品名本身、字級不變。
     // 品名裡本來就含著「（規格）」，兩邊都顯示會變成同一件事講兩次，所以品名優先用 baseName；
     // 手動CSV匯入的品項沒有 baseName/spec，就退回原本的 name 整串。
-    const specHtml = i.spec ? `<div class="spec-text">${escapeHtml(i.spec)}</div>` : '';
+    const specCell = i.spec ? specHtml(i.sku, i.spec) : '';
     const nameText = i.baseName || i.name || '';
     tr.innerHTML = `<td>${thumbHtml(i.sku, i.baseName || i.name)}</td>`+
-      `<td><span class="sku-text">${escapeHtml(i.sku)}</span>${specHtml}</td><td>${escapeHtml(nameText)}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
+      `<td><span class="sku-text">${escapeHtml(i.sku)}</span>${specCell}</td><td>${escapeHtml(nameText)}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
       `<td style="white-space:nowrap;">`+
       `<button class="btn gray sm" onclick="adjustScanned('${skuEsc}')">修改</button> `+
       `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button> `+
@@ -2196,8 +2232,11 @@ async function confirmNoBarcode(sku){
       {text: '貨號：' + item.sku},
       {text: '應出 ' + item.qty + ' 件，已核 ' + item.scanned + ' 件'}
     ],
-    warn: '請比對實體商品與上圖是否為同一款，並確認規格（顏色／尺寸）相符——'
-        + '同款不同色共用同一張圖，圖片只能確認款式。確定後會記錄在差異明細供事後稽核。',
+    warn: (hasSpecImage(item.sku)
+        ? '上圖就是這個規格的實際圖片，請直接比對實體商品是否相符。'
+        : '請比對實體商品與上圖是否為同一款，並確認規格（顏色／尺寸）相符——'
+          + '這個商品沒有規格圖，上圖是商品主圖、同款不同色共用，只能確認款式。')
+        + '確定後會記錄在差異明細供事後稽核。',
     okText: '確認是這一件'
   });
   if(!ok) return;
