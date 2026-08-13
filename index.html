@@ -424,7 +424,10 @@
         </div>
         <label class="field" style="margin-top:10px;margin-bottom:0;">
           <span>每批訂單數上限</span>
-          <input id="pickBatchSize" type="text" value="10" inputmode="numeric" style="max-width:110px;">
+          <select id="pickBatchSize" style="max-width:110px;">
+            <option>5</option><option selected>10</option><option>15</option>
+            <option>20</option><option>30</option>
+          </select>
         </label>
         <p class="hint" style="margin-top:8px;">一趟走完多張訂單的貨，回到分揀台再依訂單分裝。用「分揀檢視」按訂單分組核對。</p>
       </div>
@@ -434,7 +437,8 @@
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">
             <input type="checkbox" id="pickHideDone" checked style="width:auto;"> 隱藏已揀
           </label>
-          <input id="pickFilter" type="text" placeholder="篩選賣場／寄送方式" autocomplete="off" style="flex:1;min-width:140px;">
+          <select id="pickFilterStore" style="flex:1;min-width:130px;"><option value="">全部賣場</option></select>
+          <select id="pickFilterShip" style="flex:1;min-width:150px;"><option value="">全部寄送方式</option></select>
         </div>
       </div>
 
@@ -477,7 +481,11 @@
 
       <div class="section-label">待出貨清單</div>
       <div class="card">
-        <input id="pendingSearch" type="text" placeholder="搜尋訂單號／賣場／寄送方式" style="margin-bottom:12px;">
+        <div class="row" style="margin-bottom:12px;gap:10px;flex-wrap:wrap;">
+          <input id="pendingSearch" type="text" placeholder="搜尋訂單號" style="flex:2;min-width:150px;">
+          <select id="pendingStore" style="flex:1;min-width:130px;"><option value="">全部賣場</option></select>
+          <select id="pendingShip" style="flex:1;min-width:150px;"><option value="">全部寄送方式</option></select>
+        </div>
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>訂單號</th><th>日期</th><th>賣場</th><th>寄送方式</th><th>品項數</th><th>總數量</th></tr></thead>
@@ -1408,13 +1416,25 @@ function pickScopeOrders(){
   return pickBatch.map(no=>orders[no]).filter(o=>o && o.status==='pending' && !isManuallyClosed(o));
 }
 
+// 篩選條件集中在這裡讀，批次抓單跟畫面過濾才不會各判各的
+function pickFilterValues(){
+  const st = document.getElementById('pickFilterStore');
+  const sp = document.getElementById('pickFilterShip');
+  return {store: st ? st.value : '', ship: sp ? sp.value : ''};
+}
+function matchPickFilter(o, f){
+  if(f.store && String(o.store||'') !== f.store) return false;
+  if(f.ship && String(o.shipMethod||'') !== f.ship) return false;
+  return true;
+}
+
 // 批次模式：從待揀訂單裡取前 N 張（跳過已經全部揀完的）
 function startNewBatch(){
   const size = Math.max(1, parseInt(document.getElementById('pickBatchSize').value, 10) || 10);
-  const kw = (document.getElementById('pickFilter').value||'').trim().toLowerCase();
+  const f = pickFilterValues();
   const candidates = pickableOrders().filter(o=>{
     if(orderFullyPicked(o)) return false;
-    if(kw && !((o.store||'')+' '+(o.shipMethod||'')+' '+o.orderNo).toLowerCase().includes(kw)) return false;
+    if(!matchPickFilter(o, f)) return false;
     return true;
   });
   pickBatch = candidates.slice(0, size).map(o=>o.orderNo);
@@ -1429,6 +1449,11 @@ function renderPickList(){
   const container = document.getElementById('pickList');
   const summary = document.getElementById('pickSummary');
   const hideDone = document.getElementById('pickHideDone').checked;
+  // 選項來自「所有可揀的訂單」而不是目前這一批：篩選是用來決定下一批要抓誰的，
+  // 只列目前批次裡有的值，就永遠篩不到批次外的賣場。
+  const pickable = pickableOrders();
+  fillFilterOptions('pickFilterStore', pickable.map(function(o){ return o.store; }), '全部賣場');
+  fillFilterOptions('pickFilterShip', pickable.map(function(o){ return o.shipMethod; }), '全部寄送方式');
   const scope = pickScopeOrders();
 
   if(pickMode==='single' && !pickCurrentOrder){
@@ -1629,14 +1654,20 @@ function renderPending(){
   const q = (document.getElementById('pendingSearch').value||'').trim().toLowerCase();
   // 已經人工結案的（別的門市/倉庫出掉、缺貨取消、取消訂單）不算待出貨，不要讓人員掃到
   let pendingList = Object.values(orders).filter(o=>o.status==='pending' && !isManuallyClosed(o));
+  // 下拉選項取自「目前待出貨的訂單」，選單裡不會出現今天根本沒單的賣場
+  fillFilterOptions('pendingStore', pendingList.map(o=>o.store), '全部賣場');
+  fillFilterOptions('pendingShip', pendingList.map(o=>o.shipMethod), '全部寄送方式');
+  const fStore = (document.getElementById('pendingStore')||{}).value || '';
+  const fShip = (document.getElementById('pendingShip')||{}).value || '';
+  if(fStore) pendingList = pendingList.filter(o=>String(o.store||'') === fStore);
+  if(fShip) pendingList = pendingList.filter(o=>String(o.shipMethod||'') === fShip);
   if(q){
-    pendingList = pendingList.filter(o=>
-      (o.orderNo||'').toLowerCase().includes(q) ||
-      (o.store||'').toLowerCase().includes(q) ||
-      (o.shipMethod||'').toLowerCase().includes(q)
-    );
+    // 訂單號用文字搜尋（沒辦法做成選單，幾百個訂單號的下拉沒人選得動），
+    // 賣場／寄送方式交給旁邊的下拉。
+    pendingList = pendingList.filter(o=>(o.orderNo||'').toLowerCase().includes(q));
   }
-  if(!pendingList.length){ tbody.innerHTML = `<tr><td colspan="6" class="empty-row">${q?'沒有符合搜尋條件的訂單':'目前沒有待出貨訂單'}</td></tr>`; return; }
+  const hasFilter = q || fStore || fShip;
+  if(!pendingList.length){ tbody.innerHTML = `<tr><td colspan="6" class="empty-row">${hasFilter?'沒有符合條件的訂單':'目前沒有待出貨訂單'}</td></tr>`; return; }
   tbody.innerHTML = pendingList.map(o=>{
     const totalQty = o.items.reduce((s,i)=>s+i.qty,0);
     const noteFlag = String(o.specialNote||'').trim() ? ' <span class="tag warn">註記</span>' : '';
@@ -1644,6 +1675,10 @@ function renderPending(){
   }).join('');
 }
 document.getElementById('pendingSearch').addEventListener('input', renderPending);
+['pendingStore','pendingShip'].forEach(function(id){
+  const el = document.getElementById(id);
+  if(el) el.addEventListener('change', renderPending);
+});
 
 // ============================================================
 // 掃描出貨流程
@@ -2612,6 +2647,28 @@ function renderLastSync(){
   note.className = isToday ? 'note' : 'note warn';
 }
 
+// 賣場／寄送方式的下拉選項用「目前實際有的值」自動生成，不寫死清單：
+// 寫死的話多一個新賣場或新的寄送方式（蝦皮偶爾會改名）就會漏掉，
+// 而且漏掉的表現是「選單裡沒有那個選項」，不會有人發現是程式沒更新。
+// 保留使用者已選的值：重新整理選項時如果把選擇洗掉，正在篩選的人會突然看到全部訂單。
+function fillFilterOptions(selectId, values, allLabel){
+  const el = document.getElementById(selectId);
+  if(!el) return;
+  const keep = el.value;
+  const list = [...new Set(values.filter(function(v){ return String(v||'').trim(); }))].sort();
+  el.innerHTML = '';
+  const optAll = document.createElement('option');
+  optAll.value = ''; optAll.textContent = allLabel;
+  el.appendChild(optAll);
+  list.forEach(function(v){
+    const o = document.createElement('option');
+    o.value = v; o.textContent = v;
+    el.appendChild(o);
+  });
+  // 先前選的值如果還在清單裡就留著，不在了（例如那個賣場今天沒單）就退回「全部」
+  el.value = list.indexOf(keep) >= 0 ? keep : '';
+}
+
 // 待出貨的組成。前三格算的是本機訂單資料（＝我們自己要出的貨，含前期累積）；
 // 後三格是同步時從來源數來的當日快照，本系統不匯入那些訂單，本機永遠查不到。
 function renderHomeBreakdown(pending){
@@ -2668,7 +2725,7 @@ renderHome();
 // ---- 揀貨初始化 ----
 pickQueue = loadJSON(LS.pickQueue, []);
 if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就繼續送
-['pickFilter','pickHideDone'].forEach(id=>{
+['pickFilterStore','pickFilterShip','pickHideDone'].forEach(id=>{
   const el = document.getElementById(id);
   if(el) el.addEventListener(el.type==='checkbox'?'change':'input', renderPickList);
 });
