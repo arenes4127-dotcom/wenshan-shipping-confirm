@@ -119,6 +119,37 @@
   .progress-num{font-size:40px;font-weight:800;}
   .progress-num span{color:var(--muted2);font-size:24px;}
 
+  /* ---- 貨號與儲位 ---- */
+  /* 貨號原本跟賣場、訂單號一起塞在灰色小字那行，字小又跟旁邊同色，
+     現場要靠它比對商品卻得瞇著眼找。獨立成一行、放大、等寬字，
+     等寬字對「O 跟 0」「I 跟 1」這種辨識特別有用，貨號裡這兩組很常見。 */
+  .sku-text{font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+    font-size:17px;font-weight:700;letter-spacing:.5px;color:var(--text);
+    word-break:break-all;line-height:1.3;}
+  /* 表格裡的貨號一律不換行：欄寬被擠窄時 word-break:break-all 會變成一行一個字，
+     整欄變成直排，比原本的小字還難讀（實際踩到）。改成撐開表格、讓外層橫向捲動。
+     出貨核對表的品名也給個底寬，不然它會被壓成一行兩個字。 */
+  td .sku-text{font-size:16px;white-space:nowrap;word-break:normal;}
+  #itemTable{min-width:720px;}
+  #itemTable td:nth-child(3){min-width:220px;}
+  /* 窄螢幕上14碼的貨號會被擠到換行，最後一兩個字元單獨掉到第二行——
+     那正是最需要看清楚的位置（同款商品往往只差最後一碼）。
+     縮一級字並收掉字距，讓它在手機上也排得下一行。 */
+  @media (max-width:430px){
+    .sku-text{font-size:15px;letter-spacing:0;}
+  }
+  /* 儲位是揀貨時第一個要看的東西——先走到那一格才談得上找商品。
+     放大、加框、加底色，讓它在整頁裡是最先被看到的東西。 */
+  .loc-badge{display:inline-block;font-size:22px;font-weight:800;letter-spacing:1px;
+    color:#8ab4f8;background:rgba(138,180,248,.12);border:2px solid #8ab4f8;
+    border-radius:8px;padding:4px 14px;line-height:1.25;}
+  .loc-badge.none{color:var(--muted2);background:transparent;border-color:var(--border);
+    font-size:16px;letter-spacing:0;}
+  /* 分揀檢視／調撥區的儲位是行內的小徽章，不必跟主清單一樣大 */
+  .loc-chip{display:inline-block;font-size:14px;font-weight:700;color:#8ab4f8;
+    background:rgba(138,180,248,.12);border:1px solid #8ab4f8;border-radius:6px;
+    padding:1px 8px;margin-left:6px;}
+
   /* ---- 商品縮圖 ---- */
   /* 無條碼商品沒辦法用掃描確認，只能靠人眼比對，光看品名很容易拿錯
      （同款不同色的品名幾乎一樣）。縮圖就是給這種情況用的。 */
@@ -1406,7 +1437,9 @@ function renderPickList(){
   rows.forEach(function(r){
     if(r.location !== lastLoc){
       lastLoc = r.location;
-      html += '<div class="section-label" style="margin-top:14px;">' + escapeHtml(r.location||'（無儲位）') + '</div>';
+      const locText = r.location || '（無儲位）';
+      html += '<div style="margin:18px 0 8px;"><span class="loc-badge' + (r.location ? '' : ' none') + '">'
+        + escapeHtml(locText) + '</span></div>';
     }
     // 批次模式一定要顯示訂單號——回到分揀台要靠它把貨分回各張訂單
     const orderTag = pickMode==='batch' ? '　<b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b>' : '';
@@ -1417,7 +1450,8 @@ function renderPickList(){
         '<div style="flex:1;min-width:0;">' +
           '<div style="font-weight:700;' + (r.picked?'text-decoration:line-through;':'') + '">' +
             escapeHtml(r.baseName) + (r.spec?'（'+escapeHtml(r.spec)+'）':'') + '</div>' +
-          '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.sku) + '　' + escapeHtml(r.store) + orderTag + '</div>' +
+          '<div class="sku-text" style="margin-top:4px;">' + escapeHtml(r.sku) + '</div>' +
+          '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.store) + orderTag + '</div>' +
         '</div>' +
         '<div style="text-align:right;white-space:nowrap;">' +
           '<div style="font-size:22px;font-weight:800;">×' + r.qty + '</div>' +
@@ -1444,7 +1478,8 @@ function renderTransferSection(transferRows, scope){
       '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
         '<div style="flex:1;min-width:0;">' +
           '<div style="font-weight:700;">' + escapeHtml(r.baseName) + (r.spec?'（'+escapeHtml(r.spec)+'）':'') + '</div>' +
-          '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.sku) + '　<b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b></div>' +
+          '<div class="sku-text" style="margin-top:4px;">' + escapeHtml(r.sku) + '</div>' +
+          '<div class="hint" style="margin-top:2px;"><b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b></div>' +
         '</div>' +
         '<div style="text-align:right;white-space:nowrap;">' +
           '<div style="font-size:15px;font-weight:800;color:#e69138;">' + escapeHtml(r.alloc.fromText) + '</div>' +
@@ -1471,7 +1506,8 @@ function renderSortView(scope){
         '<div style="display:flex;justify-content:space-between;gap:10px;">' +
           '<div style="flex:1;min-width:0;">' +
             '<div style="font-weight:600;">' + escapeHtml(it.baseName||it.name||'') + (it.spec?'（'+escapeHtml(it.spec)+'）':'') + '</div>' +
-            '<div class="hint">' + escapeHtml(it.sku) + '　' + escapeHtml(it.location||'（無儲位）') + '</div>' +
+            '<div class="sku-text" style="margin-top:3px;">' + escapeHtml(it.sku) +
+              '<span class="loc-chip">' + escapeHtml(it.location||'無儲位') + '</span></div>' +
           '</div>' +
           '<div style="text-align:right;white-space:nowrap;">' +
             '<div style="font-size:18px;font-weight:800;">×' + it.qty + '</div>' +
@@ -1813,7 +1849,7 @@ function renderItemTable(){
     tr.className=cls;
     const skuEsc = i.sku.replace(/'/g,"\\'");
     tr.innerHTML = `<td>${thumbHtml(i.sku, i.baseName || i.name)}</td>`+
-      `<td>${i.sku}</td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
+      `<td><span class="sku-text">${i.sku}</span></td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
       `<td style="white-space:nowrap;">`+
       `<button class="btn gray sm" onclick="adjustScanned('${skuEsc}')">修改</button> `+
       `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button> `+
