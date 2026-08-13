@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.88';
+const BACKEND_VERSION = '2026-08-13.89';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -48,7 +48,7 @@ const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'
 // 為什麼要另外存一欄，而不是直接改 itemsJson：訂單每次同步都會從來源整列重寫，
 // 直接改品項的話下一次同步（一天4次＋隨時手動）就被蓋回去，改了等於沒改。
 // 存成「指令」而不是「改完的結果」，來源之後又變動（客服改了數量）也還套得上去。
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote','itemsOverrideJson'];
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote','itemsOverrideJson','pickDoneAt','pickDoneBy'];
 const SHEET_PICKLOG = '揀貨紀錄';
 // APP 的兩個入口。正式網頁版（GitHub Pages）是倉庫裝置在用的；
 // Drive 那份是同一支 index.html 的副本，網路連不到 GitHub 時的備援。
@@ -88,7 +88,8 @@ const HEADER_LABELS = {
   logTime:'時間', event:'事件', detail:'說明',
   logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
   pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作',
-  itemsOverrideJson:'品項修改(JSON)'
+  itemsOverrideJson:'品項修改(JSON)',
+  pickDoneAt:'揀貨完成時間', pickDoneBy:'揀貨完成人'
 };
 
 function doGet(e){
@@ -112,6 +113,7 @@ function doPost(e){
       case 'uploadFileToDrive': result = uploadFileToDrive(body.folderId, body.fileName, body.content, body.mimeType); break;
       case 'logNetFailures': result = logNetFailures(body.entries || []); break;
       case 'markPickedBatch': result = markPickedBatch(body.ops || []); break;
+      case 'markPickDone': result = markPickDone(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -289,7 +291,9 @@ function getState(){
       manualClose: String(r.manualClose || '').trim(),
       logisticsConfirmed: String(r.logisticsConfirmed || '').trim(),
       logisticsTime: String(r.logisticsTime || '').trim(),
-      specialNote: String(r.specialNote || '').trim()
+      specialNote: String(r.specialNote || '').trim(),
+      pickDoneAt: String(r.pickDoneAt || '').trim(),
+      pickDoneBy: String(r.pickDoneBy || '').trim()
     };
     // 把「已揀」狀態掛回各品項上，前端就不用自己再對一次
     const picked = safeParse(r.pickedJson, {});
@@ -445,7 +449,10 @@ function mergeOrders(incoming){
       // 特殊註記是客服寫的，由 syncSpecialNotes_ 專門更新，一般同步不要動它
       specialNote: existing ? (existing.specialNote||'') : '',
       // 品項修改指令要留著，不然同步一次就把主管改過的內容洗掉了
-      itemsOverrideJson: override
+      itemsOverrideJson: override,
+      // 揀貨完成的時間與人也是現場做出來的，同步只更新訂單內容，不能洗掉
+      pickDoneAt: existing ? (existing.pickDoneAt||'') : '',
+      pickDoneBy: existing ? (existing.pickDoneBy||'') : ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     if(existing) updated++; else added++;
@@ -632,7 +639,8 @@ const DAILY_STAT_FIELDS = [
   ['　└ 調撥（待調入）', '收盤待出貨-調撥'],
   ['　└ 缺貨', '收盤待出貨-缺貨'],
   ['掃描中', '收盤掃描中'],
-  ['已進物流籃未結案', '已進物流籃未結案']
+  ['已進物流籃未結案', '已進物流籃未結案'],
+  ['已揀完待包', '收盤已揀完待包']
 ];
 
 // 掃描儀表板上「標籤在左、數字在右」的那幾組欄位，做成 標籤→值 的對照。
@@ -1063,6 +1071,11 @@ function setupDashboardSheet_(){
     // 細項湊不齊總數（實測差過1張，是訂單狀態空白的）會讓人整個不信任這張表，
     // 而且那一張反而是最該被看到的——狀態空白代表來源資料有問題。
     ['　└ 其他', '=MAX(0,$B$5-$B$6-$B$7-$B$8)'],
+    // 揀完了但還沒開始掃描出貨的張數＝現在躺在包貨區等人包的量。
+    // 這個數字持續變大就是包貨端塞住了，光看「待出貨」看不出來是揀不動還是包不動。
+    // 欄位letter是照 ORDERS_HEADER 的順序數出來的：pickDoneAt 是第19個＝S欄。
+    // （寫這行時先數成R欄，那是 itemsOverrideJson——這種錯不會報錯，只會算出一個看起來合理的數字。）
+    ['已揀完待包', `=COUNTIFS(${O}!$G$2:$G,"待出貨*",${O}!$M$2:$M,"",${O}!$S$2:$S,"<>")`],
     ['掃描中', `=COUNTIFS(${O}!$G$2:$G,"掃描中*",${O}!$M$2:$M,"")`],
     // 看門狗：正常應該一直是0。有數字代表有人用舊流程包貨（掃了物流籃但沒走本系統），
     // 每小時的自動結案會把它清掉，所以看到非0多半是剛發生、還沒輪到下一次同步。
@@ -1611,7 +1624,8 @@ function healOrderRowIfNeeded_(sh, row){
     updatedAt: oldUpdatedAt || '', shipMethod: oldShipMethod || '', routingStatus: oldRoutingStatus || '',
     // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
     // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
-    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: '', itemsOverrideJson: ''};
+    manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: '', itemsOverrideJson: '',
+    pickDoneAt: '', pickDoneBy: ''};
   // 寫回試算表的狀態要轉成中文，回傳給呼叫端的物件維持英文代碼
   sh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
     .setValues([ORDERS_HEADER.map(h=> h==='status' ? statusToText(fixed.status) : fixed[h])]);
@@ -2666,6 +2680,43 @@ function onEdit(e){
     // 觸發器裡不能讓例外靜靜消失，寫進系統紀錄才查得到
     try{ appendSysLog_('onEdit 例外', '', '', String(err)); }catch(e2){}
   }
+}
+
+// ---------------- 揀貨完成：這張單的貨已經揀齊、放到包貨區 ----------------
+// 為什麼需要這一步：逐件點掉只知道「每一件幾點被揀」，不知道「這張什麼時候可以包」。
+// 沒有這個時間點就沒辦法回答「揀完到包完隔多久」「現在有幾張躺在包貨區等人包」，
+// 而那正是現場塞車時最想知道的兩件事。
+// 狀態刻意不動：訂單狀態的權威在掃描出貨那條路徑，揀貨完成只是多一個時間戳，
+// 兩邊各記各的才不會互相蓋掉。
+function markPickDone(body){
+  const orderNo = String((body && body.orderNo) || '').trim();
+  if(!orderNo) return {ok:false, error:'missing orderNo'};
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const row = rows.find(function(r){ return String(r.orderNo||'').trim() === orderNo; });
+  if(!row) return {ok:false, reason:'not_found'};
+  if(row.status === 'shipped') return {ok:false, reason:'already_shipped'};
+
+  const undo = !!(body && body.undo);
+  const atCol = colOf(ORDERS_HEADER, 'pickDoneAt');
+  const byCol = colOf(ORDERS_HEADER, 'pickDoneBy');
+  const time = undo ? '' : (String((body && body.time) || '') || nowStamp_());
+  const who = undo ? '' : String((body && body.pickerName) || (body && body.pickerId) || '');
+  sh.getRange(row._row, atCol).setNumberFormat('@');
+  sh.getRange(row._row, atCol, 1, 2).setValues([[time, who]]);
+
+  // 揀貨紀錄留一筆，跟逐件的紀錄放同一張表，事後看得出整張單的完整過程
+  const logSh = getSheet(SHEET_PICKLOG, PICKLOG_HEADER);
+  const o = {
+    logTime: undo ? nowStamp_() : time, orderNo: orderNo, sku: '', baseName: '（整張訂單）',
+    location: '', qty: '', pickerId: String((body && body.pickerId) || ''),
+    pickerName: String((body && body.pickerName) || ''),
+    action: undo ? '取消揀貨完成' : '揀貨完成'
+  };
+  const start = logSh.getLastRow() + 1;
+  logSh.getRange(start, 1, 1, PICKLOG_HEADER.length)
+       .setValues([PICKLOG_HEADER.map(function(h){ return o[h]; })]);
+  return {ok:true, orderNo: orderNo, pickDoneAt: time, pickDoneBy: who};
 }
 
 // ---------------- 已進物流籃卻還掛在待出貨的訂單，自動結案 ----------------

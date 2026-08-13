@@ -1607,7 +1607,8 @@ function renderPickList(){
   if(!rows.length){
     container.innerHTML = '<div class="card"><p class="hint">' +
       (total ? '文山的部分都揀完了 🎉' + (pickMode==='single' ? '' : '　可以按「分揀檢視」開始分裝') : '文山沒有要揀的品項') +
-      '</p></div>' + renderTransferSection(transferRows, scope);
+      '</p>' + (pickMode==='single' ? pickDoneBoxHtml(scope[0]) : '') + '</div>'
+      + renderTransferSection(transferRows, scope);
     container.innerHTML = noteHtml + container.innerHTML;
     return;
   }
@@ -1641,7 +1642,88 @@ function renderPickList(){
         '</div>' +
       '</div></div>';
   });
-  container.innerHTML = noteHtml + html + renderTransferSection(transferRows, scope);
+  container.innerHTML = noteHtml
+    + (pickMode==='single' ? '<div class="card">' + pickDoneBoxHtml(scope[0]) + '</div>' : '')
+    + html + renderTransferSection(transferRows, scope);
+}
+
+// 「這張揀好了」的區塊。已完成時改成顯示時間與人，並留一個取消的出口——
+// 按錯了如果沒得改，人就會去改別的地方（或乾脆不用這個功能）。
+function pickDoneBoxHtml(o){
+  if(!o) return '';
+  const no = String(o.orderNo).replace(/'/g, "\\'");
+  if(orderPickDone(o)){
+    return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">' +
+      '<div style="color:var(--accent);font-weight:700;">✅ 已標記揀貨完成　' +
+        escapeHtml(o.pickDoneAt||'') + '　' + escapeHtml(o.pickDoneBy||'') + '</div>' +
+      '<button class="btn gray sm" onclick="markPickDone(\'' + no + '\', true)">取消完成</button></div>';
+  }
+  const left = unpickedCount(o);
+  return '<button class="btn block" onclick="markPickDone(\'' + no + '\')">' +
+    '這張揀好了，放到包貨區' + (left ? '（還有 ' + left + ' 件沒點）' : '') + '</button>';
+}
+
+// ---- 揀貨完成 ----
+// 逐件點掉只知道「每一件幾點被揀」，不知道「這張什麼時候可以包」。
+// 這個動作補上那個時間點，包貨端才看得出有幾張躺在包貨區等人包。
+// 刻意不改訂單狀態：狀態的權威在掃描出貨那條路徑，這裡只多記一個時間戳。
+function orderPickDone(o){ return !!String((o && o.pickDoneAt) || '').trim(); }
+
+// 這張單「文山要揀的」還有幾件沒點。調撥的品項不算——那些本來就不在文山，
+// 揀貨員找不到也不該算成他漏點。
+function unpickedCount(o){
+  return (o.items||[]).filter(function(it){
+    return itemAlloc(it).pickQty > 0 && !it.picked;
+  }).length;
+}
+
+async function markPickDone(orderNo, undo){
+  const o = orders[orderNo];
+  if(!o) return;
+  const staffSel = document.getElementById('pickStaffSelect');
+  const pickerId = staffSel ? staffSel.value : '';
+  if(!pickerId && !undo){ errorBeep(); flash('err','請先選擇揀貨人員','',1600); return; }
+  const staffObj = staff.find(function(s){ return s.id === pickerId; });
+
+  if(!undo){
+    const left = unpickedCount(o);
+    if(left > 0){
+      const ok = await confirmWithImage({
+        title: '還有 ' + left + ' 件沒點到',
+        lines: [
+          {text: '訂單 ' + orderNo, strong: true},
+          {text: '文山要揀的品項還有 ' + left + ' 件沒有標記為已揀'}
+        ],
+        warn: '確定這幾件都已經放進揀貨盒了嗎？直接完成的話，那幾件在紀錄上會是「沒揀過」，'
+            + '之後對帳查不出來是漏揀還是漏點。建議先回去把它們點掉。',
+        okText: '仍要標記完成',
+        hideCancel: false
+      });
+      if(!ok) return;
+    }
+  }
+
+  const time = new Date().toLocaleString('zh-TW');
+  // 樂觀更新：畫面先反應，失敗再退回。揀貨是連續動作，等網路會卡住現場。
+  const prevAt = o.pickDoneAt || '', prevBy = o.pickDoneBy || '';
+  o.pickDoneAt = undo ? '' : time;
+  o.pickDoneBy = undo ? '' : (staffObj ? staffObj.name : pickerId);
+  saveJSON(LS.orders, orders);
+  okBeep();
+  renderPickList();
+  if(!undo) flash('ok','已標記揀貨完成', orderNo + '　可以放到包貨區了', 1600);
+
+  if(!hasBackend()) return;
+  try{
+    await apiPost('markPickDone', {orderNo: orderNo, undo: !!undo,
+      pickerId: pickerId, pickerName: staffObj ? staffObj.name : '', time: time});
+  }catch(err){
+    o.pickDoneAt = prevAt; o.pickDoneBy = prevBy;
+    saveJSON(LS.orders, orders);
+    renderPickList();
+    errorBeep();
+    flash('err','標記失敗', '網路不通，這張的揀貨完成沒有記錄下來，請再按一次', 2600);
+  }
 }
 
 // 需要從其他門店調撥的品項單獨一區。這些貨不在文山，揀貨員找不到也不該去找；
@@ -1684,6 +1766,8 @@ function renderSortView(scope){
     const waitTag = orderNeedsTransfer(o) ? '　<span style="color:#e69138;">⚠ 待調撥・放待調區</span>' : '';
     html += '<div class="section-label" style="margin-top:14px;">' + escapeHtml(o.orderNo) + '　' +
       escapeHtml(o.store||'') + '　' + escapeHtml(o.shipMethod||'') + '　(' + doneCount + '/' + its.length + ')' + waitTag + '</div>';
+    // 分揀台是「一張一張確認並裝箱」的地方，按鈕放在每張訂單的標題下面最順手
+    html += '<div class="card" style="padding:10px;margin-bottom:6px;">' + pickDoneBoxHtml(o) + '</div>';
     its.forEach(function(it){
       html += '<div class="card" style="padding:10px;margin-bottom:6px;' + (it.picked?'':'border-color:var(--danger);') + '"' +
         ' onclick="togglePick(\'' + escapeHtml(o.orderNo) + '\',\'' + escapeHtml(it.sku) + '\')">' +
@@ -2839,7 +2923,27 @@ document.getElementById('btnModeSingle').addEventListener('click', ()=>setPickMo
 document.getElementById('btnModeBatch').addEventListener('click', ()=>setPickMode('batch'));
 
 // 單張模式：掃訂單號
-document.getElementById('pickOrderInput').addEventListener('keydown', e=>{
+// 換到另一張單之前，如果這張還有沒點到的品項就先問一次。
+// 沒有這一問的話，漏點會靜靜地留在資料裡：那幾件在紀錄上是「沒揀過」，
+// 事後對帳分不出是漏揀（貨沒放進盒子）還是漏點（貨有揀只是忘了點）。
+async function confirmLeaveOrder(){
+  if(pickMode !== 'single' || !pickCurrentOrder) return true;
+  const o = orders[pickCurrentOrder];
+  if(!o || orderPickDone(o)) return true;
+  const left = unpickedCount(o);
+  if(!left) return true;
+  return await confirmWithImage({
+    title: '這張還有 ' + left + ' 件沒點到',
+    lines: [
+      {text: '訂單 ' + pickCurrentOrder, strong: true},
+      {text: '文山要揀的品項還有 ' + left + ' 件沒有標記為已揀'}
+    ],
+    warn: '現在換單的話，那幾件在紀錄上會是「沒揀過」，事後分不出是漏揀還是漏點。',
+    okText: '仍要換單'
+  });
+}
+
+document.getElementById('pickOrderInput').addEventListener('keydown', async e=>{
   if(e.key !== 'Enter') return;
   const code = e.target.value.trim();
   e.target.value = '';
@@ -2850,12 +2954,14 @@ document.getElementById('pickOrderInput').addEventListener('keydown', e=>{
     flash('err','找不到此訂單', `「${code}」不在待出貨清單中`, 1400);
     return;
   }
+  if(code !== pickCurrentOrder && !(await confirmLeaveOrder())) return;
   pickCurrentOrder = code;
   localStorage.setItem('ssz_pick_order', code);
   okBeep();
   renderPickList();
 });
-document.getElementById('btnPickClearOrder').addEventListener('click', ()=>{
+document.getElementById('btnPickClearOrder').addEventListener('click', async ()=>{
+  if(!(await confirmLeaveOrder())) return;
   pickCurrentOrder = '';
   localStorage.removeItem('ssz_pick_order');
   renderPickList();
