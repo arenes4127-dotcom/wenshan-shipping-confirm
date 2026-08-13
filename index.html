@@ -426,7 +426,7 @@
           <span>每批訂單數上限</span>
           <select id="pickBatchSize" style="max-width:110px;">
             <option>5</option><option selected>10</option><option>15</option>
-            <option>20</option><option>30</option>
+            <option>20</option><option>30</option><option value="all">全部</option>
           </select>
         </label>
         <p class="hint" style="margin-top:8px;">一趟走完多張訂單的貨，回到分揀台再依訂單分裝。用「分揀檢視」按訂單分組核對。</p>
@@ -439,6 +439,7 @@
           </label>
           <select id="pickFilterStore" style="flex:1;min-width:130px;"><option value="">全部賣場</option></select>
           <select id="pickFilterShip" style="flex:1;min-width:150px;"><option value="">全部寄送方式</option></select>
+          <select id="pickFilterZone" style="flex:1;min-width:120px;"><option value="">全部區域</option></select>
         </div>
       </div>
 
@@ -1159,7 +1160,14 @@ async function syncOrders(){
     const idx = name => header.indexOf(name);
     const iOrder = idx('訂單'), iSku = idx('品號'), iName = idx('品名'), iSpec = idx('規格'),
           iQty = idx('數量'), iStore = idx('賣場'), iDate = idx('日期'), iStatus = idx('訂單狀態'),
-          iShipMethod = idx('寄送方式');
+          iShipMethod = idx('寄送方式'),
+          // 揀貨要用的欄位。這裡原本沒讀，而 mergeOrders 是整包覆蓋品項的，
+          // 結果是「有人在APP按一下同步，就把後端排程同步寫進去的儲位跟分配數全部洗掉」——
+          // 揀貨清單的走動順序失效（全部落到「無儲位」）、需調撥的品項也不再標示，
+          // 揀貨員會跑去文山找根本不在文山的貨。實測31張待出貨訂單有0張還留著儲位。
+          iLocation = idx('文山儲位'), iStockWs = idx('文山'), iStockMain = idx('總倉'),
+          iShort = idx('缺貨量'), iAllocWs = idx('文山分配'), iAllocSp = idx('山物分配'),
+          iAllocZh = idx('中華分配'), iAllocOm = idx('OM分配');
     if(iOrder<0 || iSku<0 || iQty<0) throw new Error('試算表欄位格式不符（找不到訂單/品號/數量欄）');
 
     const parsed = {};
@@ -1184,10 +1192,24 @@ async function syncOrders(){
       const date = iDate>=0 ? parseOrderDate(row[iDate]) : '';
       const shipMethod = iShipMethod>=0 ? (row[iShipMethod]||'').trim() : '';
       const routingStatus = iStatus>=0 ? (row[iStatus]||'').trim() : '';
+      const location = iLocation>=0 ? (row[iLocation]||'').trim() : '';
+      const stockWs = iStockWs>=0 ? (row[iStockWs]||'').trim() : '';
+      const stockMain = iStockMain>=0 ? (row[iStockMain]||'').trim() : '';
+      const num = i => { const v = i>=0 ? parseInt(row[i], 10) : 0; return isNaN(v) ? 0 : v; };
+      const allocWs = num(iAllocWs), allocSp = num(iAllocSp), allocZh = num(iAllocZh),
+            allocOm = num(iAllocOm), shortQty = num(iShort);
       if(!parsed[orderNo]) parsed[orderNo] = {orderNo, store, date, shipMethod, routingStatus, items:[], status:'pending'};
       const existingItem = parsed[orderNo].items.find(it=>it.sku===sku);
-      if(existingItem) existingItem.qty += qty;
-      else parsed[orderNo].items.push({sku, name, baseName, spec, qty, scanned:0});
+      if(existingItem){
+        // 同一張訂單同一個品號出現多列時，數量與各店分配數都要累加——
+        // 只加數量的話分配數會停在第一列，調撥判斷就會少算。
+        existingItem.qty += qty;
+        existingItem.allocWs += allocWs; existingItem.allocSp += allocSp;
+        existingItem.allocZh += allocZh; existingItem.allocOm += allocOm;
+        existingItem.shortQty += shortQty;
+      }
+      else parsed[orderNo].items.push({sku, name, baseName, spec, qty, scanned:0,
+        location, stockWs, stockMain, allocWs, allocSp, allocZh, allocOm, shortQty});
     }
     const n = Object.keys(parsed).length;
     const byStatus = {};
@@ -1345,6 +1367,24 @@ function locationSortKey(loc){
   return '2|' + p.aisle + '|' + pad(p.bay) + '|' + pad(p.level) + '|' + String(loc||'');
 }
 
+// 儲位屬於哪一區。走道編號就是區域代碼（M32-2 → M區），解析不出來的歸「未建立／其他」——
+// 那些是還沒編儲位的商品，實務上要另外找，不能混在某一區裡讓人以為走過去就有。
+const ZONE_OTHER = '__other__';
+function zoneOf(loc){
+  const p = parseLocation(loc);
+  return p ? p.aisle : ZONE_OTHER;
+}
+function zoneLabel(z){ return z === ZONE_OTHER ? '未建立／其他' : (z + '區'); }
+// 選單順序照實際走動順序（M → A~L → P/Q/R/T/U → 其他），不要用字母排序：
+// 這個順序就是揀貨員走的路線，照它排才找得到「我現在在哪一區」。
+function zoneSortIndex(z){
+  const i0 = AISLE_ORDER.indexOf(z);
+  if(i0 >= 0) return i0;
+  const i1 = SECONDARY_AISLE_ORDER.indexOf(z);
+  if(i1 >= 0) return 100 + i1;
+  return z === ZONE_OTHER ? 999 : 500;
+}
+
 // 待送出的揀貨動作。跟出貨那邊一樣走樂觀更新：點下去畫面立刻反應，
 // 累積起來批次送後端——揀貨是連續動作，每點一件就等一次網路的話現場沒辦法用。
 let pickQueue = [];
@@ -1416,6 +1456,30 @@ function pickScopeOrders(){
   return pickBatch.map(no=>orders[no]).filter(o=>o && o.status==='pending' && !isManuallyClosed(o));
 }
 
+// 區域選單的選項：這一批訂單實際涉及的區域，照走動順序排。
+function fillZoneOptions(el, scope){
+  const zones = {};
+  scope.forEach(function(o){
+    (o.items||[]).forEach(function(it){
+      const a = itemAlloc(it);
+      if(a.pickQty <= 0) return;          // 要調撥、文山根本揀不到的不列入區域
+      zones[zoneOf(it.location)] = true;
+    });
+  });
+  const list = Object.keys(zones).sort(function(a, b){ return zoneSortIndex(a) - zoneSortIndex(b); });
+  const keep = el.value;
+  el.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = ''; all.textContent = '全部區域';
+  el.appendChild(all);
+  list.forEach(function(z){
+    const o = document.createElement('option');
+    o.value = z; o.textContent = zoneLabel(z);
+    el.appendChild(o);
+  });
+  el.value = list.indexOf(keep) >= 0 ? keep : '';
+}
+
 // 篩選條件集中在這裡讀，批次抓單跟畫面過濾才不會各判各的
 function pickFilterValues(){
   const st = document.getElementById('pickFilterStore');
@@ -1430,14 +1494,17 @@ function matchPickFilter(o, f){
 
 // 批次模式：從待揀訂單裡取前 N 張（跳過已經全部揀完的）
 function startNewBatch(){
-  const size = Math.max(1, parseInt(document.getElementById('pickBatchSize').value, 10) || 10);
+  // 「全部」＝這一批就抓完所有符合條件的訂單。用 Infinity 而不是一個很大的數字，
+  // 免得哪天訂單數超過那個數字又被默默截斷。
+  const rawSize = document.getElementById('pickBatchSize').value;
+  const size = rawSize === 'all' ? Infinity : Math.max(1, parseInt(rawSize, 10) || 10);
   const f = pickFilterValues();
   const candidates = pickableOrders().filter(o=>{
     if(orderFullyPicked(o)) return false;
     if(!matchPickFilter(o, f)) return false;
     return true;
   });
-  pickBatch = candidates.slice(0, size).map(o=>o.orderNo);
+  pickBatch = (size === Infinity ? candidates : candidates.slice(0, size)).map(o=>o.orderNo);
   saveJSON('ssz_pick_batch', pickBatch);
   pickSortView = false;
   if(!pickBatch.length) flash('err','沒有可揀的訂單','待出貨清單裡沒有符合條件、且還沒揀完的訂單',1800);
@@ -1455,6 +1522,15 @@ function renderPickList(){
   fillFilterOptions('pickFilterStore', pickable.map(function(o){ return o.store; }), '全部賣場');
   fillFilterOptions('pickFilterShip', pickable.map(function(o){ return o.shipMethod; }), '全部寄送方式');
   const scope = pickScopeOrders();
+  // 區域選單只在批次模式有意義（單張揀貨就是把那一張走完，沒有分區的餘地），
+  // 而且選項要來自「這一批實際有的區域」——列出整個倉庫的區域，選了卻沒東西，
+  // 人會以為是系統壞了。
+  const zoneSel = document.getElementById('pickFilterZone');
+  if(zoneSel){
+    zoneSel.style.display = pickMode === 'batch' ? '' : 'none';
+    if(pickMode === 'batch') fillZoneOptions(zoneSel, scope);
+    else zoneSel.value = '';
+  }
 
   if(pickMode==='single' && !pickCurrentOrder){
     summary.textContent = '掃描一張訂單號開始揀貨';
@@ -1482,6 +1558,14 @@ function renderPickList(){
       if(a.transferQty > 0) transferRows.push(base);
     });
   });
+  // 區域篩選只縮小「現在要走的範圍」，不改變這一批有哪些訂單——
+  // 分揀檢視要看到整批的全貌，所以那邊不套用。
+  const zoneFilter = (pickMode === 'batch' && !pickSortView && document.getElementById('pickFilterZone'))
+    ? document.getElementById('pickFilterZone').value : '';
+  const zoneAll = rows.length;
+  if(zoneFilter) rows = rows.filter(function(r){ return zoneOf(r.location) === zoneFilter; });
+  const zoneHidden = zoneAll - rows.length;
+
   const total = rows.length, done = rows.filter(r=>r.picked).length;
   if(hideDone && !pickSortView) rows = rows.filter(r=>!r.picked);
 
@@ -1489,7 +1573,10 @@ function renderPickList(){
   summary.textContent = (pickMode==='single'
       ? '訂單 ' + scope[0].orderNo + '　' + (scope[0].store||'') + '　' + (scope[0].shipMethod||'')
       : '本批 ' + scope.length + ' 張訂單')
+    + (zoneFilter ? '　【' + zoneLabel(zoneFilter) + '】' : '')
     + '　共 ' + total + ' 項，已揀 ' + done + '，剩 ' + (total-done)
+    // 有篩區域時一定要講清楚被藏了幾項，不然「剩0」會被當成整批揀完了
+    + (zoneHidden ? '　（其他區還有 ' + zoneHidden + ' 項）' : '')
     + (transferRows.length ? '　⚠ ' + transferRows.length + ' 件需調撥' : '')
     + (pickQueue.length ? '（' + pickQueue.length + ' 筆待同步）' : '');
 
@@ -2725,7 +2812,7 @@ renderHome();
 // ---- 揀貨初始化 ----
 pickQueue = loadJSON(LS.pickQueue, []);
 if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就繼續送
-['pickFilterStore','pickFilterShip','pickHideDone'].forEach(id=>{
+['pickFilterStore','pickFilterShip','pickFilterZone','pickHideDone'].forEach(id=>{
   const el = document.getElementById(id);
   if(el) el.addEventListener(el.type==='checkbox'?'change':'input', renderPickList);
 });
