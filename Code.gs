@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.98';
+const BACKEND_VERSION = '2026-08-13.101';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -48,7 +48,11 @@ const LEGACY_SHEET_NAMES = { '訂單':'Orders', '出貨紀錄':'Log', '人員':'
 // 為什麼要另外存一欄，而不是直接改 itemsJson：訂單每次同步都會從來源整列重寫，
 // 直接改品項的話下一次同步（一天4次＋隨時手動）就被蓋回去，改了等於沒改。
 // 存成「指令」而不是「改完的結果」，來源之後又變動（客服改了數量）也還套得上去。
-const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote','itemsOverrideJson','pickDoneAt','pickDoneBy'];
+const ORDERS_HEADER = ['orderNo','store','date','itemsJson','skuSummary','nameSummary','status','claimedBy','claimedAt','updatedAt','shipMethod','routingStatus','manualClose','logisticsConfirmed','logisticsTime','pickedJson','specialNote','itemsOverrideJson','pickDoneAt','pickDoneBy',
+  // 一張訂單的時間軸。分散在各處的時間（揀貨紀錄、出貨紀錄）算得出來，但出貨紀錄每晚清空、
+  // 揀貨紀錄要掃全表，KPI 每天都得重算一次很吃力，而且過了那天就再也回不去。
+  // 把里程碑固定在訂單自己身上，之後不管算哪一段（進單→揀貨→出貨→進籃）都只讀這一張表。
+  'createdAt','pickStartAt','shipStartAt','shipDoneAt'];
 const SHEET_PICKLOG = '揀貨紀錄';
 // APP 的兩個入口。正式網頁版（GitHub Pages）是倉庫裝置在用的；
 // Drive 那份是同一支 index.html 的副本，網路連不到 GitHub 時的備援。
@@ -93,7 +97,8 @@ const HEADER_LABELS = {
   logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
   pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作', kind:'類型', result:'揀貨結果',
   itemsOverrideJson:'品項修改(JSON)',
-  pickDoneAt:'揀貨完成時間', pickDoneBy:'揀貨完成人'
+  pickDoneAt:'揀貨完成時間', pickDoneBy:'揀貨完成人',
+  createdAt:'進單時間', pickStartAt:'開始揀貨時間', shipStartAt:'開始掃描時間', shipDoneAt:'出貨完成時間'
 };
 
 function doGet(e){
@@ -299,7 +304,11 @@ function getState(){
       logisticsTime: String(r.logisticsTime || '').trim(),
       specialNote: String(r.specialNote || '').trim(),
       pickDoneAt: String(r.pickDoneAt || '').trim(),
-      pickDoneBy: String(r.pickDoneBy || '').trim()
+      pickDoneBy: String(r.pickDoneBy || '').trim(),
+      createdAt: cellToText(r.createdAt, true) || '',
+      pickStartAt: cellToText(r.pickStartAt, true) || '',
+      shipStartAt: cellToText(r.shipStartAt, true) || '',
+      shipDoneAt: cellToText(r.shipDoneAt, true) || ''
     };
     // 把「已揀」狀態掛回各品項上，前端就不用自己再對一次
     const picked = safeParse(r.pickedJson, {});
@@ -431,6 +440,10 @@ function mergeOrders(incoming){
     // 「日期」欄位強制設成純文字格式再寫入，避免 Google試算表把「2026/8/5」這種字串
     // 自動偵測轉成日期型別儲存格（那樣讀回來會變成UTC的ISO時間字串，跟原本存的字不一樣）
     sh.getRange(targetRow, colOf(ORDERS_HEADER,'date')).setNumberFormat('@');
+    // 時間軸那幾欄同樣要先設成純文字。不設的話「2026/08/13 14:13:40」會被試算表
+    // 自動吃成日期型別，讀回來變成「Thu Aug 13 2026 ... GMT+0800」，
+    // 解析時間的正則完全對不上，所有耗時就全部算不出來（實際踩到）。
+    sh.getRange(targetRow, colOf(ORDERS_HEADER,'createdAt'), 1, 4).setNumberFormat('@');
     // 防呆：如果這張訂單目前正在被認領/掃描中，重新同步只更新品項/賣場等資料本身，
     // 不要動狀態／認領人／認領時間——不然等於把人家正在處理的訂單無聲無息退回待處理，
     // 之後如果又被別人認領，同一張訂單就可能被兩個人各自完成一次出貨，造成重複出貨紀錄。
@@ -458,7 +471,13 @@ function mergeOrders(incoming){
       itemsOverrideJson: override,
       // 揀貨完成的時間與人也是現場做出來的，同步只更新訂單內容，不能洗掉
       pickDoneAt: existing ? (existing.pickDoneAt||'') : '',
-      pickDoneBy: existing ? (existing.pickDoneBy||'') : ''
+      pickDoneBy: existing ? (existing.pickDoneBy||'') : '',
+      // 進單時間只在第一次寫入時記，之後每次同步都沿用——
+      // 每次同步都覆蓋的話它會變成「最後一次同步時間」，那就完全不是進單時間了。
+      createdAt: (existing && existing.createdAt) ? existing.createdAt : nowStamp_(),
+      pickStartAt: existing ? (existing.pickStartAt||'') : '',
+      shipStartAt: existing ? (existing.shipStartAt||'') : '',
+      shipDoneAt: existing ? (existing.shipDoneAt||'') : ''
     };
     sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
     if(existing) updated++; else added++;
@@ -624,7 +643,9 @@ function parseTwDateTime_(str){
   return isNaN(d.getTime()) ? null : d;
 }
 function minutesBetween_(a, b){
-  const d1 = parseTwDateTime_(a), d2 = parseTwDateTime_(b);
+  // 傳進來的可能是純文字，也可能是被試算表吃成日期型別的舊資料——
+  // 先統一轉成「yyyy/M/d HH:mm:ss」再解析，不然舊資料一律算不出來。
+  const d1 = parseTwDateTime_(cellToText(a, true)), d2 = parseTwDateTime_(cellToText(b, true));
   if(!d1 || !d2) return null;
   const mins = (d2 - d1) / 60000;
   // 負數或誇張的值多半是資料有問題（跨日、時間欄被改過），不要讓它污染平均
@@ -706,6 +727,33 @@ function computeDailyKpi_(){
   });
   out['平均揀貨耗時(分)'] = avg_(pickSpans);
 
+  // ---- 時間軸：一張單走完各段各花多久 ----
+  // 讀訂單分頁自己的里程碑欄位，不用再去翻揀貨紀錄／出貨紀錄。
+  // 只看「今天出貨完成」的單：跨日的單如果照進單時間歸日，會把昨天的工作算到今天頭上。
+  // 變數名不能叫 orderRows：同一個函式上面已經有一個「出貨紀錄的訂單層級列」用了這個名字，
+  // 重複宣告會整支腳本掛掉。這裡讀的是「訂單分頁」，命名上也該分開。
+  const orderTimeline = readOrderRows();
+  const stage = {進單到開始揀:[], 開始揀到揀完:[], 揀完到開始掃:[], 掃描耗時:[], 進單到出貨:[]};
+  let sameDay = 0;
+  orderTimeline.forEach(function(r){
+    const done = String(r.shipDoneAt||'').trim();
+    if(!done) return;
+    const d = parseTwDateTime_(done);
+    if(!d || Utilities.formatDate(d, tz, 'yyyy/MM/dd') !== today) return;
+    sameDay++;
+    const push = function(key, a, b){
+      const m = minutesBetween_(a, b);
+      if(m !== null) stage[key].push(m);
+    };
+    push('進單到開始揀', r.createdAt, r.pickStartAt);
+    push('開始揀到揀完', r.pickStartAt, r.pickDoneAt);
+    push('揀完到開始掃', r.pickDoneAt, r.shipStartAt);
+    push('掃描耗時', r.shipStartAt, done);
+    push('進單到出貨', r.createdAt, done);
+  });
+  out['今日完成且有時間軸的張數'] = sameDay;
+  Object.keys(stage).forEach(function(k){ out['平均' + k + '(分)'] = avg_(stage[k]); });
+
   // ---- 銜接面：揀完之後隔多久才出貨（包貨端塞不塞車） ----
   const shipTimeByOrder = {};
   orderRows.forEach(function(r){ shipTimeByOrder[r.orderNo] = String(r.time||''); });
@@ -755,7 +803,9 @@ function setupKpiSheet_(){
   const D = "'" + SHEET_DAILY_STATS + "'";
   const need = ['出貨張數','出貨件數','一次到位張數','錯誤張數','人工修正張數','無條碼核對張數',
                 '平均出貨耗時(分)','出貨人數','揀貨件數-文山','揀貨件數-調撥調入','取消揀貨次數',
-                '揀貨人數','揀貨完成張數','平均揀貨耗時(分)','揀完到出貨平均等待(分)','新進訂單'];
+                '揀貨人數','揀貨完成張數','平均揀貨耗時(分)','揀完到出貨平均等待(分)','新進訂單',
+                '今日完成且有時間軸的張數','平均進單到開始揀(分)','平均開始揀到揀完(分)',
+                '平均揀完到開始掃(分)','平均掃描耗時(分)','平均進單到出貨(分)'];
   const missing = need.filter(function(n){ return !col(n); });
   if(missing.length) return {ok:false, error:'每日統計缺少欄位：' + missing.join('、')};
 
@@ -786,7 +836,13 @@ function setupKpiSheet_(){
     ['取消揀貨次數', 'sum:' + col('取消揀貨次數')],
     ['揀貨完成張數', 'sum:' + col('揀貨完成張數')],
     ['平均揀貨耗時(分)', 'wavg:' + col('平均揀貨耗時(分)') + ':' + col('揀貨完成張數')],
-    ['揀完到出貨平均等待(分)', 'wavg:' + col('揀完到出貨平均等待(分)') + ':' + col('揀貨完成張數')]
+    ['揀完到出貨平均等待(分)', 'wavg:' + col('揀完到出貨平均等待(分)') + ':' + col('揀貨完成張數')],
+    ['時間軸（平均分鐘）', ''],
+    ['進單→開始揀', 'wavg:' + col('平均進單到開始揀(分)') + ':' + col('今日完成且有時間軸的張數')],
+    ['開始揀→揀完', 'wavg:' + col('平均開始揀到揀完(分)') + ':' + col('今日完成且有時間軸的張數')],
+    ['揀完→開始掃', 'wavg:' + col('平均揀完到開始掃(分)') + ':' + col('今日完成且有時間軸的張數')],
+    ['掃描耗時', 'wavg:' + col('平均掃描耗時(分)') + ':' + col('今日完成且有時間軸的張數')],
+    ['進單→出貨（總前置）', 'wavg:' + col('平均進單到出貨(分)') + ':' + col('今日完成且有時間軸的張數')]
   ];
 
   // 期間定義：條件式直接寫在公式裡，日／月／年只差這一段
@@ -1935,7 +1991,7 @@ function healOrderRowIfNeeded_(sh, row){
     // 舊格式（位移過的列）本來就沒有這一欄，補空字串；有值的話這裡也讀不到正確位置，
     // 一律當沒結案處理，主管在試算表看得到就能重選一次，不會誤把訂單擋掉。
     manualClose: '', logisticsConfirmed: '', logisticsTime: '', pickedJson: '', specialNote: '', itemsOverrideJson: '',
-    pickDoneAt: '', pickDoneBy: ''};
+    pickDoneAt: '', pickDoneBy: '', createdAt: '', pickStartAt: '', shipStartAt: '', shipDoneAt: ''};
   // 寫回試算表的狀態要轉成中文，回傳給呼叫端的物件維持英文代碼
   sh.getRange(row._row, 1, 1, ORDERS_HEADER.length)
     .setValues([ORDERS_HEADER.map(h=> h==='status' ? statusToText(fixed.status) : fixed[h])]);
@@ -2012,11 +2068,16 @@ function markPickedBatch(ops){
   const logRows = [];
   let applied = 0, notFound = 0;
 
+  const firstPickTime = {};   // 這一批動作裡，每張單最早的一次「揀貨」時間
   ops.forEach(op=>{
     const orderNo = String(op.orderNo||'').trim();
     const sku = String(op.sku||'').trim();
     const row = byOrderNo[orderNo];
     if(!row || !sku){ notFound++; return; }
+    if(op.action !== 'unpick'){
+      const t = String(op.time||'');
+      if(t && (!firstPickTime[orderNo] || t < firstPickTime[orderNo])) firstPickTime[orderNo] = t;
+    }
     if(!touched[orderNo]) touched[orderNo] = safeParse(row.pickedJson, {});
     if(op.action === 'unpick'){
       delete touched[orderNo][sku];
@@ -2033,9 +2094,16 @@ function markPickedBatch(ops){
     });
   });
 
+  const pickStartCol = colOf(ORDERS_HEADER, 'pickStartAt');
   Object.keys(touched).forEach(orderNo=>{
     const r = byOrderNo[orderNo];
     sh.getRange(r._row, pickedCol).setValue(JSON.stringify(touched[orderNo]));
+    // 第一件被揀的時間。只在還空著時寫：中途取消再重揀不該把開始時間往後推，
+    // 那樣算出來的揀貨耗時會比實際短。
+    if(!String(r.pickStartAt||'').trim() && Object.keys(touched[orderNo]).length){
+      sh.getRange(r._row, pickStartCol).setNumberFormat('@');
+      sh.getRange(r._row, pickStartCol).setValue(firstPickTime[orderNo] || nowStamp_());
+    }
   });
 
   if(logRows.length){
@@ -3681,6 +3749,12 @@ function finalizeShipment(entry){
     entry.amendSummary = amendSummary_(row.itemsOverrideJson);
     const now = new Date().toISOString();
     ordersSh.getRange(row._row, colOf(ORDERS_HEADER,'status'), 1, 4).setValues([[statusToText('shipped'), '', '', now]]);
+    // 出貨的起訖時間也寫回訂單。出貨紀錄每晚20:00清空，只留在那裡的話
+    // 隔天就再也算不出「這張掃了多久」，而那是要進 KPI 的。
+    const ssCol = colOf(ORDERS_HEADER, 'shipStartAt');
+    ordersSh.getRange(row._row, ssCol, 1, 2).setNumberFormat('@');
+    ordersSh.getRange(row._row, ssCol, 1, 2)
+      .setValues([[String(entry.startTime||''), String(entry.time||'')]]);
   }
   appendLogRow(entry);
   return {ok:true};
