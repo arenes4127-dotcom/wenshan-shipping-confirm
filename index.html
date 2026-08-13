@@ -510,6 +510,43 @@
       </div>
     </section>
 
+    <!-- ============ 儲位異動 ============ -->
+    <section id="view-loc" class="view">
+      <div class="section-label">儲位異動</div>
+      <div class="card">
+        <p class="hint" style="margin-top:0;">上架、移櫃、盤點調整，或揀貨時發現東西不在標示的位置，都用這裡改。
+          送出後會直接更新「文山地圖」的文山倉儲位，並在後端留一筆異動紀錄。</p>
+        <label class="field" style="margin-bottom:0;">
+          <span>掃描或輸入商品條碼／貨號</span>
+          <input id="locSkuInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+        </label>
+        <div id="locFound"></div>
+      </div>
+
+      <div class="card" id="locFormBox" style="display:none;">
+        <label class="field">
+          <span>新儲位</span>
+          <input id="locNewInput" class="scan-input" type="text" placeholder="例如 B01-2" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>異動類型</span>
+          <select id="locKindSelect"></select>
+        </label>
+        <label class="field">
+          <span>異動人員</span>
+          <select id="locStaffSelect"></select>
+        </label>
+        <label class="field">
+          <span>備註（選填）</span>
+          <input id="locNoteInput" type="text" placeholder="例如：整櫃移到走道底">
+        </label>
+        <button class="btn block" id="btnLocSubmit">確認變更儲位</button>
+      </div>
+
+      <div class="section-label">這次已變更</div>
+      <div class="card"><div id="locHistory"></div></div>
+    </section>
+
     <!-- ============ 出貨紀錄 ============ -->
     <section id="view-log" class="view">
       <div class="card">
@@ -619,6 +656,10 @@
     <button data-goto="pick">
       <span class="ic"><svg viewBox="0 0 24 24"><path d="M3 6h13l-1.5 8H5.5z"/><circle cx="7" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/><path d="M3 6L2 3"/></svg></span>
       揀貨
+    </button>
+    <button data-goto="loc">
+      <span class="ic"><svg viewBox="0 0 24 24"><path d="M12 21s-7-5.5-7-11a7 7 0 0114 0c0 5.5-7 11-7 11z"/><circle cx="12" cy="10" r="2.5"/></svg></span>
+      儲位
     </button>
     <button data-goto="orders">
       <span class="ic"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></svg></span>
@@ -977,6 +1018,13 @@ async function gotoView(name){
   if(name==='home') renderHome();
   if(name==='orders') renderPending();
   if(name==='pick') renderPickList();
+  if(name==='loc'){
+    renderLocKinds();
+    renderStaffSelects();
+    renderLocFound();
+    renderLocHistory();
+    setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 40);
+  }
   if(name==='log') renderLog();
   if(name==='settings') renderSettings();
   if(name==='scan') setTimeout(()=>inputOrder && inputOrder.focus(), 30);
@@ -1657,12 +1705,152 @@ function renderPickList(){
         '<div style="text-align:right;white-space:nowrap;">' +
           '<div style="font-size:22px;font-weight:800;">×' + r.qty + '</div>' +
           '<div class="hint">文山 ' + escapeHtml(String(r.stockWs||'-')) + '　總倉 ' + escapeHtml(String(r.stockMain||'-')) + '</div>' +
+          // 東西不在標示的位置時，就地改掉。stopPropagation 是因為整張卡片是打勾用的
+          '<button class="btn gray sm" style="margin-top:6px;"' +
+            ' onclick="event.stopPropagation();locFromPick(\'' + escapeHtml(r.sku).replace(/'/g, "\\'") + '\')">改儲位</button>' +
         '</div>' +
       '</div></div>';
   });
   container.innerHTML = noteHtml
     + (pickMode==='single' ? '<div class="card">' + pickDoneBoxHtml(scope[0]) + '</div>' : '')
     + html + renderTransferSection(transferRows, scope);
+}
+
+// ============================================================
+// 儲位異動
+// ============================================================
+// 為什麼要「先查、再改」而不是直接填一個新位置：儲位是揀貨路線的唯一依據，
+// 打錯一個字，之後每個人都會被帶到錯的地方，而且沒人會發現是這裡錯的。
+// 所以送出前一定先把「這個貨號現在登記在哪、叫什麼、長什麼樣」攤開來讓人對。
+const LOC_CHANGE_KINDS = ['上架', '移櫃', '揀貨時發現', '盤點調整', '其他'];
+let locCurrent = null;   // 目前查到的品項
+let locChanges = [];     // 這次開啟APP之後改過的，只留在本機供對照
+
+function renderLocKinds(){
+  const sel = document.getElementById('locKindSelect');
+  if(!sel || sel.options.length) return;
+  sel.innerHTML = LOC_CHANGE_KINDS.map(k=>`<option value="${k}">${k}</option>`).join('');
+}
+
+function renderLocFound(){
+  const box = document.getElementById('locFound');
+  const form = document.getElementById('locFormBox');
+  if(!box) return;
+  if(!locCurrent){
+    box.innerHTML = '';
+    form.style.display = 'none';
+    return;
+  }
+  form.style.display = '';
+  box.innerHTML = '<div style="display:flex;gap:12px;align-items:flex-start;margin-top:12px;">' +
+      thumbHtml(locCurrent.sku, locCurrent.baseName) +
+      '<div style="flex:1;min-width:0;">' +
+        '<div class="sku-badge">' + escapeHtml(locCurrent.sku) + '</div>' +
+        '<div style="font-weight:700;margin-top:4px;">' + escapeHtml(locCurrent.baseName || '（無品名）') + '</div>' +
+        '<div class="hint" style="margin-top:8px;">目前儲位</div>' +
+        '<span class="loc-badge' + (locCurrent.location ? '' : ' none') + '">' +
+          escapeHtml(locCurrent.location || '（尚未建立儲位）') + '</span>' +
+        (locCurrent.updated ? '<div class="hint" style="margin-top:6px;">最後更新：' + escapeHtml(locCurrent.updated) + '</div>' : '') +
+        (locCurrent.note ? '<div class="hint" style="margin-top:2px;">備註：' + escapeHtml(locCurrent.note) + '</div>' : '') +
+      '</div></div>';
+}
+
+function renderLocHistory(){
+  const box = document.getElementById('locHistory');
+  if(!box) return;
+  if(!locChanges.length){
+    box.innerHTML = '<p class="hint" style="margin:0;">這次開啟APP之後改過的儲位會列在這裡，方便回頭核對。</p>';
+    return;
+  }
+  box.innerHTML = locChanges.map(function(c){
+    return '<div style="padding:9px 0;border-bottom:1px solid var(--border);">' +
+      '<div><span class="sku-badge" style="font-size:15px;">' + escapeHtml(c.sku) + '</span>' +
+      '　<b>' + escapeHtml(c.from) + ' → ' + escapeHtml(c.to) + '</b></div>' +
+      '<div class="hint" style="margin-top:2px;">' + escapeHtml(c.time + '　' + c.kind + '　' + c.staffName) + '</div>' +
+      '</div>';
+  }).join('');
+}
+
+async function locLookup(code){
+  const raw = String(code||'').trim();
+  if(!raw) return;
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位異動要連上後端才能用',1800); return; }
+  // 掃到的可能是國際條碼，先用條碼對照轉成貨號再查（跟出貨掃描同一套解析）
+  const skus = [raw].concat(barcodeMap[raw] || []);
+  for(let i = 0; i < skus.length; i++){
+    let res;
+    try{ res = await apiPost('lookupLocation', {sku: skus[i]}); }
+    catch(err){ errorBeep(); flash('err','查詢失敗', err.message||'', 2200); return; }
+    if(res && res.ok){
+      locCurrent = res;
+      okBeep();
+      renderLocFound();
+      setTimeout(function(){ const el = document.getElementById('locNewInput'); if(el) el.focus(); }, 60);
+      return;
+    }
+  }
+  locCurrent = null;
+  renderLocFound();
+  errorBeep();
+  flash('err','文山地圖裡沒有這個貨號', '「' + raw + '」查不到儲位資料，請確認是不是文山倉的商品', 2600);
+}
+
+async function locSubmit(){
+  if(!locCurrent) return;
+  const to = String(document.getElementById('locNewInput').value||'').trim();
+  const kind = document.getElementById('locKindSelect').value;
+  const note = String(document.getElementById('locNoteInput').value||'').trim();
+  const staffId = document.getElementById('locStaffSelect').value;
+  const staffObj = staff.find(s=>s.id===staffId);
+  if(!to){ errorBeep(); flash('err','請填新儲位','',1600); return; }
+  if(!staffObj){ errorBeep(); flash('err','請先選擇異動人員','',1600); return; }
+  if(to === locCurrent.location){ errorBeep(); flash('err','新儲位跟現在一樣','沒有需要變更的地方',1800); return; }
+
+  // 這一改會蓋掉全倉共用的地圖，所以送出前看著圖再確認一次
+  const ok = await confirmWithImage({
+    title: '確認變更儲位',
+    sku: locCurrent.sku,
+    lines: [
+      {text: locCurrent.baseName || locCurrent.sku, strong: true},
+      {text: '貨號：' + locCurrent.sku},
+      {text: (locCurrent.location || '（尚未建立）') + '　→　' + to},
+      {text: '類型：' + kind + '　人員：' + staffObj.name + (note ? '　備註：' + note : '')}
+    ],
+    warn: '確定後會直接改掉「文山地圖」上的儲位，之後所有人的揀貨路線都照新的走。'
+        + '請確認手上這件商品跟上圖相符，而且新儲位沒有打錯。',
+    okText: '確定變更'
+  });
+  if(!ok) return;
+
+  let res;
+  try{
+    res = await apiPost('changeLocation', {sku: locCurrent.sku, toLocation: to, kind: kind,
+      staffId: staffObj.id, staffName: staffObj.name, note: note});
+  }catch(err){
+    errorBeep(); flash('err','變更失敗，儲位沒有被改動', err.message||'', 3000); return;
+  }
+  if(!res || !res.ok){
+    errorBeep(); flash('err','變更失敗，儲位沒有被改動', (res && res.error) || '', 3000); return;
+  }
+  okBeep();
+  flash('ok','儲位已變更', res.sku + '　' + res.from + ' → ' + res.to, 2200);
+  locChanges.unshift({time: new Date().toLocaleTimeString('zh-TW'), sku: res.sku,
+    from: res.from, to: res.to, kind: kind, staffName: staffObj.name});
+  renderLocHistory();
+  // 清掉表單、焦點回到掃描框，讓人可以一件接一件處理
+  document.getElementById('locNewInput').value = '';
+  document.getElementById('locNoteInput').value = '';
+  locCurrent = null;
+  renderLocFound();
+  setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 60);
+}
+
+// 揀貨卡片上的「改儲位」：人就站在貨架前，這時候改最準。
+// 要是得先記在紙上、回辦公室再補，多半就不會補了。
+async function locFromPick(sku){
+  await gotoView('loc');
+  document.getElementById('locSkuInput').value = '';
+  await locLookup(sku);
 }
 
 // 「這張揀好了」的區塊。已完成時改成顯示時間與人，並留一個取消的出口——
@@ -2764,6 +2952,14 @@ function renderStaffSelects(){
     pickSel.innerHTML = optionsHtml;
     pickSel.value = (keep && staff.find(s=>s.id===keep)) ? keep : currentStaffId;
   }
+  // 儲位異動人員：預設跟著揀貨人員走（最常是同一個人邊揀邊改），但可以自己選
+  const locSel = document.getElementById('locStaffSelect');
+  if(locSel){
+    const keep = locSel.value;
+    locSel.innerHTML = optionsHtml;
+    locSel.value = (keep && staff.find(s=>s.id===keep)) ? keep
+      : ((pickSel && pickSel.value) || currentStaffId);
+  }
   const staffObj = staff.find(s=>s.id===currentStaffId);
   document.getElementById('headerStaffName').textContent = staffObj ? staffObj.name : '未選擇';
 }
@@ -3065,6 +3261,17 @@ async function confirmLeaveOrder(){
     okText: '仍要換單'
   });
 }
+
+document.getElementById('locSkuInput').addEventListener('keydown', e=>{
+  if(e.key !== 'Enter') return;
+  const code = e.target.value.trim();
+  e.target.value = '';
+  locLookup(code);
+});
+document.getElementById('locNewInput').addEventListener('keydown', e=>{
+  if(e.key === 'Enter') locSubmit();
+});
+document.getElementById('btnLocSubmit').addEventListener('click', locSubmit);
 
 const pickBarcodeInput = document.getElementById('pickBarcodeInput');
 pickBarcodeInput.addEventListener('keydown', e=>{
