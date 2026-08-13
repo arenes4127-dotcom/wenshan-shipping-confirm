@@ -145,6 +145,18 @@
     border-radius:8px;padding:4px 14px;line-height:1.25;}
   .loc-badge.none{color:var(--muted2);background:transparent;border-color:var(--border);
     font-size:16px;letter-spacing:0;}
+  /* 揀貨清單的貨號再加一級：比品名更大、外框標紅。
+     揀貨時人是邊走邊掃視的，貨號要在還沒細看整張卡片之前就先跳出來。
+     紅框在這套介面裡本來代表錯誤，這裡刻意只用「框線」不用紅字——
+     文字維持白色才不會讀起來像一則錯誤訊息。 */
+  .sku-badge{display:inline-block;font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+    font-size:20px;font-weight:800;letter-spacing:.5px;color:var(--text);
+    border:2px solid var(--danger);border-radius:8px;background:rgba(239,75,82,.10);
+    padding:3px 10px;line-height:1.25;word-break:break-all;}
+  @media (max-width:430px){
+    .sku-badge{font-size:18px;letter-spacing:0;padding:3px 8px;}
+  }
+
   /* 規格（顏色、尺寸）是同款商品之間唯一的差別，卻最容易被當成品名的一部分掃過去。
      字級刻意排在貨號與品名之間，顏色用薄荷綠——這個色在整套介面裡沒有別的用途，
      不會跟藍色（儲位／訂單號）、橘色（警告）、紅色（錯誤）混淆。 */
@@ -1456,8 +1468,8 @@ function renderPickList(){
         '<div style="flex:1;min-width:0;' + (r.picked?'text-decoration:line-through;':'') + '">' +
           // 由上而下：貨號 → 規格 → 品名 → 賣場/訂單號。
           // 前兩項才是「拿對東西」要看的，品名長又常常好幾款共用開頭，擺在第三行。
-          '<div class="sku-text">' + escapeHtml(r.sku) + '</div>' +
-          (r.spec ? '<div class="spec-text" style="margin-top:3px;">' + escapeHtml(r.spec) + '</div>' : '') +
+          '<div class="sku-badge">' + escapeHtml(r.sku) + '</div>' +
+          (r.spec ? '<div class="spec-text" style="margin-top:5px;">' + escapeHtml(r.spec) + '</div>' : '') +
           '<div style="font-weight:700;margin-top:3px;">' + escapeHtml(r.baseName) + '</div>' +
           '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.store) + orderTag + '</div>' +
         '</div>' +
@@ -1485,8 +1497,8 @@ function renderTransferSection(transferRows, scope){
     html += '<div class="card" style="padding:12px;margin-bottom:8px;opacity:.85;">' +
       '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
         '<div style="flex:1;min-width:0;">' +
-          '<div class="sku-text">' + escapeHtml(r.sku) + '</div>' +
-          (r.spec ? '<div class="spec-text" style="margin-top:3px;">' + escapeHtml(r.spec) + '</div>' : '') +
+          '<div class="sku-badge">' + escapeHtml(r.sku) + '</div>' +
+          (r.spec ? '<div class="spec-text" style="margin-top:5px;">' + escapeHtml(r.spec) + '</div>' : '') +
           '<div style="font-weight:700;margin-top:3px;">' + escapeHtml(r.baseName) + '</div>' +
           '<div class="hint" style="margin-top:2px;"><b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b></div>' +
         '</div>' +
