@@ -1907,9 +1907,13 @@ function setPicked(orderNo, sku, picked){
   saveJSON(LS.orders, orders);
   okBeep();
 
+  // kind 要在這裡判斷再送出：後端只看得到品項的快照，判斷不出這件當下是
+  // 「在文山貨架上揀到」還是「等別的門店送來才確認調入」，而那兩件事的效率要分開看。
+  const alloc = itemAlloc(it);
   pickQueue.push({orderNo, sku, action: it.picked ? 'pick' : 'unpick',
     pickerId, pickerName: staffObj?staffObj.name:'', time: nowIso,
-    baseName: it.baseName||it.name||'', location: it.location||'', qty: it.qty||0});
+    baseName: it.baseName||it.name||'', location: it.location||'', qty: it.qty||0,
+    kind: (alloc.pickQty <= 0 && alloc.transferQty > 0) ? '調撥' : '文山'});
   saveJSON(LS.pickQueue, pickQueue);
   schedulePickFlush();
   renderPickList();

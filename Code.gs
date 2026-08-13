@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.89';
+const BACKEND_VERSION = '2026-08-13.95';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -57,7 +57,9 @@ const SHEET_PICKLOG = '揀貨紀錄';
 const APP_WEB_URL = 'https://arenes4127-dotcom.github.io/wenshan-shipping-confirm/';
 const APP_DRIVE_FOLDER_ID = '1quwo_65K5YQMZtuLD-vkheg-g97kYond';
 const APP_DRIVE_URL = 'https://drive.google.com/drive/folders/' + APP_DRIVE_FOLDER_ID;
-const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action'];
+// kind：文山／調撥。同樣是「打勾」，在文山貨架上揀到、跟等別的門店把貨送來，
+// 是兩種完全不同的作業，效率也要分開看——沒有這一欄就只知道「今天打了幾個勾」。
+const PICKLOG_HEADER = ['logTime','orderNo','sku','baseName','location','qty','pickerId','pickerName','action','kind'];
 // 人工結案的三個選項，同時用在試算表的下拉選單驗證跟程式判斷，兩邊共用同一份定義不會不同步
 const MANUAL_CLOSE_OPTIONS = ['出貨完成', '缺貨取消', '取消訂單'];
 // 出貨紀錄改成「一列一品項」格式（品號一格一個，不再是itemsJson整包塞一欄+貨號/品名頓號串起來），
@@ -87,7 +89,7 @@ const HEADER_LABELS = {
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
   logTime:'時間', event:'事件', detail:'說明',
   logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
-  pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作',
+  pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作', kind:'類型',
   itemsOverrideJson:'品項修改(JSON)',
   pickDoneAt:'揀貨完成時間', pickDoneBy:'揀貨完成人'
 };
@@ -186,6 +188,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   migrateOrderStatusToChinese_: () => migrateOrderStatusToChinese_(),
   archiveShippedOrders_: () => archiveShippedOrders_(),
   appendDailyStats_: () => appendDailyStats_(),
+  setupKpiSheet_: () => setupKpiSheet_(),
   previewArchiveShippedOrders_: () => previewArchiveShippedOrders_(),
   fixCheckResultEmoji_: () => fixCheckResultEmoji_(),
   fixBooleanColumnEmoji_: () => fixBooleanColumnEmoji_(),
@@ -602,6 +605,261 @@ function parseOrderDate_(raw){
 // 「訂單」分頁裡還沒出貨的訂單完全不受影響，繼續留著等下一個營業日被掃描（週末/假日也一樣）。
 // 同名檔案已存在就先丟垃圾桶再建新的，同一天重跑不會留下好幾份重複的備份檔。
 const SHIPPING_LOG_BACKUP_FOLDER_ID = '1fC7kFv-6ozYmrY1S_up55R_yslcu2qYE';
+// APP 寫進來的時間都是 toLocaleString('zh-TW') 的格式：「2026/8/13 下午1:35:47」。
+// 要算耗時就得先解析回時間；下午要 +12 小時，但「下午12點」本身就是12點不能再加，
+// 「上午12點」則是0點——這兩個邊界不處理的話會算出差12小時的耗時。
+function parseTwDateTime_(str){
+  const s = String(str||'').trim();
+  if(!s) return null;
+  const m = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})\s*(上午|下午)?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if(!m) return null;
+  let hour = parseInt(m[5], 10);
+  if(m[4] === '下午' && hour < 12) hour += 12;
+  if(m[4] === '上午' && hour === 12) hour = 0;
+  const d = new Date(parseInt(m[1],10), parseInt(m[2],10)-1, parseInt(m[3],10),
+                     hour, parseInt(m[6],10), m[7] ? parseInt(m[7],10) : 0);
+  return isNaN(d.getTime()) ? null : d;
+}
+function minutesBetween_(a, b){
+  const d1 = parseTwDateTime_(a), d2 = parseTwDateTime_(b);
+  if(!d1 || !d2) return null;
+  const mins = (d2 - d1) / 60000;
+  // 負數或誇張的值多半是資料有問題（跨日、時間欄被改過），不要讓它污染平均
+  return (mins < 0 || mins > 24 * 60) ? null : mins;
+}
+function avg_(arr){
+  const v = arr.filter(function(x){ return typeof x === 'number' && !isNaN(x); });
+  return v.length ? Math.round(v.reduce(function(a,b){ return a+b; }, 0) / v.length * 10) / 10 : '';
+}
+
+// 當天的作業面 KPI。刻意從原始資料算，不從儀表板抓：
+// 儀表板只有「現在」的樣子，而這些要的是「今天整天發生了什麼」，
+// 而且出貨紀錄20:00就會被清空，錯過這個時間點就再也算不出來。
+function computeDailyKpi_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = ss.getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd');
+  const out = {};
+
+  // ---- 出貨面：出貨紀錄是一列一品項，訂單層級欄位只填在第一列（需求件數>0） ----
+  const logRows = readRows(SHEET_LOG, LOG_HEADER);
+  const orderRows = logRows.filter(function(r){ return Number(r.requiredCount) > 0; });
+  const durations = [], noBarcodeOrders = {};
+  let perfect = 0, error = 0, manualEdit = 0;
+  orderRows.forEach(function(r){
+    const mins = minutesBetween_(r.startTime, r.time);
+    if(mins !== null) durations.push(mins);
+    const cr = String(r.checkResult||'');
+    if(cr.indexOf('完成') === 0 && cr.indexOf('人工') < 0) perfect++;
+    if(cr.indexOf('錯誤') === 0) error++;
+    if(cr.indexOf('人工修正') >= 0) manualEdit++;
+  });
+  logRows.forEach(function(r){
+    if(textToBool_(r.hadNoBarcodeConfirm)) noBarcodeOrders[r.orderNo] = true;
+  });
+  out['出貨張數'] = orderRows.length;
+  out['出貨件數'] = logRows.reduce(function(n, r){ return n + (Number(r.scanned) || 0); }, 0);
+  out['平均出貨耗時(分)'] = avg_(durations);
+  out['最長出貨耗時(分)'] = durations.length ? Math.round(Math.max.apply(null, durations) * 10) / 10 : '';
+  out['一次到位張數'] = perfect;
+  out['一次到位率(%)'] = orderRows.length ? Math.round(perfect / orderRows.length * 1000) / 10 : '';
+  out['錯誤張數'] = error;
+  out['人工修正張數'] = manualEdit;
+  out['無條碼核對張數'] = Object.keys(noBarcodeOrders).length;
+  out['出貨人數'] = Object.keys(orderRows.reduce(function(m, r){
+    if(String(r.staffName||'').trim()) m[r.staffName] = 1; return m;
+  }, {})).length;
+
+  // ---- 揀貨面：揀貨紀錄是累積的，要自己篩今天 ----
+  // 不能用字串前綴比日期：揀貨紀錄的時間來自APP的 toLocaleString('zh-TW')，
+  // 寫出來是「2026/8/13」不補零，而 today 是「2026/08/13」——直接比會全部對不到，
+  // 結果是揀貨面的KPI整排0，看起來像沒人揀貨（第一次跑就踩到）。
+  // 解析成日期再格式化，兩種寫法都吃得到。
+  const pickRows = readRows(SHEET_PICKLOG, PICKLOG_HEADER).filter(function(r){
+    const d = parseTwDateTime_(r.logTime);
+    return d && Utilities.formatDate(d, tz, 'yyyy/MM/dd') === today;
+  });
+  const pickers = {}, doneOrders = {};
+  let pickWs = 0, pickTr = 0, cancel = 0;
+  const firstPickAt = {};
+  pickRows.forEach(function(r){
+    const act = String(r.action||'');
+    if(act === '揀貨'){
+      if(String(r.kind||'') === '調撥') pickTr++; else pickWs++;
+      if(String(r.pickerName||'').trim()) pickers[r.pickerName] = 1;
+      const t = String(r.logTime||'');
+      if(!firstPickAt[r.orderNo] || t < firstPickAt[r.orderNo]) firstPickAt[r.orderNo] = t;
+    } else if(act === '取消揀貨'){ cancel++; }
+    else if(act === '揀貨完成'){ doneOrders[r.orderNo] = String(r.logTime||''); }
+  });
+  out['揀貨件數-文山'] = pickWs;
+  out['揀貨件數-調撥調入'] = pickTr;
+  out['取消揀貨次數'] = cancel;
+  out['揀貨人數'] = Object.keys(pickers).length;
+  out['揀貨完成張數'] = Object.keys(doneOrders).length;
+  // 一張單從第一件被揀到按下「揀好了」的時間
+  const pickSpans = Object.keys(doneOrders).map(function(no){
+    return firstPickAt[no] ? minutesBetween_(firstPickAt[no], doneOrders[no]) : null;
+  });
+  out['平均揀貨耗時(分)'] = avg_(pickSpans);
+
+  // ---- 銜接面：揀完之後隔多久才出貨（包貨端塞不塞車） ----
+  const shipTimeByOrder = {};
+  orderRows.forEach(function(r){ shipTimeByOrder[r.orderNo] = String(r.time||''); });
+  const waits = Object.keys(doneOrders).map(function(no){
+    return shipTimeByOrder[no] ? minutesBetween_(doneOrders[no], shipTimeByOrder[no]) : null;
+  });
+  out['揀完到出貨平均等待(分)'] = avg_(waits);
+  return out;
+}
+
+// hadNoBarcodeConfirm 存的是「是 🟠 / 否」這種顯示字，不是布林
+function textToBool_(v){
+  const s = String(v||'').trim();
+  return s.indexOf('是') === 0 || s === 'TRUE' || s === 'true';
+}
+
+// ================= KPI 統計（日／月／年） =================
+// 每日統計是一天一列的原始資料，人不會想從幾百列裡自己算月平均。
+// 這張表把它彙總成三段：最近30天、各月、各年。
+//
+// 用公式而不是把算好的數字寫死：每天20:00多一列，公式隔天自己更新，
+// 寫死的話得每天重跑一次彙總，漏跑一次就變成過期的數字掛在那裡沒人發現。
+//
+// 比率一律「先加總再相除」，不能拿每天的比率去平均——
+// 出3張的那天跟出300張的那天權重會變成一樣，算出來的月一次到位率是錯的。
+const SHEET_KPI = 'KPI統計';
+
+// 欄位letter在建表當下依「每日統計」的表頭算出來，不寫死。
+// 之後KPI欄位增減時重跑一次 setupKpiSheet_ 就好；沒重跑的話公式會指到別欄，
+// 所以這裡也把當時的欄位名稱寫在表上，對不上時看得出來。
+function colLetter2_(n){
+  let out = '';
+  while(n > 0){ const r = (n - 1) % 26; out = String.fromCharCode(65 + r) + out; n = (n - 1 - r) / 26; }
+  return out;
+}
+
+function setupKpiSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const src = ss.getSheetByName(SHEET_DAILY_STATS);
+  if(!src) return {ok:false, error:'還沒有「' + SHEET_DAILY_STATS + '」分頁，請先執行 appendDailyStats_'};
+  const header = src.getRange(1, 1, 1, src.getLastColumn()).getDisplayValues()[0]
+                    .map(function(x){ return String(x||'').trim(); });
+  const col = function(name){
+    const i = header.indexOf(name);
+    return i < 0 ? null : colLetter2_(i + 1);
+  };
+  const D = "'" + SHEET_DAILY_STATS + "'";
+  const need = ['出貨張數','出貨件數','一次到位張數','錯誤張數','人工修正張數','無條碼核對張數',
+                '平均出貨耗時(分)','出貨人數','揀貨件數-文山','揀貨件數-調撥調入','取消揀貨次數',
+                '揀貨人數','揀貨完成張數','平均揀貨耗時(分)','揀完到出貨平均等待(分)','新進訂單'];
+  const missing = need.filter(function(n){ return !col(n); });
+  if(missing.length) return {ok:false, error:'每日統計缺少欄位：' + missing.join('、')};
+
+  let sh = ss.getSheetByName(SHEET_KPI);
+  if(!sh) sh = ss.insertSheet(SHEET_KPI);
+  sh.clear();
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
+
+  // 每一列＝一個指標，欄位＝各期間。用 SUMPRODUCT 對日期字串取年月，
+  // 日期欄存的是文字（yyyy/MM/dd），LEFT 取前7碼就是年月、前4碼就是年。
+  const dateCol = col('日期');
+  const rows = [
+    ['訂單量', ''],
+    ['新進訂單', 'sum:' + col('新進訂單')],
+    ['出貨張數', 'sum:' + col('出貨張數')],
+    ['出貨件數', 'sum:' + col('出貨件數')],
+    ['出貨品質', ''],
+    ['一次到位率(%)', 'rate:' + col('一次到位張數') + ':' + col('出貨張數')],
+    ['錯誤率(%)', 'rate:' + col('錯誤張數') + ':' + col('出貨張數')],
+    ['人工修正張數', 'sum:' + col('人工修正張數')],
+    ['無條碼核對張數', 'sum:' + col('無條碼核對張數')],
+    ['效率', ''],
+    ['平均出貨耗時(分)', 'wavg:' + col('平均出貨耗時(分)') + ':' + col('出貨張數')],
+    ['每人每日出貨張數', 'ratio:' + col('出貨張數') + ':' + col('出貨人數')],
+    ['揀貨', ''],
+    ['揀貨件數-文山', 'sum:' + col('揀貨件數-文山')],
+    ['揀貨件數-調撥調入', 'sum:' + col('揀貨件數-調撥調入')],
+    ['取消揀貨次數', 'sum:' + col('取消揀貨次數')],
+    ['揀貨完成張數', 'sum:' + col('揀貨完成張數')],
+    ['平均揀貨耗時(分)', 'wavg:' + col('平均揀貨耗時(分)') + ':' + col('揀貨完成張數')],
+    ['揀完到出貨平均等待(分)', 'wavg:' + col('揀完到出貨平均等待(分)') + ':' + col('揀貨完成張數')]
+  ];
+
+  // 期間定義：條件式直接寫在公式裡，日／月／年只差這一段
+  const periods = [
+    ['近7天', '(' + D + '!$' + dateCol + '$2:$' + dateCol + '<>"")*(IFERROR(DATEVALUE(' + D + '!$' + dateCol + '$2:$' + dateCol + '),0)>=TODAY()-6)'],
+    ['近30天', '(' + D + '!$' + dateCol + '$2:$' + dateCol + '<>"")*(IFERROR(DATEVALUE(' + D + '!$' + dateCol + '$2:$' + dateCol + '),0)>=TODAY()-29)'],
+    ['本月', 'EXACT(LEFT(' + D + '!$' + dateCol + '$2:$' + dateCol + ',7),TEXT(TODAY(),"yyyy/MM"))'],
+    ['上月', 'EXACT(LEFT(' + D + '!$' + dateCol + '$2:$' + dateCol + ',7),TEXT(EOMONTH(TODAY(),-1),"yyyy/MM"))'],
+    ['今年', 'EXACT(LEFT(' + D + '!$' + dateCol + '$2:$' + dateCol + ',4),TEXT(TODAY(),"yyyy"))'],
+    ['累計', '(' + D + '!$' + dateCol + '$2:$' + dateCol + '<>"")']
+  ];
+
+  const rng = function(c){ return D + '!$' + c + '$2:$' + c; };
+  const build = function(spec, cond){
+    const parts = spec.split(':');
+    if(parts[0] === 'sum') return '=IFERROR(SUMPRODUCT(' + cond + ',N(' + rng(parts[1]) + ')),0)';
+    // rate=百分比（要×100），ratio=純比值（例如每人每日張數，×100就變成4300那種鬼數字）。
+    // 先前是用「spec字串裡有沒有『每人』」判斷，但spec裡只有欄位letter、永遠沒有那兩個字，
+    // 所以一律當百分比處理——算出來看起來像個正常數字，只是大了100倍。
+    if(parts[0] === 'rate' || parts[0] === 'ratio'){
+      return '=IFERROR(ROUND(SUMPRODUCT(' + cond + ',N(' + rng(parts[1]) + '))'
+        + '/SUMPRODUCT(' + cond + ',N(' + rng(parts[2]) + '))*'
+        + (parts[0] === 'rate' ? '100' : '1') + ',1),"-")';
+    }
+    // 加權平均：用張數當權重。直接平均每日平均會讓小量的日子有一樣的份量。
+    return '=IFERROR(ROUND(SUMPRODUCT(' + cond + ',N(' + rng(parts[1]) + '),N(' + rng(parts[2]) + '))'
+      + '/SUMPRODUCT(' + cond + ',N(' + rng(parts[2]) + ')),1),"-")';
+  };
+
+  sh.getRange('A1').setValue('📊 揀貨・出貨 KPI（資料來源：每日統計，每天20:00寫入一列）');
+  sh.getRange('A1:H1').merge().setFontSize(15).setFontWeight('bold')
+    .setBackground('#1c4587').setFontColor('#ffffff');
+  sh.getRange('A2').setFormula('="更新於 "&TEXT(NOW(),"yyyy/MM/dd HH:mm")&"　｜　每日統計目前 "&COUNTA(' + D + '!$' + dateCol + '$2:$' + dateCol + ')&" 天資料"');
+  sh.getRange('A2:H2').merge().setFontColor('#666666');
+
+  const headRow = 4;
+  sh.getRange(headRow, 1).setValue('指標');
+  periods.forEach(function(p, i){ sh.getRange(headRow, 2 + i).setValue(p[0]); });
+  sh.getRange(headRow, 1, 1, periods.length + 1).setFontWeight('bold').setBackground('#f3f3f3');
+
+  rows.forEach(function(r, ri) {
+    const row = headRow + 1 + ri;
+    sh.getRange(row, 1).setValue(r[0]);
+    if(!r[1]){   // 分段標題
+      sh.getRange(row, 1, 1, periods.length + 1).setBackground('#cfe2f3').setFontWeight('bold')
+        .setFontColor('#1c4587');
+      return;
+    }
+    if(r[1].indexOf('null') >= 0) return;   // 對照不到欄位就留白，不要寫出壞公式
+    periods.forEach(function(p, pi){
+      sh.getRange(row, 2 + pi).setFormula(build(r[1], p[1]));
+    });
+  });
+
+  const lastRow = headRow + rows.length;
+  sh.getRange(headRow + 1, 2, rows.length, periods.length).setHorizontalAlignment('center');
+  sh.setColumnWidth(1, 200);
+  for(let i = 0; i < periods.length; i++) sh.setColumnWidth(2 + i, 95);
+  sh.setFrozenRows(headRow);
+  // 不凍結欄：標題列是整列合併的（A1:H1），凍結第1欄等於把合併範圍切一半，
+  // Google 會直接拒絕並讓整個重建失敗。指標名稱那一欄本來就在最左邊，不凍也看得到。
+
+  const note = lastRow + 2;
+  sh.getRange(note, 1, 1, periods.length + 1).merge();
+  sh.getRange(note, 1).setValue([
+    '比率一律「先加總再相除」，不是把每天的比率平均——出3張的那天跟出300張的那天權重不該一樣。',
+    '平均耗時用張數加權，同理。',
+    '「每日統計」每天20:00寫一列，所以歷史從導入這個功能的那天開始，之前的日子沒有資料。',
+    '之後如果在「每日統計」增減欄位，要重跑一次 setupKpiSheet_，公式才會指到正確的欄。'
+  ].join('\n')).setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
+  sh.setRowHeight(note, 74);
+
+  return {ok:true, 分頁: SHEET_KPI, 指標數: rows.filter(function(r){ return r[1]; }).length,
+          期間: periods.map(function(p){ return p[0]; })};
+}
+
 // ---------------- 每日統計：把當天的儀表板數字留成一列 ----------------
 // 儀表板只看得到「現在」。出貨紀錄每晚清空、來源鏡像每晚重置，所以今天的數字
 // 過了20:30就永遠問不到了——想知道上週三出了幾張、品質如何，現在完全查不出來。
@@ -670,16 +928,25 @@ function appendDailyStats_(){
   const tz = ss.getSpreadsheetTimeZone();
   const today = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd');
 
+  // 作業面KPI（出貨耗時、揀貨件數…）從原始資料算，儀表板上沒有這些數字。
+  // 出貨紀錄20:00就清空，錯過就永遠算不出來，所以一定要在備份前算完。
+  const kpi = computeDailyKpi_();
+  const kpiKeys = Object.keys(kpi);
+  const header = ['日期', '記錄時間']
+    .concat(DAILY_STAT_FIELDS.map(function(f){ return f[1]; }))
+    .concat(kpiKeys);
+
   let sh = ss.getSheetByName(SHEET_DAILY_STATS);
   if(!sh){
     sh = ss.insertSheet(SHEET_DAILY_STATS);
-    sh.getRange(1, 1, 1, DAILY_STAT_FIELDS.length + 2)
-      .setValues([['日期', '記錄時間'].concat(DAILY_STAT_FIELDS.map(function(f){ return f[1]; }))])
-      .setFontWeight('bold').setBackground('#f3f3f3');
     sh.setFrozenRows(1);
     sh.setFrozenColumns(1);
     sh.setColumnWidth(1, 100); sh.setColumnWidth(2, 80);
   }
+  // 表頭每次都重寫：之後增減KPI欄位時，舊表頭留著會讓新欄位對不上名稱。
+  // 欄位只增不減、也不改順序，既有資料才不會錯位（跟訂單分頁同一個原則）。
+  sh.getRange(1, 1, 1, header.length).setValues([header])
+    .setFontWeight('bold').setBackground('#f3f3f3');
   // 同一天重複執行就覆蓋那一列，不要多寫一列——手動補跑或觸發器重試都可能發生，
   // 一天兩列會讓之後任何加總、平均都默默算錯。
   const lastRow = sh.getLastRow();
@@ -700,11 +967,11 @@ function appendDailyStats_(){
       const n = Number(String(v).replace(/,/g, ''));
       return isNaN(n) ? v : n;   // 數字就存成數字，之後才畫得出圖
     })
-  );
+  ).concat(kpiKeys.map(function(k){ return kpi[k]; }));
   sh.getRange(targetRow, 1, 1, row.length).setValues([row]);
   sh.getRange(targetRow, 1).setNumberFormat('@');
   return {ok:true, 日期: today, 覆蓋既有列: hitIdx >= 0, 列: targetRow,
-          找不到的標籤: missing};
+          找不到的標籤: missing, KPI: kpi};
 }
 
 function backupAndClearShippingLog_(){
@@ -1718,7 +1985,8 @@ function markPickedBatch(ops){
       logTime: op.time || '', orderNo: orderNo, sku: sku,
       baseName: op.baseName || '', location: op.location || '', qty: op.qty || '',
       pickerId: op.pickerId || '', pickerName: op.pickerName || '',
-      action: op.action === 'unpick' ? '取消揀貨' : '揀貨'
+      action: op.action === 'unpick' ? '取消揀貨' : '揀貨',
+      kind: op.kind === '調撥' ? '調撥' : '文山'
     });
   });
 
@@ -2711,7 +2979,8 @@ function markPickDone(body){
     logTime: undo ? nowStamp_() : time, orderNo: orderNo, sku: '', baseName: '（整張訂單）',
     location: '', qty: '', pickerId: String((body && body.pickerId) || ''),
     pickerName: String((body && body.pickerName) || ''),
-    action: undo ? '取消揀貨完成' : '揀貨完成'
+    action: undo ? '取消揀貨完成' : '揀貨完成',
+    kind: '整單'
   };
   const start = logSh.getLastRow() + 1;
   logSh.getRange(start, 1, 1, PICKLOG_HEADER.length)
