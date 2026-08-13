@@ -227,6 +227,9 @@
   .flash.show{opacity:1;}
   .flash.err{background:rgba(239,75,82,.95);}
   .flash.ok{background:rgba(52,168,112,.95);}
+  /* 掃到已經揀過的東西不是錯誤也不是成功，要有第三種顏色；
+     沒有這條規則的話 flash('warn') 會變成一片透明的遮罩，看起來像畫面壞掉。 */
+  .flash.warn{background:rgba(224,167,47,.95);}
   .flash .big{font-size:56px;color:#fff;font-weight:800;}
   .flash .sub{font-size:20px;color:#fff;max-width:600px;}
 
@@ -430,6 +433,17 @@
           </select>
         </label>
         <p class="hint" style="margin-top:8px;">一趟走完多張訂單的貨，回到分揀台再依訂單分裝。用「分揀檢視」按訂單分組核對。</p>
+      </div>
+
+      <!-- 掃碼揀貨：跟點選並行，不是二選一。
+           拿在手上的商品掃一下就打勾，手不用離開貨品去點螢幕；
+           但儲位上沒貼條碼、或掃不出來的時候還是可以直接點卡片。 -->
+      <div class="card" id="pickScanBox">
+        <label class="field" style="margin-bottom:8px;">
+          <span>掃描商品條碼直接打勾（也可以直接點卡片）</span>
+          <input id="pickBarcodeInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+        </label>
+        <p class="hint" id="pickScanHint" style="margin:0;">掃到的商品會自動打勾；重複掃同一件會提醒，不會被取消。</p>
       </div>
 
       <div class="card">
@@ -1517,6 +1531,7 @@ function startNewBatch(){
     return true;
   });
   pickBatch = (size === Infinity ? candidates : candidates.slice(0, size)).map(o=>o.orderNo);
+  focusPickScan();
   saveJSON('ssz_pick_batch', pickBatch);
   pickSortView = false;
   if(!pickBatch.length) flash('err','沒有可揀的訂單','待出貨清單裡沒有符合條件、且還沒揀完的訂單',1800);
@@ -1537,6 +1552,9 @@ function renderPickList(){
   // 區域選單只在批次模式有意義（單張揀貨就是把那一張走完，沒有分區的餘地），
   // 而且選項要來自「這一批實際有的區域」——列出整個倉庫的區域，選了卻沒東西，
   // 人會以為是系統壞了。
+  // 還沒選訂單（單張）或批次是空的時候，掃碼框沒有作用，藏起來免得人對著它掃半天
+  const scanBox = document.getElementById('pickScanBox');
+  if(scanBox) scanBox.style.display = scope.length ? '' : 'none';
   const zoneSel = document.getElementById('pickFilterZone');
   if(zoneSel){
     zoneSel.style.display = pickMode === 'batch' ? '' : 'none';
@@ -1661,6 +1679,63 @@ function pickDoneBoxHtml(o){
   const left = unpickedCount(o);
   return '<button class="btn block" onclick="markPickDone(\'' + no + '\')">' +
     '這張揀好了，放到包貨區' + (left ? '（還有 ' + left + ' 件沒點）' : '') + '</button>';
+}
+
+// ---- 掃碼揀貨 ----
+// 跟「點卡片」共用同一套資料流（pickQueue → markPickedBatch），只是入口不同。
+// 刻意不做成「掃到就切換」：連掃兩次的話第二次會把它取消，而掃描槍很容易連發，
+// 那種錯要等到分揀台才發現少一件。掃到已揀的只提醒、不動狀態。
+function pickScanCandidates(code){
+  const raw = String(code||'').trim();
+  if(!raw) return [];
+  // 跟出貨掃描同一套解析：先當品號，再查條碼對照表（一個條碼可能對到多個品號）
+  const skus = [raw].concat(barcodeMap[raw] || []);
+  const scope = pickScopeOrders();
+  const hits = [];
+  scope.forEach(function(o){
+    (o.items||[]).forEach(function(it){
+      if(skus.indexOf(it.sku) < 0) return;
+      if(itemAlloc(it).pickQty <= 0) return;   // 要調撥的不在文山，不該被掃到就打勾
+      hits.push({order: o, item: it});
+    });
+  });
+  // 沒揀的排前面；同樣沒揀的照走動順序，這樣批次模式下掃到重複品號時
+  // 打勾的會是「路線上最近的那一張」，跟人實際拿的那件最接近
+  hits.sort(function(a, b){
+    if(!!a.item.picked !== !!b.item.picked) return a.item.picked ? 1 : -1;
+    return locationSortKey(a.item.location) < locationSortKey(b.item.location) ? -1 : 1;
+  });
+  return hits;
+}
+
+function handlePickScan(code){
+  const raw = String(code||'').trim();
+  if(!raw) return;
+  const scope = pickScopeOrders();
+  if(!scope.length){
+    errorBeep();
+    flash('err', pickMode==='single' ? '還沒選訂單' : '批次是空的', '先掃訂單號或開始新批次', 1600);
+    return;
+  }
+  const hits = pickScanCandidates(raw);
+  if(!hits.length){
+    errorBeep();
+    flash('err','不在這批裡', '條碼「' + raw + '」不屬於' + (pickMode==='single' ? '這張訂單' : '這個批次'), 1800);
+    return;
+  }
+  const target = hits.find(function(h){ return !h.item.picked; });
+  if(!target){
+    // 全部都揀過了：提醒但不取消。真的要取消請直接點那張卡片。
+    errorBeep();
+    flash('warn','這件已經揀過了', (hits[0].item.baseName||hits[0].item.sku)
+      + '　要取消請直接點卡片', 2000);
+    return;
+  }
+  // 批次模式一定要講是哪一張訂單——分裝時靠這個把貨放進正確的盒子
+  const tag = pickMode==='batch' ? ('　' + target.order.orderNo) : '';
+  setPicked(target.order.orderNo, target.item.sku, true);
+  flash('ok','已打勾', (target.item.baseName||target.item.sku)
+    + (target.item.spec ? '（' + target.item.spec + '）' : '') + tag, 1400);
 }
 
 // ---- 揀貨完成 ----
@@ -1790,6 +1865,15 @@ function renderSortView(scope){
 }
 
 function togglePick(orderNo, sku){
+  const o = orders[orderNo];
+  const it = o ? (o.items||[]).find(i=>i.sku===sku) : null;
+  if(!it) return;
+  setPicked(orderNo, sku, !it.picked);
+}
+
+// 明確指定要設成已揀或未揀。點卡片是切換，掃碼一律設成已揀——
+// 兩個入口共用這一段，紀錄格式與同步佇列才不會有兩套。
+function setPicked(orderNo, sku, picked){
   const staffSel = document.getElementById('pickStaffSelect');
   const pickerId = staffSel ? staffSel.value : '';
   if(!pickerId){ errorBeep(); flash('err','請先選擇揀貨人員','上方選單選好人才能開始揀貨',1600); return; }
@@ -1797,10 +1881,11 @@ function togglePick(orderNo, sku){
   if(!o) return;
   const it = (o.items||[]).find(i=>i.sku===sku);
   if(!it) return;
+  if(!!it.picked === !!picked) return;    // 狀態沒變就不要送一筆一模一樣的紀錄
 
   const staffObj = staff.find(s=>s.id===pickerId);
   const nowIso = new Date().toLocaleString('zh-TW');
-  it.picked = !it.picked;                 // 本機先反應，不等後端
+  it.picked = !!picked;                   // 本機先反應，不等後端
   it.pickedBy = it.picked ? pickerId : '';
   saveJSON(LS.orders, orders);
   okBeep();
@@ -2943,6 +3028,22 @@ async function confirmLeaveOrder(){
   });
 }
 
+const pickBarcodeInput = document.getElementById('pickBarcodeInput');
+pickBarcodeInput.addEventListener('keydown', e=>{
+  if(e.key !== 'Enter') return;
+  const code = e.target.value.trim();
+  e.target.value = '';
+  handlePickScan(code);
+});
+// 掃描槍是「鍵盤輸入」，焦點不在輸入框的話字會散落到頁面上。
+// 選好訂單／抓完批次之後就把焦點放過來，讓人可以直接連續掃。
+function focusPickScan(){
+  setTimeout(function(){
+    const el = document.getElementById('pickBarcodeInput');
+    if(el && document.getElementById('view-pick').classList.contains('active')) el.focus();
+  }, 60);
+}
+
 document.getElementById('pickOrderInput').addEventListener('keydown', async e=>{
   if(e.key !== 'Enter') return;
   const code = e.target.value.trim();
@@ -2959,6 +3060,7 @@ document.getElementById('pickOrderInput').addEventListener('keydown', async e=>{
   localStorage.setItem('ssz_pick_order', code);
   okBeep();
   renderPickList();
+  focusPickScan();
 });
 document.getElementById('btnPickClearOrder').addEventListener('click', async ()=>{
   if(!(await confirmLeaveOrder())) return;
