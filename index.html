@@ -1344,14 +1344,22 @@ document.getElementById('btnClearOrders').addEventListener('click', ()=>{
 // M 前方展售區 → A~L 貨架區（蛇行）→ P/Q/R/T/U → S(二樓)／未建立／描述性位置
 const AISLE_ORDER = ['M','A','B','C','D','E','F','G','H','I','J','K','L'];
 const SECONDARY_AISLE_ORDER = ['P','Q','R','T','U'];
+// 儲位字串長相不只「B01-2」一種，實際資料裡還有「L13牌面」「E10~12」這類寫法。
+// 層號那一段刻意改成選填：那些也是貨架上的位置，只是沒寫到第幾層。
+// 原本的嚴格規則會把它們判成「無法解析」，結果是
+//   (1) 區域選單看不到它們，全部混進「未建立／其他」
+//   (2) 走動順序把它們排到整份清單的最後面——揀貨員走到L區時不會看到「L13牌面」，
+//       等走完整趟才在最後發現還有一件要回頭拿。
+// 沒寫層號的排在該貨架最後（level=99），走到那一格時順手看牌面。
 function parseLocation(loc){
   const s = String(loc||'').trim();
   if(!s) return null;
   const first = s.split(/[、,，\s]/)[0];
-  const m = first.match(/^([A-Za-z])\s*(\d{1,3})\s*-\s*(\d{1,2})/);
+  const m = first.match(/^([A-Za-z])\s*(\d{1,3})(?:\s*[-~～]\s*(\d{1,2}))?/);
   if(!m) return null;
   const aisle = m[1].toUpperCase();
-  return {aisle, aisleIndex: AISLE_ORDER.indexOf(aisle), bay: parseInt(m[2],10), level: parseInt(m[3],10)};
+  return {aisle, aisleIndex: AISLE_ORDER.indexOf(aisle),
+          bay: parseInt(m[2],10), level: m[3] ? parseInt(m[3],10) : 99};
 }
 function locationSortKey(loc){
   const pad = n => String(n).padStart(3,'0');
@@ -1369,12 +1377,20 @@ function locationSortKey(loc){
 
 // 儲位屬於哪一區。走道編號就是區域代碼（M32-2 → M區），解析不出來的歸「未建立／其他」——
 // 那些是還沒編儲位的商品，實務上要另外找，不能混在某一區裡讓人以為走過去就有。
-const ZONE_OTHER = '__other__';
+const ZONE_NONE = '__none__';
 function zoneOf(loc){
   const p = parseLocation(loc);
-  return p ? p.aisle : ZONE_OTHER;
+  if(p) return p.aisle;
+  // 解析不出貨架編號的，用文字本身當一區（「未建立」「鐵門前」「架上」…）。
+  // 全部併成一個「其他」的話，那幾種要找的地方完全不一樣的東西會被混在一起，
+  // 選了也不知道該往哪走。
+  const s = String(loc||'').trim();
+  return s || ZONE_NONE;
 }
-function zoneLabel(z){ return z === ZONE_OTHER ? '未建立／其他' : (z + '區'); }
+function zoneLabel(z){
+  if(z === ZONE_NONE) return '（無儲位）';
+  return /^[A-Z]$/.test(z) ? (z + '區') : z;   // 單一字母才是貨架區，其餘就是原本的文字
+}
 // 選單順序照實際走動順序（M → A~L → P/Q/R/T/U → 其他），不要用字母排序：
 // 這個順序就是揀貨員走的路線，照它排才找得到「我現在在哪一區」。
 function zoneSortIndex(z){
@@ -1382,7 +1398,9 @@ function zoneSortIndex(z){
   if(i0 >= 0) return i0;
   const i1 = SECONDARY_AISLE_ORDER.indexOf(z);
   if(i1 >= 0) return 100 + i1;
-  return z === ZONE_OTHER ? 999 : 500;
+  if(z === ZONE_NONE) return 999;              // 沒儲位的排最後
+  if(/^[A-Z]$/.test(z)) return 200;            // 認得是貨架、但不在既定路線上的字母（例如S二樓）
+  return 500;                                   // 描述性的地點（未建立、鐵門前、架上…）
 }
 
 // 待送出的揀貨動作。跟出貨那邊一樣走樂觀更新：點下去畫面立刻反應，
@@ -1456,16 +1474,10 @@ function pickScopeOrders(){
   return pickBatch.map(no=>orders[no]).filter(o=>o && o.status==='pending' && !isManuallyClosed(o));
 }
 
-// 區域選單的選項：這一批訂單實際涉及的區域，照走動順序排。
-function fillZoneOptions(el, scope){
+// 區域選單的選項：直接從清單上會出現的那些列取，照走動順序排。
+function fillZoneOptions(el, rows){
   const zones = {};
-  scope.forEach(function(o){
-    (o.items||[]).forEach(function(it){
-      const a = itemAlloc(it);
-      if(a.pickQty <= 0) return;          // 要調撥、文山根本揀不到的不列入區域
-      zones[zoneOf(it.location)] = true;
-    });
-  });
+  rows.forEach(function(r){ zones[zoneOf(r.location)] = true; });
   const list = Object.keys(zones).sort(function(a, b){ return zoneSortIndex(a) - zoneSortIndex(b); });
   const keep = el.value;
   el.innerHTML = '';
@@ -1528,8 +1540,7 @@ function renderPickList(){
   const zoneSel = document.getElementById('pickFilterZone');
   if(zoneSel){
     zoneSel.style.display = pickMode === 'batch' ? '' : 'none';
-    if(pickMode === 'batch') fillZoneOptions(zoneSel, scope);
-    else zoneSel.value = '';
+    if(pickMode !== 'batch') zoneSel.value = '';
   }
 
   if(pickMode==='single' && !pickCurrentOrder){
@@ -1560,8 +1571,11 @@ function renderPickList(){
   });
   // 區域篩選只縮小「現在要走的範圍」，不改變這一批有哪些訂單——
   // 分揀檢視要看到整批的全貌，所以那邊不套用。
-  const zoneFilter = (pickMode === 'batch' && !pickSortView && document.getElementById('pickFilterZone'))
-    ? document.getElementById('pickFilterZone').value : '';
+  // 選項一定要從「實際會顯示的列」產生，不能另外用一套條件算。
+  // 先前是用 itemAlloc().pickQty>0 挑，結果「L14牌面」這種分配數全0的缺貨品項
+  // 列表上看得到、選單裡卻沒有 L 區——選任何一區都會把它藏起來，而且沒有辦法篩到它。
+  if(zoneSel && pickMode === 'batch' && !pickSortView) fillZoneOptions(zoneSel, rows);
+  const zoneFilter = (pickMode === 'batch' && !pickSortView && zoneSel) ? zoneSel.value : '';
   const zoneAll = rows.length;
   if(zoneFilter) rows = rows.filter(function(r){ return zoneOf(r.location) === zoneFilter; });
   const zoneHidden = zoneAll - rows.length;
