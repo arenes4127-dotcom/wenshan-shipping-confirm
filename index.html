@@ -145,6 +145,12 @@
     border-radius:8px;padding:4px 14px;line-height:1.25;}
   .loc-badge.none{color:var(--muted2);background:transparent;border-color:var(--border);
     font-size:16px;letter-spacing:0;}
+  /* 規格（顏色、尺寸）是同款商品之間唯一的差別，卻最容易被當成品名的一部分掃過去。
+     字級刻意排在貨號與品名之間，顏色用薄荷綠——這個色在整套介面裡沒有別的用途，
+     不會跟藍色（儲位／訂單號）、橘色（警告）、紅色（錯誤）混淆。 */
+  .spec-text{font-size:16px;font-weight:700;color:#5fd3ad;line-height:1.35;}
+  td .spec-text{font-size:15px;}
+
   /* 分揀檢視／調撥區的儲位是行內的小徽章，不必跟主清單一樣大 */
   .loc-chip{display:inline-block;font-size:14px;font-weight:700;color:#8ab4f8;
     background:rgba(138,180,248,.12);border:1px solid #8ab4f8;border-radius:6px;
@@ -1447,10 +1453,12 @@ function renderPickList(){
       ' onclick="togglePick(\'' + escapeHtml(r.orderNo) + '\',\'' + escapeHtml(r.sku) + '\')">' +
       '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
         thumbHtml(r.sku, r.baseName) +
-        '<div style="flex:1;min-width:0;">' +
-          '<div style="font-weight:700;' + (r.picked?'text-decoration:line-through;':'') + '">' +
-            escapeHtml(r.baseName) + (r.spec?'（'+escapeHtml(r.spec)+'）':'') + '</div>' +
-          '<div class="sku-text" style="margin-top:4px;">' + escapeHtml(r.sku) + '</div>' +
+        '<div style="flex:1;min-width:0;' + (r.picked?'text-decoration:line-through;':'') + '">' +
+          // 由上而下：貨號 → 規格 → 品名 → 賣場/訂單號。
+          // 前兩項才是「拿對東西」要看的，品名長又常常好幾款共用開頭，擺在第三行。
+          '<div class="sku-text">' + escapeHtml(r.sku) + '</div>' +
+          (r.spec ? '<div class="spec-text" style="margin-top:3px;">' + escapeHtml(r.spec) + '</div>' : '') +
+          '<div style="font-weight:700;margin-top:3px;">' + escapeHtml(r.baseName) + '</div>' +
           '<div class="hint" style="margin-top:2px;">' + escapeHtml(r.store) + orderTag + '</div>' +
         '</div>' +
         '<div style="text-align:right;white-space:nowrap;">' +
@@ -1477,8 +1485,9 @@ function renderTransferSection(transferRows, scope){
     html += '<div class="card" style="padding:12px;margin-bottom:8px;opacity:.85;">' +
       '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">' +
         '<div style="flex:1;min-width:0;">' +
-          '<div style="font-weight:700;">' + escapeHtml(r.baseName) + (r.spec?'（'+escapeHtml(r.spec)+'）':'') + '</div>' +
-          '<div class="sku-text" style="margin-top:4px;">' + escapeHtml(r.sku) + '</div>' +
+          '<div class="sku-text">' + escapeHtml(r.sku) + '</div>' +
+          (r.spec ? '<div class="spec-text" style="margin-top:3px;">' + escapeHtml(r.spec) + '</div>' : '') +
+          '<div style="font-weight:700;margin-top:3px;">' + escapeHtml(r.baseName) + '</div>' +
           '<div class="hint" style="margin-top:2px;"><b style="color:var(--blue);">' + escapeHtml(r.orderNo) + '</b></div>' +
         '</div>' +
         '<div style="text-align:right;white-space:nowrap;">' +
@@ -1505,9 +1514,10 @@ function renderSortView(scope){
         ' onclick="togglePick(\'' + escapeHtml(o.orderNo) + '\',\'' + escapeHtml(it.sku) + '\')">' +
         '<div style="display:flex;justify-content:space-between;gap:10px;">' +
           '<div style="flex:1;min-width:0;">' +
-            '<div style="font-weight:600;">' + escapeHtml(it.baseName||it.name||'') + (it.spec?'（'+escapeHtml(it.spec)+'）':'') + '</div>' +
-            '<div class="sku-text" style="margin-top:3px;">' + escapeHtml(it.sku) +
+            '<div class="sku-text">' + escapeHtml(it.sku) +
               '<span class="loc-chip">' + escapeHtml(it.location||'無儲位') + '</span></div>' +
+            (it.spec ? '<div class="spec-text" style="margin-top:3px;">' + escapeHtml(it.spec) + '</div>' : '') +
+            '<div style="font-weight:600;margin-top:3px;">' + escapeHtml(it.baseName||it.name||'') + '</div>' +
           '</div>' +
           '<div style="text-align:right;white-space:nowrap;">' +
             '<div style="font-size:18px;font-weight:800;">×' + it.qty + '</div>' +
@@ -1848,8 +1858,13 @@ function renderItemTable(){
     else if(i.scanned===i.qty){ cls='ok'; label='<span class="tag ok">OK</span>'; }
     tr.className=cls;
     const skuEsc = i.sku.replace(/'/g,"\\'");
+    // 規格擺在貨號下面，品名欄只留品名本身、字級不變。
+    // 品名裡本來就含著「（規格）」，兩邊都顯示會變成同一件事講兩次，所以品名優先用 baseName；
+    // 手動CSV匯入的品項沒有 baseName/spec，就退回原本的 name 整串。
+    const specHtml = i.spec ? `<div class="spec-text">${escapeHtml(i.spec)}</div>` : '';
+    const nameText = i.baseName || i.name || '';
     tr.innerHTML = `<td>${thumbHtml(i.sku, i.baseName || i.name)}</td>`+
-      `<td><span class="sku-text">${i.sku}</span></td><td>${i.name}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
+      `<td><span class="sku-text">${escapeHtml(i.sku)}</span>${specHtml}</td><td>${escapeHtml(nameText)}</td><td>${i.qty}</td><td>${i.scanned}</td><td>${label}</td>`+
       `<td style="white-space:nowrap;">`+
       `<button class="btn gray sm" onclick="adjustScanned('${skuEsc}')">修改</button> `+
       `<button class="btn gray sm" onclick="confirmNoBarcode('${skuEsc}')">找不到條碼</button> `+
