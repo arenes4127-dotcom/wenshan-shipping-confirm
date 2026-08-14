@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.116';
+const BACKEND_VERSION = '2026-08-14.119';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -189,6 +189,10 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   previewMissingLocationRows_: () => previewMissingLocationRows_(),
   syncMissingLocationRowsDaily_: () => syncMissingLocationRowsDaily_(),
   listAutomationTriggers_: () => listAutomationTriggers_(),
+  repairScientificSkus_: () => repairScientificSkus_({dryRun:false}),
+  previewScientificSkus_: () => repairScientificSkus_({dryRun:true}),
+  dedupeLocationRows_: () => dedupeLocationRows_({dryRun:false}),
+  previewDedupeLocationRows_: () => dedupeLocationRows_({dryRun:true}),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
   testAmendFlow_: () => testAmendFlow_(),
@@ -2551,10 +2555,13 @@ const LOC_SYNC_TAB = '山物地圖(快取)';
 // 快取第1列是人工打的表頭（內容已過期），IMPORTRANGE 放在 A2，
 // 所以第2列是庫存表自己的表頭，真正的資料從第3列開始。
 const LOC_SYNC_FIRST_ROW = 3;
-const LOC_SYNC_COL = {sku:1, name:2, ws:9};   // A品號 B品名 I網購庫存倉
-// 條件只看「網購庫存倉」(I)，不看總倉(J)與商品在途倉(K)：
-// 那兩個代表貨不在文山，現在建一列空儲位沒有意義。等貨真的進到文山，
-// I 欄就會有值，隔天這支排程自然會把它補進來——不會漏，只是晚一天。
+const LOC_SYNC_COL = {sku:1, name:2};
+// 哪幾個倉的庫存代表「東西實際放在文山的貨架上」＝需要一個儲位。
+//   I 網購庫存倉 … 文山自己的庫存
+//   J 總倉      … 使用者確認：總倉的貨也是放在文山倉、跟網購庫存共用貨架
+// 不看 K（商品在途倉）：那是還在路上的貨，還沒上架。等它到了會落進 I 或 J，
+// 隔天這支排程自然會補進來——不會漏，只是晚一天。
+const LOC_SYNC_STOCK_COLS = [9, 10];   // I 網購庫存倉、J 總倉
 const LOC_SYNC_MIN_SOURCE_ROWS = 1000;   // 來源看起來是空的就整個放棄（IMPORTRANGE 載入中）
 
 function syncMissingLocationRows_(opts){
@@ -2575,7 +2582,8 @@ function syncMissingLocationRows_(opts){
             error:'來源只有 ' + nRows + ' 列，可能還在載入，這次不執行'};
   }
 
-  const srcVals = src.getRange(LOC_SYNC_FIRST_ROW, 1, nRows, LOC_SYNC_COL.ws).getValues();
+  const srcWidth = Math.max.apply(null, LOC_SYNC_STOCK_COLS.concat([LOC_SYNC_COL.sku, LOC_SYNC_COL.name]));
+  const srcVals = src.getRange(LOC_SYNC_FIRST_ROW, 1, nRows, srcWidth).getValues();
   const dstLast = dst.getLastRow();
   const dstVals = dst.getRange(2, LOCMAP_COL.sku, Math.max(dstLast - 1, 1), 1).getValues();
 
@@ -2595,8 +2603,11 @@ function syncMissingLocationRows_(opts){
     const sku = r[LOC_SYNC_COL.sku - 1];
     const key = String(sku||'').trim();
     if(!key || existing[key] || seen[key]) return;
-    const ws = String(r[LOC_SYNC_COL.ws - 1]||'').trim();
-    if(!ws || ws === '0' || ws === '-' || ws.indexOf('#') === 0) return;
+    const onShelf = LOC_SYNC_STOCK_COLS.some(function(c){
+      const v = String(r[c - 1]||'').trim();
+      return v && v !== '0' && v !== '-' && v.indexOf('#') !== 0;
+    });
+    if(!onShelf) return;
     seen[key] = 1;
     // 型別照抄來源，不轉字串：快取 P 欄的 XLOOKUP 是拿快取A比對本表A，
     // 兩邊型別不一樣（文字"30411611" vs 數字30411611）就會對不上，P 欄整片查無。
@@ -2622,14 +2633,108 @@ function syncMissingLocationRows_(opts){
 
   // 只寫 A:B 兩欄。E~K 是第1列的 ARRAYFORMULA（範圍 A1:A），會自己延伸到新列，
   // 千萬不要碰那七欄，寫值進去會把整條公式打斷。
+  //
+  // 寫值之前一定要先鎖格式。setValues 會像人打字一樣重新解析內容：
+  // 品號「3204E204」會被當成科學記號 3204×10^204 存成數字（實際發生過，
+  // 而且 CSV 匯出才看得出來，在試算表上看起來只是變成 3.20E+207）。
+  // 但也不能一律鎖成文字：快取 P 欄的 XLOOKUP 是拿快取A比對本表A，
+  // 文字"123" 和數字 123 在 Sheets 裡不相等。所以逐格照來源的型別決定格式。
+  const skuFmts = add.map(function(x){ return [typeof x[0] === 'string' ? '@' : '0']; });
+  dst.getRange(startRow, LOCMAP_COL.sku, add.length, 1).setNumberFormats(skuFmts);
+  dst.getRange(startRow, LOCMAP_COL.name, add.length, 1).setNumberFormat('@');
   dst.getRange(startRow, LOCMAP_COL.sku, add.length, 2).setValues(add);
 
   const logSh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
   logSh.appendRow([nowStamp_(), '儲位主檔補列', '', '',
-    '新增 ' + add.length + ' 個品號（文山有庫存但儲位主檔沒建），寫在第 '
+    '新增 ' + add.length + ' 個品號（文山貨架上有貨但儲位主檔沒建），寫在第 '
     + startRow + '~' + (startRow + add.length - 1) + ' 列，只寫品號與品名']);
   result.written = add.length;
   return result;
+}
+
+// 修復被 Sheets 自動轉成數字的品號（例如「3204E204」被當成科學記號）。
+// 判斷依據不是「長得像不像」，而是：本表存成數字、而快取那邊是字串——
+// 那就代表型別在寫入時被改掉了，照快取的原樣救回來。
+// 快取那邊本來就是數字的（純數字品號）不動，動了反而會讓 XLOOKUP 對不上。
+function repairScientificSkus_(opts){
+  opts = opts || {};
+  const dryRun = opts.dryRun !== false;
+  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const src = ss.getSheetByName(LOC_SYNC_TAB);
+  const dst = getLocMapSheet_();
+  if(!src || !dst) return {ok:false, error:'找不到分頁'};
+
+  const srcVals = src.getRange(LOC_SYNC_FIRST_ROW, LOC_SYNC_COL.sku,
+                               src.getLastRow() - LOC_SYNC_FIRST_ROW + 1, 1).getValues();
+  const byNumber = {};   // 快取裡是字串的品號 → 它被當數字解析後的值
+  srcVals.forEach(function(r){
+    const v = r[0];
+    if(typeof v !== 'string' || !v) return;
+    const n = Number(v);
+    if(isFinite(n) && String(n) !== v) byNumber[String(n)] = v;
+  });
+
+  const last = dst.getLastRow();
+  const cells = dst.getRange(2, LOCMAP_COL.sku, last - 1, 1).getValues();
+  const fixes = [];
+  cells.forEach(function(r, i){
+    const v = r[0];
+    if(typeof v !== 'number') return;
+    const hit = byNumber[String(v)];
+    if(hit) fixes.push({row: i + 2, was: String(v), now: hit});
+  });
+
+  if(!dryRun){
+    fixes.forEach(function(f){
+      const cell = dst.getRange(f.row, LOCMAP_COL.sku);
+      cell.setNumberFormat('@');
+      cell.setValue(f.now);
+    });
+    if(fixes.length){
+      getSheet(SHEET_SYSLOG, SYSLOG_HEADER).appendRow([nowStamp_(), '品號型別修復', '', '',
+        '修正 ' + fixes.length + ' 筆被自動轉成數字的品號：'
+        + fixes.map(function(f){ return f.now; }).join('、')]);
+    }
+  }
+  return {ok:true, dryRun: dryRun, found: fixes.length, fixes: fixes.slice(0, 20)};
+}
+
+// 刪掉重複的品號列。會有重複是因為品號被存成數字之後，下一次比對「這個品號建過了嗎」
+// 就對不上，同一個品號又被補了一次。
+// 安全規則：只刪「儲位/更新/備註三欄都空白」的那一列——只要有人在上面填過任何東西，
+// 就不是我們補進來的空列，不准碰。由後往前刪避免列號位移。
+function dedupeLocationRows_(opts){
+  opts = opts || {};
+  const dryRun = opts.dryRun !== false;
+  const dst = getLocMapSheet_();
+  if(!dst) return {ok:false, error:'找不到分頁'};
+  const last = dst.getLastRow();
+  const vals = dst.getRange(2, 1, last - 1, LOCMAP_COL.note).getValues();
+
+  const firstSeen = {}, dups = [];
+  vals.forEach(function(r, i){
+    const key = String(r[LOCMAP_COL.sku - 1]||'').trim();
+    if(!key) return;
+    const row = i + 2;
+    if(firstSeen[key] === undefined){ firstSeen[key] = row; return; }
+    const blank = !String(r[LOCMAP_COL.location-1]||'').trim()
+               && !String(r[LOCMAP_COL.updated-1]||'').trim()
+               && !String(r[LOCMAP_COL.note-1]||'').trim();
+    dups.push({row: row, sku: key, keptRow: firstSeen[key], safeToDelete: blank});
+  });
+
+  const deletable = dups.filter(function(d){ return d.safeToDelete; });
+  if(!dryRun && deletable.length){
+    deletable.slice().sort(function(a,b){ return b.row - a.row; })
+      .forEach(function(d){ dst.deleteRow(d.row); });
+    getSheet(SHEET_SYSLOG, SYSLOG_HEADER).appendRow([nowStamp_(), '儲位主檔去重', '', '',
+      '刪除 ' + deletable.length + ' 列重複且空白的品號：'
+      + deletable.map(function(d){ return d.sku; }).join('、')]);
+  }
+  return {ok:true, dryRun: dryRun, duplicates: dups.length,
+          deleted: dryRun ? 0 : deletable.length,
+          skippedBecauseNotBlank: dups.length - deletable.length,
+          detail: dups.slice(0, 20)};
 }
 
 // 排程用：每天跑一次，真的寫入
