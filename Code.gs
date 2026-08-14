@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-14.123';
+const BACKEND_VERSION = '2026-08-14.124';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -188,6 +188,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   importProductImages_: () => importProductImages_(),
   testLocationChange_: () => testLocationChange_(),
   analyzeLocMapWorkbook_: () => analyzeLocMapWorkbook_(),
+  analyzeTransferSheet_: () => analyzeSheetStructure_({id:'1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ', gid:611981791}),
+  analyzeTransferTemplate_: () => analyzeSheetStructure_({id:'1_nWAeLo5lmOZ-zsmqVWqM99dGB0t1bSL-ZMdkWT0Q68'}),
   previewMissingLocationRows_: () => previewMissingLocationRows_(),
   syncMissingLocationRowsDaily_: () => syncMissingLocationRowsDaily_(),
   listAutomationTriggers_: () => listAutomationTriggers_(),
@@ -2984,6 +2986,67 @@ function syncMissingLocationRowsDaily_(){
 // 給API手動觸發的乾跑版本
 function previewMissingLocationRows_(){
   return syncMissingLocationRows_({dryRun: true});
+}
+
+// 唯讀：解析任何一份試算表的結構。要接手別人維護的表單之前，
+// 得先知道哪幾欄是人填的、哪幾欄是公式算的、有沒有下拉/勾選框——
+// 這些決定了功能能不能原樣搬過來。
+function analyzeSheetStructure_(opts){
+  opts = opts || {};
+  const ss = SpreadsheetApp.openById(opts.id);
+  const out = {name: ss.getName(), sheets: []};
+  ss.getSheets().forEach(function(sh){
+    out.sheets.push({name: sh.getName(), gid: sh.getSheetId(),
+                     rows: sh.getLastRow(), cols: sh.getLastColumn(),
+                     hidden: sh.isSheetHidden()});
+  });
+  if(opts.gid === undefined || opts.gid === null) return out;
+
+  let target = null;
+  ss.getSheets().forEach(function(sh){ if(String(sh.getSheetId()) === String(opts.gid)) target = sh; });
+  if(!target) return Object.assign(out, {error: '找不到 gid ' + opts.gid});
+
+  const rows = target.getLastRow(), cols = target.getLastColumn();
+  const d = {name: target.getName(), gid: target.getSheetId(), rows: rows, cols: cols,
+             headers: [], topFormulas: [], colFormulas: [], validations: [], samples: [],
+             frozen: {rows: target.getFrozenRows(), cols: target.getFrozenColumns()},
+             merges: target.getRange(1, 1, Math.min(rows||1, 20), Math.min(cols||1, 30))
+                           .getMergedRanges().map(function(r){ return r.getA1Notation(); })};
+  if(rows && cols){
+    const readCols = Math.min(cols, 30);
+    d.headers = target.getRange(1, 1, 1, readCols).getDisplayValues()[0];
+    const fr = target.getRange(1, 1, Math.min(rows, 4), readCols).getFormulas();
+    fr.forEach(function(line, r){
+      line.forEach(function(f, c){ if(f) d.topFormulas.push('R' + (r+1) + 'C' + (c+1) + ': ' + f.slice(0, 220)); });
+    });
+    const probe = Math.min(rows - 1, 40);
+    if(probe > 0){
+      const body = target.getRange(2, 1, probe, readCols).getFormulas();
+      for(let c = 0; c < readCols; c++){
+        let n = 0, sample = '';
+        for(let r = 0; r < probe; r++){ if(body[r][c]){ n++; if(!sample) sample = body[r][c].slice(0, 150); } }
+        if(n) d.colFormulas.push({col: c + 1, header: d.headers[c], hits: n, of: probe, sample: sample});
+      }
+      d.samples = target.getRange(2, 1, Math.min(probe, 3), readCols).getDisplayValues();
+      // 資料驗證（下拉選單／勾選框）——檢核表單最關鍵的部分往往就在這裡
+      const dv = target.getRange(2, 1, probe, readCols).getDataValidations();
+      for(let c = 0; c < readCols; c++){
+        for(let r = 0; r < probe; r++){
+          const v = dv[r][c];
+          if(!v) continue;
+          let desc = String(v.getCriteriaType());
+          try{
+            const args = v.getCriteriaValues();
+            desc += ' → ' + JSON.stringify(args).slice(0, 120);
+          }catch(err){}
+          d.validations.push({col: c + 1, header: d.headers[c], row: r + 2, rule: desc});
+          break;
+        }
+      }
+    }
+  }
+  out.detail = d;
+  return out;
 }
 
 // 唯讀：把「文山地圖」整份的結構攤開來看（分頁、欄位、哪些欄是公式拉來的）。
