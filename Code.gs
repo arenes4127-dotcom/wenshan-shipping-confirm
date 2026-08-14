@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.112';
+const BACKEND_VERSION = '2026-08-13.116';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -186,6 +186,9 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   importProductImages_: () => importProductImages_(),
   testLocationChange_: () => testLocationChange_(),
   analyzeLocMapWorkbook_: () => analyzeLocMapWorkbook_(),
+  previewMissingLocationRows_: () => previewMissingLocationRows_(),
+  syncMissingLocationRowsDaily_: () => syncMissingLocationRowsDaily_(),
+  listAutomationTriggers_: () => listAutomationTriggers_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
   testAmendFlow_: () => testAmendFlow_(),
@@ -1918,9 +1921,22 @@ function syncNativeOrderSheet_(){
 // 內的誤差空間），9:00/9:15、14:05/14:15這種只差10-15分鐘的排程實際執行時間可能會前後飄動、
 // 甚至順序調換——但因為mergeOrders()本來就是「同步現況」的概念，同一天重複執行/順序調換
 // 都不會有副作用（只是把「訂單」分頁同步到源頭當下最新的樣子），不影響最終結果只是可能差幾分鐘。
+// 唯讀：列出目前實際裝了哪些時間觸發器。
+// 裝完排程一定要回頭確認——發出請求不等於完成，這個系統在這上面吃過虧。
+function listAutomationTriggers_(){
+  return ScriptApp.getProjectTriggers().map(function(t){
+    let when = '';
+    try{
+      when = t.getTriggerSource() === ScriptApp.TriggerSource.CLOCK ? '時間觸發' : String(t.getTriggerSource());
+    }catch(err){ when = '?'; }
+    return {handler: t.getHandlerFunction(), type: when, id: t.getUniqueId()};
+  }).sort(function(x,y){ return x.handler < y.handler ? -1 : 1; });
+}
+
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
-    'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_', 'releaseStaleClaims_'];
+    'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_', 'releaseStaleClaims_',
+    'syncMissingLocationRowsDaily_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -1929,6 +1945,9 @@ function installAutomationTriggers_(){
     ScriptApp.newTrigger('autoSyncOrders_').timeBased().atHour(h).nearMinute(m).everyDays(1).create();
   });
   ScriptApp.newTrigger('backupAndClearShippingLog_').timeBased().atHour(20).nearMinute(0).everyDays(1).create();
+  // 儲位主檔補列排 07:30：早於 9:00 的訂單同步，當天開工前新品號就已經在主檔裡，
+  // 揀貨時才不會又看到一批「未建立」。也避開 19:30／20:30 那兩個會清資料的時段。
+  ScriptApp.newTrigger('syncMissingLocationRowsDaily_').timeBased().atHour(7).nearMinute(30).everyDays(1).create();
   // 已出貨訂單歸檔刻意排在 19:30，不能排在 20:30——
   // 「文山出貨 工作區」自己也有一個 20:30 的觸發器（dailyArchiveAndResetAuto），
   // 它會把「文山出貨V2」從模板還原、也就是清空當天的訂單資料。我們的歸檔要讀那份鏡像
@@ -2511,6 +2530,117 @@ function getLocationVocab(body){
                known: Object.keys(known), builtAt: nowStamp_()};
   try{ cache.put(LOC_VOCAB_CACHE_KEY, JSON.stringify(out), LOC_VOCAB_TTL); }catch(err){ /* 太大就不快取 */ }
   return out;
+}
+
+// ================= 自動補建缺少的儲位列 =================
+// 問題：庫存主檔裡有 24,109 個品號，「 文山倉儲位」只建了 7,088 個。
+// 文山架上實際有貨、但儲位主檔沒有那一列的品號有 2,986 個——揀貨時它們顯示「未建立」，
+// 揀貨員得自己去找，這是軟體解決不了、只能靠補資料的問題。
+//
+// 為什麼不用公式做：使用者原本想在「 文山倉儲位」用公式從「山物地圖(快取)」抓回來。
+// 那會死結——快取的 P 欄（文山儲位）本身就是 XLOOKUP 自「 文山倉儲位」C 欄的鏡子，
+// 從快取抓儲位回填等於把影子複製回本體，Google Sheets 會判定循環參照，兩欄一起爛掉。
+// 而且公式會重建整張表：C 欄的人工儲位、D 欄更新、L 欄備註都是靜態手寫值，
+// 靠列的位置對應品號，一旦列的組成隨庫存變動，備註就會掛到別的商品身上——
+// 這種錯不會報錯，只會靜靜地錯下去。
+//
+// 所以改成腳本、而且只做一件事：**把缺的品號 append 上去，其他什麼都不碰**。
+// 不改既有列、不刪列、不寫 C/D/L，只寫 A（品號）B（品名）。
+// 沒有公式就沒有循環，快取的 P 欄完全不受影響。
+const LOC_SYNC_TAB = '山物地圖(快取)';
+// 快取第1列是人工打的表頭（內容已過期），IMPORTRANGE 放在 A2，
+// 所以第2列是庫存表自己的表頭，真正的資料從第3列開始。
+const LOC_SYNC_FIRST_ROW = 3;
+const LOC_SYNC_COL = {sku:1, name:2, ws:9};   // A品號 B品名 I網購庫存倉
+// 條件只看「網購庫存倉」(I)，不看總倉(J)與商品在途倉(K)：
+// 那兩個代表貨不在文山，現在建一列空儲位沒有意義。等貨真的進到文山，
+// I 欄就會有值，隔天這支排程自然會把它補進來——不會漏，只是晚一天。
+const LOC_SYNC_MIN_SOURCE_ROWS = 1000;   // 來源看起來是空的就整個放棄（IMPORTRANGE 載入中）
+
+function syncMissingLocationRows_(opts){
+  opts = opts || {};
+  const dryRun = opts.dryRun !== false;   // 預設乾跑；要真的寫必須明確傳 dryRun:false
+  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const src = ss.getSheetByName(LOC_SYNC_TAB);
+  const dst = getLocMapSheet_();
+  if(!src) return {ok:false, error:'找不到「' + LOC_SYNC_TAB + '」分頁'};
+  if(!dst) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
+
+  const srcLast = src.getLastRow();
+  const nRows = srcLast - LOC_SYNC_FIRST_ROW + 1;
+  if(nRows < LOC_SYNC_MIN_SOURCE_ROWS){
+    // 來源是 IMPORTRANGE，載入中的時候整片會是空的。這時候「缺哪些品號」算出來會是錯的，
+    // 雖然我們只新增不刪除、算錯也不會毀資料，但寧可什麼都不做也不要寫進半套的東西。
+    return {ok:false, reason:'source_not_ready',
+            error:'來源只有 ' + nRows + ' 列，可能還在載入，這次不執行'};
+  }
+
+  const srcVals = src.getRange(LOC_SYNC_FIRST_ROW, 1, nRows, LOC_SYNC_COL.ws).getValues();
+  const dstLast = dst.getLastRow();
+  const dstVals = dst.getRange(2, LOCMAP_COL.sku, Math.max(dstLast - 1, 1), 1).getValues();
+
+  const existing = {};
+  // 順便找出「最後一列真的有品號的位置」。不能直接用 getLastRow()：
+  // E~K 那七條 ARRAYFORMULA 的範圍是 A1:A，會一路輸出空字串到工作表底部，
+  // getLastRow() 因此回報 17,088，但實際有品號的只到 7,088 列。
+  // 照 getLastRow() 接下去寫，中間會空一萬列。
+  let lastSkuRow = 1;
+  dstVals.forEach(function(r, i){
+    const k = String(r[0]||'').trim();
+    if(k){ existing[k] = 1; lastSkuRow = i + 2; }
+  });
+
+  const add = [], seen = {};
+  srcVals.forEach(function(r){
+    const sku = r[LOC_SYNC_COL.sku - 1];
+    const key = String(sku||'').trim();
+    if(!key || existing[key] || seen[key]) return;
+    const ws = String(r[LOC_SYNC_COL.ws - 1]||'').trim();
+    if(!ws || ws === '0' || ws === '-' || ws.indexOf('#') === 0) return;
+    seen[key] = 1;
+    // 型別照抄來源，不轉字串：快取 P 欄的 XLOOKUP 是拿快取A比對本表A，
+    // 兩邊型別不一樣（文字"30411611" vs 數字30411611）就會對不上，P 欄整片查無。
+    add.push([sku, r[LOC_SYNC_COL.name - 1]]);
+  });
+
+  // 寫入前確認目標區塊是空的。萬一有人在下面幾千列的地方留了東西，
+  // 直接覆蓋過去會神不知鬼不覺地毀掉它，寧可退回接在 getLastRow() 後面。
+  let startRow = lastSkuRow + 1;
+  if(add.length && startRow + add.length - 1 <= dstLast){
+    const probe = dst.getRange(startRow, LOCMAP_COL.sku, add.length, 2).getValues();
+    const dirty = probe.some(function(r){
+      return String(r[0]||'').trim() || String(r[1]||'').trim();
+    });
+    if(dirty) startRow = dstLast + 1;
+  }
+
+  const result = {ok:true, dryRun: dryRun, sourceRows: nRows, existingRows: Object.keys(existing).length,
+                  toAdd: add.length, lastSkuRow: lastSkuRow, sheetLastRow: dstLast, firstNewRow: startRow,
+                  samples: add.slice(0, 5).map(function(x){ return String(x[0]) + '　' + String(x[1]).slice(0, 30); }),
+                  types: add.slice(0, 5).map(function(x){ return typeof x[0]; })};
+  if(dryRun || !add.length) return result;
+
+  // 只寫 A:B 兩欄。E~K 是第1列的 ARRAYFORMULA（範圍 A1:A），會自己延伸到新列，
+  // 千萬不要碰那七欄，寫值進去會把整條公式打斷。
+  dst.getRange(startRow, LOCMAP_COL.sku, add.length, 2).setValues(add);
+
+  const logSh = getSheet(SHEET_SYSLOG, SYSLOG_HEADER);
+  logSh.appendRow([nowStamp_(), '儲位主檔補列', '', '',
+    '新增 ' + add.length + ' 個品號（文山有庫存但儲位主檔沒建），寫在第 '
+    + startRow + '~' + (startRow + add.length - 1) + ' 列，只寫品號與品名']);
+  result.written = add.length;
+  return result;
+}
+
+// 排程用：每天跑一次，真的寫入
+function syncMissingLocationRowsDaily_(){
+  const r = syncMissingLocationRows_({dryRun: false});
+  Logger.log('儲位主檔補列：' + JSON.stringify(r));
+  return r;
+}
+// 給API手動觸發的乾跑版本
+function previewMissingLocationRows_(){
+  return syncMissingLocationRows_({dryRun: true});
 }
 
 // 唯讀：把「文山地圖」整份的結構攤開來看（分頁、欄位、哪些欄是公式拉來的）。
