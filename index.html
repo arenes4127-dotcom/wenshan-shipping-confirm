@@ -221,6 +221,14 @@
   .confirm-list .li .txt{flex:1;min-width:0;font-size:12px;line-height:1.45;}
   .confirm-list .li .txt b{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
 
+  /* 組出來的儲位預覽。選完三個下拉還要在腦中把 A + 04 + 3 拼起來，
+     等於把驗證的責任丟回給人，所以直接把最後會寫進地圖的字串顯示出來。 */
+  .loc-preview{background:var(--panel2);border-radius:8px;padding:10px 12px;margin-bottom:14px;}
+  .loc-preview .big{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:22px;
+    font-weight:800;color:var(--blue);letter-spacing:1px;}
+  .loc-preview .note{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5;}
+  .loc-preview .note.warn{color:#d98324;}
+
   /* 批次待移動清單 */
   .loc-row{display:flex;gap:10px;align-items:flex-start;padding:10px 0;
     border-bottom:1px solid var(--border);}
@@ -567,11 +575,35 @@
             <option value="remove">移除存放點（清空其中一個位置）</option>
           </select>
         </label>
-        <label class="field">
-          <span id="locTargetLabel">新儲位</span>
-          <input id="locNewInput" class="scan-input" type="text" placeholder="例如 B01-2"
-                 autocomplete="off" list="locKnownList">
-          <datalist id="locKnownList"></datalist>
+        <div id="locBuildBox">
+          <label class="field" style="margin-bottom:8px;">
+            <span id="locTargetLabel">新儲位</span>
+            <select id="locZoneSelect"></select>
+          </label>
+          <div class="row" id="locSlotRow" style="gap:10px;margin-bottom:12px;">
+            <label class="field" style="flex:1;margin-bottom:0;">
+              <span>格位</span>
+              <select id="locSlotSelect"></select>
+            </label>
+            <label class="field" style="flex:1;margin-bottom:0;">
+              <span>層</span>
+              <select id="locLevelSelect"></select>
+            </label>
+          </div>
+          <label class="field" id="locSuffixField">
+            <span>位置補充（選填）</span>
+            <select id="locSuffixSelect"></select>
+          </label>
+          <label class="field" id="locFreeField" style="display:none;">
+            <span>自行輸入儲位</span>
+            <input id="locFreeInput" class="scan-input" type="text"
+                   placeholder="例如 R04-1-2" autocomplete="off">
+          </label>
+          <div id="locPreview"></div>
+        </div>
+        <label class="field" id="locRemoveField" style="display:none;">
+          <span>要移除的儲位</span>
+          <select id="locRemoveSelect"></select>
         </label>
         <label class="field">
           <span>異動類型</span>
@@ -737,7 +769,10 @@ const LS = {
   netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue',
   // 同步時順手從來源數出來的「非本倉」訂單數（山物出／中華宅配／各調撥來源）。
   // 這些訂單本系統不匯入，本機訂單資料裡永遠是0，只有同步當下看得到，所以存起來給首頁用。
-  sourceStats: 'ssz_source_stats'
+  sourceStats: 'ssz_source_stats',
+  // 儲位選單的字彙（有哪些區、每區幾格幾層）。存本機是為了進頁面就有選單可用，
+  // 不用先等一趟網路；背景再去後端更新一次。
+  locVocab: 'ssz_loc_vocab'
 };
 function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
 function saveJSON(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
@@ -1068,6 +1103,7 @@ async function gotoView(name){
     renderStaffSelects();
     renderLocBatch();
     renderLocHistory();
+    loadLocVocab();
     setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 40);
   }
   if(name==='log') renderLog();
@@ -1818,6 +1854,184 @@ function locChipsHtml(cell){
 
 function locMode(){ return document.getElementById('locModeSelect').value; }
 
+// ---- 儲位下拉選單 ----
+// 儲位是一組有結構的編號：A04-3 ＝ A區、04格位、第3層。
+// 讓人自由打字，遲早會出現 a04-3、A4-3、A04_3 這種同義但不同字串的寫法，
+// 而揀貨路線是照字串比對的，寫歪了就等於這件商品從路線上消失。
+// 所以拆成三個下拉，最後由程式組出唯一一種寫法。
+// 選項不寫死在程式裡，是掃描「文山倉儲位」現有資料統計出來的——倉庫加架、清排時
+// 選單會自己跟上，不需要有人記得回來改程式。
+let locVocab = loadJSON(LS.locVocab, null);
+
+async function loadLocVocab(force){
+  // 先用本機存的把選單畫出來，再去後端更新：進頁面就能操作，不用盯著空選單等網路
+  if(locVocab && !force) renderLocZoneOptions();
+  if(!hasBackend()) return;
+  try{
+    const res = await apiPost('getLocationVocab', force ? {force:true} : {});
+    if(res && res.ok){
+      locVocab = res;
+      saveJSON(LS.locVocab, res);
+      renderLocZoneOptions();
+    }
+  }catch(err){ /* 拿不到就沿用本機那份，不要讓整頁不能用 */ }
+}
+
+function locZoneList(){
+  if(!locVocab) return {shelf: [], text: []};
+  const shelf = (locVocab.zones||[]).slice().sort(function(a, b){
+    return zoneSortIndex(a.code.toUpperCase()) - zoneSortIndex(b.code.toUpperCase());
+  });
+  return {shelf: shelf, text: locVocab.textZones || []};
+}
+function locZoneInfo(code){
+  return (locVocab && (locVocab.zones||[]).find(function(z){ return z.code === code; })) || null;
+}
+
+function renderLocZoneOptions(){
+  const sel = document.getElementById('locZoneSelect');
+  if(!sel) return;
+  const keep = sel.value;
+  const lists = locZoneList();
+  let html = '';
+  if(lists.shelf.length){
+    html += '<optgroup label="貨架區（照走動順序）">' + lists.shelf.map(function(z){
+      return '<option value="' + escapeHtml(z.code) + '">' + escapeHtml(z.code) + '區</option>';
+    }).join('') + '</optgroup>';
+  }
+  if(lists.text.length){
+    html += '<optgroup label="其他區域">' + lists.text.map(function(t){
+      return '<option value="__t__' + escapeHtml(t.code) + '">' + escapeHtml(t.code) + '</option>';
+    }).join('') + '</optgroup>';
+  }
+  html += '<option value="__free__">其他（自行輸入）</option>';
+  sel.innerHTML = html;
+  sel.value = keep || (lists.shelf[0] ? lists.shelf[0].code : '__free__');
+  if(!sel.value) sel.selectedIndex = 0;
+  renderLocSlotOptions();
+}
+
+function renderLocSlotOptions(){
+  const zone = document.getElementById('locZoneSelect').value;
+  const slotRow = document.getElementById('locSlotRow');
+  const suffixField = document.getElementById('locSuffixField');
+  const freeField = document.getElementById('locFreeField');
+  const isShelf = zone && zone.indexOf('__') !== 0;
+  const isFree = zone === '__free__';
+
+  slotRow.style.display = isShelf ? '' : 'none';
+  suffixField.style.display = isShelf ? '' : 'none';
+  freeField.style.display = isFree ? '' : 'none';
+
+  if(isShelf){
+    const z = locZoneInfo(zone);
+    const slotSel = document.getElementById('locSlotSelect');
+    const lvlSel = document.getElementById('locLevelSelect');
+    const keepSlot = slotSel.value, keepLvl = lvlSel.value;
+    const used = (z && z.usedSlots) || [];
+    // 標出目前沒有商品的格位：上架時要挑空位，這個標記省掉一趟走過去確認
+    slotSel.innerHTML = ((z && z.slots) || []).map(function(n){
+      const txt = locPadSlot(z, n);
+      return '<option value="' + n + '">' + txt + (used.indexOf(n) < 0 ? '　（目前無商品）' : '') + '</option>';
+    }).join('');
+    lvlSel.innerHTML = ((z && z.levels) || []).map(function(n){
+      return '<option value="' + n + '">第 ' + n + ' 層</option>';
+    }).join('') + '<option value="">（不分層）</option>';
+    if(keepSlot) slotSel.value = keepSlot;
+    if(!slotSel.value) slotSel.selectedIndex = 0;
+    if(keepLvl !== '') lvlSel.value = keepLvl;
+    if(lvlSel.selectedIndex < 0) lvlSel.selectedIndex = 0;
+
+    const sfxSel = document.getElementById('locSuffixSelect');
+    if(!sfxSel.options.length){
+      sfxSel.innerHTML = '<option value="">（無）</option>' +
+        ((locVocab && locVocab.suffixes) || []).map(function(x){
+          return '<option value="' + escapeHtml(x) + '">' + escapeHtml(x) + '</option>';
+        }).join('');
+    }
+  }
+  updateLocPreview();
+}
+
+function locPadSlot(z, n){
+  return (z && z.pad === false) ? String(n) : String(n).padStart(2, '0');
+}
+
+// 組出最後要寫進地圖的字串
+function locBuiltValue(){
+  const zone = document.getElementById('locZoneSelect').value;
+  if(zone === '__free__') return String(document.getElementById('locFreeInput').value||'').trim();
+  if(zone.indexOf('__t__') === 0) return zone.slice(5);
+  const z = locZoneInfo(zone);
+  const slot = document.getElementById('locSlotSelect').value;
+  const lvl = document.getElementById('locLevelSelect').value;
+  const sfx = document.getElementById('locSuffixSelect').value;
+  if(!slot) return '';
+  return zone + locPadSlot(z, parseInt(slot, 10)) + (lvl ? '-' + lvl : '') + (sfx || '');
+}
+
+// 同一個位置在地圖上可能已經有另一種寫法（K9-1 vs K09-1）。
+// 直接寫我們組的那種，會讓同一格出現兩個字串、揀貨分組也會分成兩堆。
+// 所以先看看地圖上有沒有等價的既有寫法，有就沿用它。
+function locCanonical(value){
+  if(!value || !locVocab || !locVocab.known) return {value: value, kept: false};
+  if(locVocab.known.indexOf(value) >= 0) return {value: value, kept: false};
+  const m = /^([A-Za-z]{1,2})(\d{1,3})(.*)$/.exec(value);
+  if(!m) return {value: value, kept: false};
+  const n = parseInt(m[2], 10);
+  const alts = [m[1] + String(n) + m[3], m[1] + String(n).padStart(2,'0') + m[3]];
+  for(let i = 0; i < alts.length; i++){
+    if(alts[i] !== value && locVocab.known.indexOf(alts[i]) >= 0){
+      return {value: alts[i], kept: true, from: value};
+    }
+  }
+  return {value: value, kept: false};
+}
+
+function locTargetValue(){
+  if(locMode() === 'remove') return document.getElementById('locRemoveSelect').value || '';
+  return locCanonical(locBuiltValue()).value;
+}
+
+function updateLocPreview(){
+  const box = document.getElementById('locPreview');
+  if(!box) return;
+  if(locMode() === 'remove'){ box.innerHTML = ''; return; }
+  const raw = locBuiltValue();
+  if(!raw){ box.innerHTML = ''; return; }
+  const c = locCanonical(raw);
+  const isNew = locVocab && locVocab.known && locVocab.known.indexOf(c.value) < 0;
+  box.innerHTML = '<div class="loc-preview"><div class="big">' + escapeHtml(c.value) + '</div>' +
+    (c.kept
+      ? '<div class="note warn">地圖上這一格既有的寫法是「' + escapeHtml(c.value)
+        + '」，已沿用，避免同一格出現兩種寫法（你選的是 ' + escapeHtml(c.from) + '）。</div>'
+      : isNew
+        ? '<div class="note warn">地圖上目前沒有任何商品放在這個位置，會是新建立的儲位。</div>'
+        : '<div class="note">這個位置目前已經有其他商品。</div>') +
+    '</div>';
+}
+
+// 移除存放點時，只能從「這幾件實際上有的位置」裡選。
+// 讓人自己打的話，打錯一個字就是「這個位置本來就沒有它」，白忙一趟。
+function renderLocRemoveOptions(){
+  const sel = document.getElementById('locRemoveSelect');
+  if(!sel) return;
+  const keep = sel.value;
+  const counts = {};
+  locBatch.filter(function(x){ return x.ok; }).forEach(function(it){
+    parseLocList(it.location).list.forEach(function(l){ counts[l] = (counts[l]||0) + 1; });
+  });
+  const keys = Object.keys(counts);
+  const total = locBatch.filter(function(x){ return x.ok; }).length;
+  sel.innerHTML = keys.length
+    ? keys.map(function(l){
+        return '<option value="' + escapeHtml(l) + '">' + escapeHtml(l) +
+          '（' + counts[l] + '/' + total + ' 件在這裡）</option>';
+      }).join('')
+    : '<option value="">（清單裡的商品都沒有儲位）</option>';
+  if(keys.indexOf(keep) >= 0) sel.value = keep;
+}
+
 function renderLocKinds(){
   const sel = document.getElementById('locKindSelect');
   if(!sel || sel.options.length) return;
@@ -1864,20 +2078,22 @@ function renderLocBatch(){
     '</div>';
   }).join('');
 
-  // 已知儲位丟進 datalist：移除存放點時可以直接選，不用手打（打錯就等於沒移除）
-  const known = {};
-  ready.forEach(function(it){ parseLocList(it.location).list.forEach(function(l){ known[l] = 1; }); });
-  document.getElementById('locKnownList').innerHTML =
-    Object.keys(known).map(function(l){ return '<option value="' + escapeHtml(l) + '">'; }).join('');
   renderLocModeUi();
 }
 
 function renderLocModeUi(){
-  const m = LOC_MODE_TEXT[locMode()] || LOC_MODE_TEXT.replace;
+  const mode = locMode();
+  const m = LOC_MODE_TEXT[mode] || LOC_MODE_TEXT.replace;
   const n = locBatch.filter(function(x){ return x.ok; }).length;
   document.getElementById('locTargetLabel').textContent = m.label;
   document.getElementById('btnLocSubmit').textContent =
     n > 1 ? ('把這 ' + n + ' 件一併' + m.btn) : ('確認' + m.btn);
+  // 移除是「從既有的裡面挑一個」，跟移動／新增要組一個新編號是相反的動作，
+  // 所以換成另一組輸入元件，而不是共用同一個。
+  document.getElementById('locBuildBox').style.display = mode === 'remove' ? 'none' : '';
+  document.getElementById('locRemoveField').style.display = mode === 'remove' ? '' : 'none';
+  if(mode === 'remove') renderLocRemoveOptions();
+  updateLocPreview();
 }
 
 function locRemove(uid){
@@ -1958,11 +2174,11 @@ async function locSubmit(){
   if(!items.length) return;
   const mode = locMode();
   const m = LOC_MODE_TEXT[mode];
-  const target = String(document.getElementById('locNewInput').value||'').trim();
+  const target = locTargetValue();
   const kind = document.getElementById('locKindSelect').value;
   const note = String(document.getElementById('locNoteInput').value||'').trim();
   const staffObj = staff.find(s=>s.id===document.getElementById('locStaffSelect').value);
-  if(!target){ errorBeep(); flash('err','請填' + m.label,'',1600); return; }
+  if(!target){ errorBeep(); flash('err','請選擇' + m.label,'',1600); return; }
   if(!staffObj){ errorBeep(); flash('err','請先選擇異動人員','',1600); return; }
 
   // 送出前先在本機把明顯不合理的擋掉，省一趟來回，也讓錯誤訊息更即時
@@ -2046,7 +2262,7 @@ async function locSubmit(){
     if(bad) x.failNote = bad.error || '沒有改到';
   });
   if(!locBatch.length){
-    document.getElementById('locNewInput').value = '';
+    document.getElementById('locFreeInput').value = '';
     document.getElementById('locNoteInput').value = '';
   }
   renderLocBatch();
@@ -3515,8 +3731,13 @@ document.getElementById('locSkuInput').addEventListener('keydown', e=>{
   e.target.value = '';
   locScan(code);
 });
-document.getElementById('locNewInput').addEventListener('keydown', e=>{
+document.getElementById('locFreeInput').addEventListener('keydown', e=>{
   if(e.key === 'Enter') locSubmit();
+});
+document.getElementById('locFreeInput').addEventListener('input', updateLocPreview);
+document.getElementById('locZoneSelect').addEventListener('change', renderLocSlotOptions);
+['locSlotSelect','locLevelSelect','locSuffixSelect'].forEach(function(id){
+  document.getElementById(id).addEventListener('change', updateLocPreview);
 });
 document.getElementById('locModeSelect').addEventListener('change', renderLocModeUi);
 document.getElementById('btnLocClear').addEventListener('click', locClear);

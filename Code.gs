@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-13.108';
+const BACKEND_VERSION = '2026-08-13.111';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -128,6 +128,7 @@ function doPost(e){
       case 'changeLocation': result = changeLocation(body); break;
       case 'lookupLocations': result = lookupLocations(body); break;
       case 'changeLocationBatch': result = changeLocationBatch(body); break;
+      case 'getLocationVocab': result = getLocationVocab(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -2400,6 +2401,115 @@ function readLocRow_(sh, row, sku){
           locationExtra: parsed.extra,
           updated: String(v[LOCMAP_COL.updated-1]||'').trim(),
           note: String(v[LOCMAP_COL.note-1]||'').trim()};
+}
+
+// ---- 儲位選單的字彙 ----
+// 儲位改成下拉選單之後，選項不能用寫死的表：倉庫會加架、會清空整排，
+// 寫死的表過幾個月就跟現場對不起來，而且沒有人會發現。
+// 所以直接掃描「文山倉儲位」現有的儲位字串，統計出有哪些區、每區有幾格、幾層。
+//
+// 統計出來的實際格式（7,088列）：格位補零到兩位、層不補零 → A04-3。
+// 補零與否要跟現場既有寫法一致，不然選單會生出 K09-1、地圖上卻是 K9-1，
+// 同一個位置變成兩種寫法，之後誰都對不起來。
+const LOC_VOCAB_CACHE_KEY = 'locVocab_v1';
+const LOC_VOCAB_TTL = 6 * 3600;   // 秒。倉庫格局不會一天到晚變，六小時夠新了
+// 位置補充：實際資料裡「上」463筆、「下」416筆…這些是同一格裡的相對位置，
+// 不是另一個區，所以獨立成一個選填欄位。
+const LOC_SUFFIXES = ['上', '下', '地上', '右', '左', '牌面', '旁走道'];
+// 這幾個在資料裡是接在儲位後面（M45-2待加工），沒有單獨成一格過，
+// 但它們確實是獨立的區域，使用者也指名要能選。硬掃資料掃不出來，就明講。
+const LOC_EXTRA_TEXT_ZONES = ['待加工', '中華'];
+
+function getLocationVocab(body){
+  const force = !!(body && body.force);
+  const cache = CacheService.getScriptCache();
+  if(!force){
+    const hit = cache.get(LOC_VOCAB_CACHE_KEY);
+    if(hit){
+      try{ return JSON.parse(hit); }catch(err){ /* 快取壞了就重算 */ }
+    }
+  }
+  const sh = getLocMapSheet_();
+  if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
+  const lastRow = sh.getLastRow();
+  const cells = sh.getRange(2, LOCMAP_COL.location, lastRow - 1, 1).getValues();
+
+  const shelf = {};   // 小寫區碼 → {spellings:{}, slots:{}, levels:{}, n}
+  const text = {};    // 純文字的地點 → 次數
+  const known = {};   // 所有出現過的完整儲位字串 → 次數
+  const tok = /^([A-Za-z]{1,2})(\d{1,3})(?:-(\d{1,2}))?/;
+
+  cells.forEach(function(row){
+    const cell = String(row[0]||'').trim();
+    if(!cell) return;
+    cell.split(LOC_SPLIT_RE).forEach(function(seg){
+      seg = String(seg||'').trim();
+      if(!seg) return;
+      known[seg] = (known[seg]||0) + 1;
+      const parsed = parseLocList_(seg);
+      parsed.list.forEach(function(one){
+        const m = tok.exec(one.replace(/\s+/g, ''));
+        if(!m){ text[one] = (text[one]||0) + 1; return; }
+        const key = m[1].toLowerCase();
+        const z = shelf[key] || (shelf[key] = {spellings:{}, slots:{}, levels:{}, n:0, pad:0, noPad:0});
+        z.spellings[m[1]] = (z.spellings[m[1]]||0) + 1;
+        z.slots[parseInt(m[2], 10)] = 1;
+        // 格位補零與否要照各區既有的寫法：多數區是 C04-1，但 Pa 區是 Pa2-1。
+        // 選單生出跟現場不一樣的寫法，同一個位置就會變成兩種字串。
+        if(parseInt(m[2], 10) <= 9){ if(m[2].length >= 2) z.pad++; else z.noPad++; }
+        if(m[3]) z.levels[parseInt(m[3], 10)] = 1;
+        z.n++;
+      });
+    });
+  });
+
+  const numsOf = function(obj){
+    return Object.keys(obj).map(Number).sort(function(a,b){ return a-b; });
+  };
+  const zones = [];
+  Object.keys(shelf).forEach(function(key){
+    const z = shelf[key];
+    // 同一區大小寫混用（i/I、pa/PA/Pa）時，取出現最多次的寫法當代表。
+    // 少數幾筆的異體字多半是打錯的，不要讓它們變成選單上的另一區。
+    let spell = '', best = -1;
+    Object.keys(z.spellings).forEach(function(sp){
+      if(z.spellings[sp] > best){ best = z.spellings[sp]; spell = sp; }
+    });
+    if(z.n < 3) return;   // 出現不到3次的（fF03-2 這種）當打錯，不列進選單
+    const slots = numsOf(z.slots), levels = numsOf(z.levels);
+    // A~L 是規則的貨架排，每排 1~12 座。只列「目前有貨的格位」的話，
+    // 空著的格子就選不到——而上架到空格正是最需要用這個功能的時候。
+    const maxSlot = /^[A-La-l]$/.test(spell) ? Math.max(12, slots[slots.length-1] || 0)
+                                             : (slots[slots.length-1] || 1);
+    const full = [];
+    for(let i = 1; i <= maxSlot; i++) full.push(i);
+    const maxLevel = Math.max(4, levels.length ? levels[levels.length-1] : 0);
+    const fullLevels = [];
+    for(let i = 1; i <= maxLevel; i++) fullLevels.push(i);
+    zones.push({code: spell, kind:'shelf', count: z.n, slots: full, levels: fullLevels,
+                usedSlots: slots, usedLevels: levels, pad: z.pad >= z.noPad});
+  });
+
+  // 純文字的地點（架上、2樓、待加工…）本身就是一個區，沒有格位跟層。
+  // 出現太少次的多半是一次性的手寫（「-」「康康位置」），不列進選單但仍可自行輸入。
+  const textZones = Object.keys(text).filter(function(t){
+      if(text[t] < 3) return false;
+      if(/^[-–—.,、。\s]+$/.test(t)) return false;      // 「-」這種是空值的替代寫法，不是地點
+      if(LOC_SUFFIXES.indexOf(t) >= 0) return false;    // 「右」「上」是格內位置，不是一個區
+      return true;
+    })
+    .sort(function(a,b){ return text[b] - text[a]; })
+    .map(function(t){ return {code: t, kind:'text', count: text[t]}; });
+  LOC_EXTRA_TEXT_ZONES.forEach(function(t){
+    if(!textZones.some(function(x){ return x.code === t; })){
+      textZones.push({code: t, kind:'text', count: text[t] || 0});
+    }
+  });
+
+  const out = {ok:true, zones: zones, textZones: textZones, suffixes: LOC_SUFFIXES,
+               known: Object.keys(known), builtAt: nowStamp_()};
+  try{ cache.put(LOC_VOCAB_CACHE_KEY, JSON.stringify(out), LOC_VOCAB_TTL); }catch(err){ /* 太大就不快取 */ }
+  return out;
 }
 
 // 查一個品號現在登記在哪。給APP在送出前顯示「原儲位」用——
