@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-14.122';
+const BACKEND_VERSION = '2026-08-14.123';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -130,6 +130,7 @@ function doPost(e){
       case 'changeLocationBatch': result = changeLocationBatch(body); break;
       case 'getLocationVocab': result = getLocationVocab(body); break;
       case 'findSiblingSkus': result = findSiblingSkus(body); break;
+      case 'listLocationContents': result = listLocationContents(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -2427,6 +2428,97 @@ function readLocRow_(sh, row, sku){
           locationExtra: parsed.extra,
           updated: String(v[LOCMAP_COL.updated-1]||'').trim(),
           note: String(v[LOCMAP_COL.note-1]||'').trim()};
+}
+
+// ---- 貨架商品查詢 ----
+// 「A04-3 上面到底有什麼」現在只能開試算表用眼睛找。盤點、找空位、
+// 查「這格說有貨但架上沒有」都需要反過來查：給位置，列出商品。
+//
+// 比對不用字串前綴，是拆成 區/格位/層 三個數字比。原因是同一格在資料裡
+// 有兩種寫法（K09-1 與 K9-1 並存，實測 10 處 121 個品號），
+// 字串比對會讓其中一種查不到——而查不到的那些正是最需要被發現的。
+// 開頭的 0* 就是把補零與不補零的寫法拉成同一個數字。
+const LOC_LOOSE_RE = /^([A-Za-z]{1,2})\s*0*(\d{1,3})(?:\s*-\s*(\d{1,2}))?(.*)$/;
+
+function parseLocToken_(t){
+  const m = LOC_LOOSE_RE.exec(String(t||'').trim());
+  if(!m) return null;
+  return {zone: m[1], slot: parseInt(m[2], 10),
+          level: m[3] ? parseInt(m[3], 10) : null, rest: String(m[4]||'').trim()};
+}
+
+function locMatches_(entry, q){
+  const raw = String(entry||'').trim();
+  if(!raw) return false;
+  // 文字地點（架上、2樓、待加工…）沒有格位層次，只能整串比對
+  if(q.textZone) return raw === q.zone;
+  const p = parseLocToken_(raw);
+  if(!p) return false;
+  if(p.zone.toLowerCase() !== String(q.zone||'').toLowerCase()) return false;
+  if(q.slot !== null && q.slot !== undefined && p.slot !== q.slot) return false;
+  if(q.level !== null && q.level !== undefined && p.level !== q.level) return false;
+  return true;
+}
+
+const LOC_QUERY_MAX = 2000;
+
+function listLocationContents(body){
+  const zone = String((body && body.zone) || '').trim();
+  if(!zone) return {ok:false, error:'請指定區域'};
+  const num = function(v){
+    if(v === '' || v === null || v === undefined) return null;
+    const n = parseInt(v, 10);
+    return isNaN(n) ? null : n;
+  };
+  const q = {zone: zone, slot: num(body && body.slot), level: num(body && body.level),
+             textZone: !!(body && body.textZone)};
+
+  const sh = getLocMapSheet_();
+  if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
+  const last = sh.getLastRow();
+  // A品號 B品名 C儲位 D更新 E網購庫存倉 F總倉 …… L重要訊息備註
+  const vals = sh.getRange(2, 1, last - 1, LOCMAP_COL.note).getValues();
+
+  const items = [];
+  const locSet = {};
+  let scanned = 0;
+  vals.forEach(function(r){
+    const sku = String(r[LOCMAP_COL.sku - 1]||'').trim();
+    if(!sku) return;
+    scanned++;
+    const cell = String(r[LOCMAP_COL.location - 1]||'').trim();
+    if(!cell) return;
+    const parsed = parseLocList_(cell);
+    const hit = parsed.list.filter(function(x){ return locMatches_(x, q); });
+    if(!hit.length) return;
+    hit.forEach(function(h){ locSet[h] = (locSet[h]||0) + 1; });
+    if(items.length < LOC_QUERY_MAX){
+      items.push({sku: sku,
+        baseName: String(r[LOCMAP_COL.name - 1]||'').trim(),
+        location: cell,
+        matched: hit[0],
+        updated: String(r[LOCMAP_COL.updated - 1]||'').trim(),
+        stockWs: String(r[5 - 1]||'').trim(),      // E 網購庫存倉
+        stockMain: String(r[6 - 1]||'').trim(),    // F 總倉
+        note: String(r[LOCMAP_COL.note - 1]||'').trim(),
+        alsoAt: parsed.list.filter(function(x){ return hit.indexOf(x) < 0; })});
+    }
+  });
+
+  // 照儲位排序，同一格的排在一起；同格內照品號，現場才好一格一格對
+  items.sort(function(a, b){
+    if(a.matched !== b.matched) return locationSortKey_(a.matched) < locationSortKey_(b.matched) ? -1 : 1;
+    return a.sku < b.sku ? -1 : 1;
+  });
+
+  const locations = Object.keys(locSet).sort(function(a, b){
+    return locationSortKey_(a) < locationSortKey_(b) ? -1 : 1;
+  }).map(function(k){ return {location: k, count: locSet[k]}; });
+
+  // 「地圖說這裡有、但庫存是0」是盤點最想先看到的一批
+  const noStock = items.filter(function(x){ return !x.stockWs && !x.stockMain; }).length;
+  return {ok:true, query: q, total: items.length, truncated: items.length >= LOC_QUERY_MAX,
+          scanned: scanned, locations: locations, noStock: noStock, items: items};
 }
 
 // ---- 同款其他規格 ----

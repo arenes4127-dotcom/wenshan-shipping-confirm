@@ -229,6 +229,18 @@
   .loc-preview .note{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5;}
   .loc-preview .note.warn{color:#d98324;}
 
+  /* 貨架查詢結果：一格一組，組頭是儲位 */
+  .q-group{margin-top:14px;}
+  .q-group .head{display:flex;justify-content:space-between;align-items:center;gap:8px;
+    margin-bottom:6px;flex-wrap:wrap;}
+  .q-item{display:flex;gap:9px;align-items:center;padding:7px 2px;border-bottom:1px solid var(--border);}
+  .q-item:last-child{border-bottom:none;}
+  .q-item .t{flex:1;min-width:0;font-size:12px;line-height:1.45;}
+  .q-item .t b{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
+  .q-item .st{font-size:12px;white-space:nowrap;text-align:right;}
+  .q-item .st .zero{color:var(--danger);}
+  .q-sum{background:var(--panel2);border-radius:8px;padding:10px 12px;margin-top:12px;font-size:13px;line-height:1.6;}
+
   /* 同款規格挑選：一款可能有 80 個規格，要能一眼看出哪些文山有貨 */
   .sib-row{display:flex;gap:9px;align-items:center;padding:7px 10px;border-bottom:1px solid var(--border);}
   .sib-row:last-child{border-bottom:none;}
@@ -316,6 +328,23 @@
       <div class="row">
         <button class="btn gray" id="confirmCancel">取消</button>
         <button class="btn" id="confirmOk">確定</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="confirm-mask" id="shelfMask">
+    <div class="confirm-box" style="max-width:520px;">
+      <h3>查詢貨架商品</h3>
+      <p class="hint" style="margin-top:0;">選到哪一層就查那一層；格位或層選「全部」就查整格、整區。</p>
+      <div class="row" style="gap:8px;align-items:flex-end;">
+        <label class="field" style="flex:1.2;margin-bottom:0;"><span>區</span><select id="qZone"></select></label>
+        <label class="field" style="flex:1;margin-bottom:0;" id="qSlotField"><span>格位</span><select id="qSlot"></select></label>
+        <label class="field" style="flex:1;margin-bottom:0;" id="qLevelField"><span>層</span><select id="qLevel"></select></label>
+      </div>
+      <button class="btn block" id="qRun" style="margin-top:12px;">查詢</button>
+      <div id="qResult"></div>
+      <div class="row" style="margin-top:12px;">
+        <button class="btn gray" id="qClose">關閉</button>
       </div>
     </div>
   </div>
@@ -582,10 +611,11 @@
         <p class="hint" style="margin-top:0;">上架、移櫃、盤點調整，或揀貨時發現東西不在標示的位置，都用這裡改。
           送出後會直接更新「文山地圖」的文山倉儲位，並在後端留一筆異動紀錄。<br>
           <b>同一批要一起搬的（同商品多顏色、多尺寸）可以連續掃，最後一次送出。</b></p>
-        <label class="field" style="margin-bottom:0;">
+        <label class="field" style="margin-bottom:10px;">
           <span>掃描或輸入商品條碼／貨號</span>
           <input id="locSkuInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
         </label>
+        <button class="btn gray block" id="btnShelfQuery">🔍 查詢貨架上有哪些商品</button>
       </div>
 
       <div class="card" id="locBatchBox" style="display:none;">
@@ -2315,6 +2345,138 @@ async function locSubmit(){
   setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 60);
 }
 
+// ---- 貨架商品查詢 ----
+// 反過來查：給位置，列出商品。盤點、找空位、查「地圖說有但架上沒有」都要用。
+let shelfResult = null;
+
+function qFillZones(){
+  const sel = document.getElementById('qZone');
+  const lists = locZoneList();
+  let html = '';
+  if(lists.shelf.length){
+    html += '<optgroup label="貨架區（照走動順序）">' + lists.shelf.map(function(z){
+      return '<option value="' + escapeHtml(z.code) + '">' + escapeHtml(z.code) + '區</option>';
+    }).join('') + '</optgroup>';
+  }
+  if(lists.text.length){
+    html += '<optgroup label="其他區域">' + lists.text.map(function(t){
+      return '<option value="__t__' + escapeHtml(t.code) + '">' + escapeHtml(t.code) + '</option>';
+    }).join('') + '</optgroup>';
+  }
+  sel.innerHTML = html;
+  qFillSlots();
+}
+
+function qFillSlots(){
+  const zone = document.getElementById('qZone').value;
+  const isText = zone.indexOf('__t__') === 0;
+  document.getElementById('qSlotField').style.display = isText ? 'none' : '';
+  document.getElementById('qLevelField').style.display = isText ? 'none' : '';
+  if(isText) return;
+  const z = locZoneInfo(zone);
+  const used = (z && z.usedSlots) || [];
+  document.getElementById('qSlot').innerHTML = '<option value="">全部格位</option>' +
+    ((z && z.slots) || []).map(function(n){
+      return '<option value="' + n + '">' + locPadSlot(z, n)
+        + (used.indexOf(n) < 0 ? '　（無商品）' : '') + '</option>';
+    }).join('');
+  document.getElementById('qLevel').innerHTML = '<option value="">全部層</option>' +
+    ((z && z.levels) || []).map(function(n){
+      return '<option value="' + n + '">第 ' + n + ' 層</option>';
+    }).join('');
+}
+
+async function runShelfQuery(){
+  const zoneRaw = document.getElementById('qZone').value;
+  if(!zoneRaw) return;
+  const isText = zoneRaw.indexOf('__t__') === 0;
+  const body = isText
+    ? {zone: zoneRaw.slice(5), textZone: true}
+    : {zone: zoneRaw, slot: document.getElementById('qSlot').value,
+       level: document.getElementById('qLevel').value};
+  const box = document.getElementById('qResult');
+  box.innerHTML = '<p class="hint">查詢中…</p>';
+  let res;
+  try{ res = await apiPost('listLocationContents', body); }
+  catch(err){ box.innerHTML = '<p class="hint" style="color:var(--danger);">查詢失敗：' + escapeHtml(err.message||'') + '</p>'; return; }
+  if(!res || !res.ok){
+    box.innerHTML = '<p class="hint" style="color:var(--danger);">' + escapeHtml((res && res.error) || '查詢失敗') + '</p>';
+    return;
+  }
+  shelfResult = res;
+  renderShelfResult();
+}
+
+function renderShelfResult(){
+  const box = document.getElementById('qResult');
+  const res = shelfResult;
+  if(!res) return;
+  if(!res.total){
+    box.innerHTML = '<div class="q-sum">這個位置目前沒有登記任何商品。<br>'
+      + '<span class="hint">可以直接把商品掃進來指定到這裡。</span></div>';
+    return;
+  }
+  // 依儲位分組。同一格的東西擺在一起，現場才好一格一格對
+  const groups = {};
+  res.items.forEach(function(it){
+    (groups[it.matched] = groups[it.matched] || []).push(it);
+  });
+  const order = res.locations.map(function(x){ return x.location; });
+
+  let html = '<div class="q-sum">共 <b>' + res.total + '</b> 個品號，分布在 <b>'
+    + res.locations.length + '</b> 個位置。'
+    + (res.noStock ? '<br><span style="color:var(--danger);">其中 ' + res.noStock
+        + ' 個品號目前庫存是 0</span>（地圖上還掛著，實際架上可能已經沒有了）' : '')
+    + (res.truncated ? '<br><span class="hint">結果太多，只顯示前 ' + res.total + ' 筆</span>' : '')
+    + '</div>';
+
+  order.forEach(function(loc){
+    const list = groups[loc] || [];
+    if(!list.length) return;
+    const safe = String(loc).replace(/'/g, "\\'");
+    html += '<div class="q-group"><div class="head">' +
+      '<span class="loc-badge">' + escapeHtml(loc) + '</span>' +
+      '<span class="hint">' + list.length + ' 個品號</span>' +
+      '<button class="btn gray sm" onclick="addShelfGroupToBatch(\'' + escapeHtml(safe) + '\')">整格加入異動清單</button>' +
+      '</div>';
+    html += list.map(function(it){
+      const zero = !it.stockWs && !it.stockMain;
+      return '<div class="q-item">' + thumbHtml(it.sku, it.baseName) +
+        '<div class="t"><b>' + escapeHtml(it.sku) + '</b>' +
+          '<div>' + escapeHtml((it.baseName || '').slice(0, 46)) + '</div>' +
+          (it.alsoAt && it.alsoAt.length
+            ? '<div style="color:var(--muted);">也放在 ' + it.alsoAt.map(escapeHtml).join('、') + '</div>' : '') +
+          (it.note ? '<div style="color:var(--muted);">' + escapeHtml(it.note.slice(0, 40)) + '</div>' : '') +
+        '</div>' +
+        '<div class="st"><div' + (zero ? ' class="zero"' : '') + '>文山 ' + escapeHtml(it.stockWs || '0') + '</div>' +
+          '<div class="hint">總倉 ' + escapeHtml(it.stockMain || '0') + '</div></div>' +
+      '</div>';
+    }).join('');
+    html += '</div>';
+  });
+  box.innerHTML = html;
+}
+
+// 查到一整格之後，常常接著就是要把它們搬走。
+// 讓人再一件一件掃回來太蠢了，直接整格丟進異動清單。
+function addShelfGroupToBatch(loc){
+  if(!shelfResult) return;
+  const already = {};
+  locBatch.forEach(function(x){ if(x.ok) already[x.sku] = 1; });
+  const picked = shelfResult.items.filter(function(it){
+    return it.matched === loc && !already[it.sku];
+  });
+  picked.forEach(function(it){
+    locBatch.push({uid: ++locSeq, code: it.sku, ok: true, sku: it.sku, baseName: it.baseName,
+      spec: '', location: it.location, locations: parseLocList(it.location).list,
+      note: it.note || '', updated: it.updated || '', isNew: false, stockWs: it.stockWs || ''});
+  });
+  if(!picked.length){ errorBeep(); flash('err', '這一格的商品都已經在清單裡了', '', 1800); return; }
+  okBeep();
+  flash('ok', loc + ' 整格加入 ' + picked.length + ' 個品號', '關掉查詢就可以指定新位置', 2400);
+  renderLocBatch();
+}
+
 // 小樣多尺寸多顏色是整箱一起搬的，一箱三十件逐件掃要掃三十次，
 // 而它們的目的地是同一個位置。掃一件、把同款其他規格叫出來勾一勾，
 // 實測 57% 的品號能這樣展開，平均一群 10.2 個規格。
@@ -3865,6 +4027,22 @@ document.getElementById('locZoneSelect').addEventListener('change', renderLocSlo
 });
 document.getElementById('locModeSelect').addEventListener('change', renderLocModeUi);
 document.getElementById('btnLocClear').addEventListener('click', locClear);
+document.getElementById('btnShelfQuery').addEventListener('click', async function(){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','貨架查詢要連上後端才能用',1800); return; }
+  await loadLocVocab();
+  qFillZones();
+  document.getElementById('qResult').innerHTML = '';
+  shelfResult = null;
+  document.getElementById('shelfMask').classList.add('show');
+});
+document.getElementById('qZone').addEventListener('change', qFillSlots);
+document.getElementById('qRun').addEventListener('click', runShelfQuery);
+document.getElementById('qClose').addEventListener('click', function(){
+  document.getElementById('shelfMask').classList.remove('show');
+});
+document.getElementById('shelfMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('shelfMask')) document.getElementById('shelfMask').classList.remove('show');
+});
 document.getElementById('sibOk').addEventListener('click', function(){ closeSiblings(true); });
 document.getElementById('sibCancel').addEventListener('click', function(){ closeSiblings(false); });
 document.getElementById('sibMask').addEventListener('click', function(e){
