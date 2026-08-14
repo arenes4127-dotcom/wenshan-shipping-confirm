@@ -229,6 +229,17 @@
   .loc-preview .note{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5;}
   .loc-preview .note.warn{color:#d98324;}
 
+  /* 同款規格挑選：一款可能有 80 個規格，要能一眼看出哪些文山有貨 */
+  .sib-row{display:flex;gap:9px;align-items:center;padding:7px 10px;border-bottom:1px solid var(--border);}
+  .sib-row:last-child{border-bottom:none;}
+  .sib-row input[type=checkbox]{width:18px;height:18px;flex:none;}
+  .sib-row .t{flex:1;min-width:0;font-size:12px;line-height:1.45;}
+  .sib-row .t b{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
+  .sib-row .qty{font-size:12px;white-space:nowrap;color:var(--muted);}
+  .sib-row .qty.has{color:var(--accent);font-weight:700;}
+  .tag-new{display:inline-block;font-size:11px;font-weight:700;color:#d98324;
+    border:1px solid #d98324;border-radius:5px;padding:0 5px;margin-left:5px;}
+
   /* 批次待移動清單 */
   .loc-row{display:flex;gap:10px;align-items:flex-start;padding:10px 0;
     border-bottom:1px solid var(--border);}
@@ -305,6 +316,25 @@
       <div class="row">
         <button class="btn gray" id="confirmCancel">取消</button>
         <button class="btn" id="confirmOk">確定</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="confirm-mask" id="sibMask">
+    <div class="confirm-box">
+      <h3 id="sibTitle">同款其他規格</h3>
+      <p class="hint" id="sibHint" style="margin-top:0;"></p>
+      <div class="row" style="gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap;">
+        <button class="btn gray sm" id="sibAll">全選</button>
+        <button class="btn gray sm" id="sibNone">全不選</button>
+        <label class="hint" style="display:flex;align-items:center;gap:6px;margin:0;">
+          <input type="checkbox" id="sibOnlyStock" checked> 只顯示文山有貨的
+        </label>
+      </div>
+      <div class="confirm-list" id="sibList"></div>
+      <div class="row">
+        <button class="btn gray" id="sibCancel">取消</button>
+        <button class="btn" id="sibOk">加入清單</button>
       </div>
     </div>
   </div>
@@ -2068,13 +2098,17 @@ function renderLocBatch(){
     return '<div class="loc-row">' + thumbHtml(it.sku, it.baseName) +
       '<div class="body">' +
         '<div class="sku-badge">' + escapeHtml(it.sku) + '</div>' +
+        (it.isNew ? '<span class="tag-new">新品·將建檔</span>' : '') +
         '<div style="font-weight:700;margin-top:3px;font-size:13px;">' + escapeHtml(it.baseName||'（無品名）') + '</div>' +
-        '<div style="margin-top:2px;">' + locChipsHtml(it.location) + '</div>' +
+        (it.isNew ? '' : '<div style="margin-top:2px;">' + locChipsHtml(it.location) + '</div>') +
         (it.note ? '<div class="hint" style="margin-top:2px;">備註：' + escapeHtml(it.note) + '</div>' : '') +
         (it.failNote ? '<div class="hint" style="margin-top:2px;color:var(--danger);">上次沒改到：'
           + escapeHtml(it.failNote) + '</div>' : '') +
       '</div>' +
-      '<button class="btn gray sm" onclick="locRemove(' + it.uid + ')">移除</button>' +
+      '<div style="display:flex;flex-direction:column;gap:5px;">' +
+        '<button class="btn gray sm" onclick="locRemove(' + it.uid + ')">移除</button>' +
+        '<button class="btn gray sm" onclick="openSiblings(\'' + escapeHtml(it.sku).replace(/'/g, "\\'") + '\')">同款規格</button>' +
+      '</div>' +
     '</div>';
   }).join('');
 
@@ -2149,18 +2183,26 @@ async function locScan(code){
   const idx = locBatch.findIndex(function(x){ return x.uid === uid; });
   if(idx < 0) return;   // 查詢途中被人移掉了
   const found = (res && res.found) || [];
-  if(!found.length){
-    locBatch[idx] = {uid: uid, code: raw, ok: false, error: '文山地圖裡沒有這個貨號'};
+  // 儲位主檔還沒有這個品號，但 ERP 查得到＝新品入倉，補列排程還沒跑到。
+  // 貨就在手上、位置也放好了，沒有理由叫人等到明天——當場建檔。
+  const fresh = (res && res.newItems) || [];
+  if(!found.length && !fresh.length){
+    locBatch[idx] = {uid: uid, code: raw, ok: false,
+      error: '儲位主檔和庫存主檔都沒有這個貨號，請確認是否掃錯'};
     renderLocBatch(); errorBeep();
-    flash('err','文山地圖裡沒有這個貨號', '「' + raw + '」查不到儲位資料', 2400);
+    flash('err','查不到這個貨號', '「' + raw + '」連庫存主檔也沒有，請確認條碼', 2800);
     return;
   }
-  const rows = found.filter(function(f){
+  const rows = found.concat(fresh).filter(function(f){
     return !locBatch.some(function(x){ return x.ok && x.sku === f.sku; });
   }).map(function(f){
     return {uid: ++locSeq, code: raw, ok: true, sku: f.sku, baseName: f.baseName,
-            location: f.location, locations: f.locations, note: f.note, updated: f.updated};
+            spec: f.spec || '', location: f.location || '', locations: f.locations || [],
+            note: f.note || '', updated: f.updated || '', isNew: !!f.isNew,
+            stockWs: f.stockWs || ''};
   });
+  if(fresh.length) flash('ok', '新品：' + fresh[0].baseName.slice(0, 18),
+    '儲位主檔還沒有這個品號，指定儲位後會直接幫你建檔', 3000);
   locBatch.splice(idx, 1);
   locBatch = locBatch.concat(rows);
   renderLocBatch();
@@ -2196,7 +2238,8 @@ async function locSubmit(){
     title: (items.length > 1 ? '確認一併' + m.btn + '（' + items.length + ' 件）' : '確認' + m.btn),
     items: items.map(function(it){
       return {sku: it.sku, name: it.baseName,
-              sub: (mode === 'add' ? '目前：' + (it.location||'（無）') + ' ＋ ' + target
+              sub: it.isNew ? ('新品，將在主檔建立並指定 ' + target)
+                 : (mode === 'add' ? '目前：' + (it.location||'（無）') + ' ＋ ' + target
                  : mode === 'remove' ? '目前：' + (it.location||'（無）') + ' － ' + target
                  : (it.location||'（無）') + ' → ' + target)};
     }),
@@ -2213,6 +2256,9 @@ async function locSubmit(){
   items.forEach(function(it){ delete it.failNote; });
   const payload = {toLocation: target, kind: kind, mode: mode,
                    staffId: staffObj.id, staffName: staffObj.name, note: note};
+  // 清單裡有新品才開建檔。平常不開，是為了讓「掃錯的貨號」還是走查無資料被擋下來，
+  // 而不是默默在主檔生出一列。
+  if(items.some(function(x){ return x.isNew; })) payload.createIfMissing = true;
   let res;
   try{
     res = items.length === 1
@@ -2267,6 +2313,84 @@ async function locSubmit(){
   }
   renderLocBatch();
   setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 60);
+}
+
+// 小樣多尺寸多顏色是整箱一起搬的，一箱三十件逐件掃要掃三十次，
+// 而它們的目的地是同一個位置。掃一件、把同款其他規格叫出來勾一勾，
+// 實測 57% 的品號能這樣展開，平均一群 10.2 個規格。
+let sibCandidates = [];
+let sibResolve = null;
+
+function renderSibList(){
+  const onlyStock = document.getElementById('sibOnlyStock').checked;
+  const box = document.getElementById('sibList');
+  const shown = sibCandidates.filter(function(x){ return !onlyStock || x.hasStock; });
+  if(!shown.length){
+    box.innerHTML = '<p class="hint" style="padding:12px;margin:0;">'
+      + (onlyStock ? '同款的其他規格目前文山都沒有庫存。把上面的勾拿掉可以看全部。' : '沒有同款的其他規格。')
+      + '</p>';
+    return;
+  }
+  box.innerHTML = shown.map(function(x){
+    return '<label class="sib-row">' +
+      '<input type="checkbox" data-sku="' + escapeHtml(x.sku) + '"' + (x.checked ? ' checked' : '') + '>' +
+      '<div class="t"><b>' + escapeHtml(x.sku) + '</b>' +
+        (x.inMap ? '' : '<span class="tag-new">未建檔</span>') +
+        '<div>' + escapeHtml((x.baseName || '').slice(0, 40)) + '</div>' +
+        '<div style="color:var(--muted);">' + escapeHtml(x.spec || '') +
+          (x.location ? '　現在：' + escapeHtml(x.location) : '') + '</div>' +
+      '</div>' +
+      '<div class="qty' + (x.hasStock ? ' has' : '') + '">文山 ' + escapeHtml(x.stockWs || '0') + '</div>' +
+    '</label>';
+  }).join('');
+  box.querySelectorAll('input[type=checkbox]').forEach(function(cb){
+    cb.addEventListener('change', function(){
+      const hit = sibCandidates.find(function(x){ return x.sku === cb.dataset.sku; });
+      if(hit) hit.checked = cb.checked;
+    });
+  });
+}
+
+async function openSiblings(sku){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','',1600); return; }
+  flash('ok', '查詢同款規格中…', sku, 1200);
+  let res;
+  try{ res = await apiPost('findSiblingSkus', {sku: sku}); }
+  catch(err){ errorBeep(); flash('err','查詢失敗', err.message||'', 2200); return; }
+  const list = (res && res.siblings) || [];
+  const already = {};
+  locBatch.forEach(function(x){ if(x.ok) already[x.sku] = 1; });
+  sibCandidates = list.filter(function(x){ return !already[x.sku]; }).map(function(x){
+    const hasStock = !!(String(x.stockWs||'').trim() || String(x.stockMain||'').trim());
+    // 預設只勾「文山有貨」的。沒貨的東西勾起來一起指定位置，
+    // 等於在地圖上宣告一個架上其實沒有的商品——那比沒有資料更糟。
+    return Object.assign({}, x, {hasStock: hasStock, checked: hasStock});
+  });
+  if(!sibCandidates.length){
+    flash('err', '沒有可加入的同款規格', list.length ? '同款的都已經在清單裡了' : '找不到同款其他規格', 2400);
+    return;
+  }
+  document.getElementById('sibTitle').textContent = '同款其他規格（' + sibCandidates.length + ' 個）';
+  document.getElementById('sibHint').textContent =
+    '整箱搬動時，把這箱裡真的有的規格一起勾起來，就不用一件一件掃。預設只勾了文山有庫存的。';
+  document.getElementById('sibOnlyStock').checked = sibCandidates.some(function(x){ return x.hasStock; });
+  renderSibList();
+  document.getElementById('sibMask').classList.add('show');
+}
+
+function closeSiblings(add){
+  document.getElementById('sibMask').classList.remove('show');
+  if(add){
+    const picked = sibCandidates.filter(function(x){ return x.checked; });
+    picked.forEach(function(x){
+      locBatch.push({uid: ++locSeq, code: x.sku, ok: true, sku: x.sku, baseName: x.baseName,
+        spec: x.spec, location: x.location || '', locations: parseLocList(x.location).list,
+        note: '', updated: '', isNew: !x.inMap, stockWs: x.stockWs || ''});
+    });
+    if(picked.length){ okBeep(); flash('ok', '加入 ' + picked.length + ' 個規格', '', 1600); }
+    renderLocBatch();
+  }
+  sibCandidates = [];
 }
 
 // 揀貨卡片上的「改儲位」：人就站在貨架前，這時候改最準。
@@ -3741,6 +3865,21 @@ document.getElementById('locZoneSelect').addEventListener('change', renderLocSlo
 });
 document.getElementById('locModeSelect').addEventListener('change', renderLocModeUi);
 document.getElementById('btnLocClear').addEventListener('click', locClear);
+document.getElementById('sibOk').addEventListener('click', function(){ closeSiblings(true); });
+document.getElementById('sibCancel').addEventListener('click', function(){ closeSiblings(false); });
+document.getElementById('sibMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('sibMask')) closeSiblings(false);
+});
+document.getElementById('sibOnlyStock').addEventListener('change', renderSibList);
+document.getElementById('sibAll').addEventListener('click', function(){
+  const onlyStock = document.getElementById('sibOnlyStock').checked;
+  sibCandidates.forEach(function(x){ if(!onlyStock || x.hasStock) x.checked = true; });
+  renderSibList();
+});
+document.getElementById('sibNone').addEventListener('click', function(){
+  sibCandidates.forEach(function(x){ x.checked = false; });
+  renderSibList();
+});
 document.getElementById('btnLocSubmit').addEventListener('click', locSubmit);
 
 const pickBarcodeInput = document.getElementById('pickBarcodeInput');

@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-14.119';
+const BACKEND_VERSION = '2026-08-14.122';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -129,6 +129,7 @@ function doPost(e){
       case 'lookupLocations': result = lookupLocations(body); break;
       case 'changeLocationBatch': result = changeLocationBatch(body); break;
       case 'getLocationVocab': result = getLocationVocab(body); break;
+      case 'findSiblingSkus': result = findSiblingSkus(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -193,6 +194,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   previewScientificSkus_: () => repairScientificSkus_({dryRun:true}),
   dedupeLocationRows_: () => dedupeLocationRows_({dryRun:false}),
   previewDedupeLocationRows_: () => dedupeLocationRows_({dryRun:true}),
+  testNewItemCreate_: () => testNewItemCreate_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
   testAmendFlow_: () => testAmendFlow_(),
@@ -2427,6 +2429,78 @@ function readLocRow_(sh, row, sku){
           note: String(v[LOCMAP_COL.note-1]||'').trim()};
 }
 
+// ---- 同款其他規格 ----
+// 現場實況：小樣多尺寸多顏色是整箱一起搬的。一箱三十件逐件掃，光掃就要三十次，
+// 而它們的目的地是同一個位置。
+// 分群用兩把尺，因為單獨一把都蓋不住：
+//   1. 蝦皮商品ID —— 同一個賣場商品底下的規格，是真正的「同一款」（實測最多81個規格）
+//   2. 品號去掉尾端尺寸碼 —— 沒上架蝦皮的商品只能靠這個
+// 實測兩者併用，57% 的品號掃一次就能帶出同伴，平均一群 10.2 個。
+const SHOPEE_MAP_TAB = '蝦皮商品儲位對照';
+const SHOPEE_COL = {productId:2, sku:11};
+const SIZE_SUFFIX_RE = /(2XL|3XL|4XL|XXL|XS|S|M|L|XL)$/;
+
+function skuFamilyKey_(sku){ return String(sku||'').trim().replace(SIZE_SUFFIX_RE, ''); }
+
+function findSiblingSkus(body){
+  const sku = String((body && body.sku) || '').trim();
+  if(!sku) return {ok:false, error:'請提供品號'};
+  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const sib = {};
+
+  // (1) 蝦皮商品ID
+  const shop = ss.getSheetByName(SHOPEE_MAP_TAB);
+  if(shop && shop.getLastRow() > 1){
+    const n = shop.getLastRow() - 1;
+    const ids = shop.getRange(2, SHOPEE_COL.productId, n, 1).getValues();
+    const sks = shop.getRange(2, SHOPEE_COL.sku, n, 1).getValues();
+    let myId = '';
+    for(let i = 0; i < n; i++){
+      if(String(sks[i][0]||'').trim() === sku){ myId = String(ids[i][0]||'').trim(); break; }
+    }
+    if(myId){
+      for(let i = 0; i < n; i++){
+        if(String(ids[i][0]||'').trim() !== myId) continue;
+        const k = String(sks[i][0]||'').trim();
+        if(k && k !== sku) sib[k] = '同賣場商品';
+      }
+    }
+  }
+
+  // (2) 品號前綴（去掉尾端尺寸碼）
+  const dst = getLocMapSheet_();
+  const key = skuFamilyKey_(sku);
+  const rows = {};
+  if(dst){
+    const last = dst.getLastRow();
+    const vals = dst.getRange(2, LOCMAP_COL.sku, last - 1, LOCMAP_COL.location).getValues();
+    vals.forEach(function(r, i){
+      const k = String(r[0]||'').trim();
+      if(!k) return;
+      rows[k] = {row: i + 2, location: String(r[LOCMAP_COL.location - 1]||'').trim()};
+      if(k !== sku && skuFamilyKey_(k) === key && !sib[k]) sib[k] = '同品號前綴';
+    });
+  }
+
+  const keys = Object.keys(sib);
+  if(!keys.length) return {ok:true, sku: sku, siblings: []};
+  const info = cacheInfoFor_(keys);
+  const list = keys.map(function(k){
+    const c = info[k] || {};
+    const r = rows[k];
+    return {sku: k, why: sib[k], baseName: c.baseName || '', spec: c.spec || '',
+            stockWs: c.stockWs || '', stockMain: c.stockMain || '',
+            location: r ? r.location : '', inMap: !!r};
+  });
+  // 文山有貨的排前面：那些才是這箱裡真的會有的東西
+  list.sort(function(a, b){
+    const av = (a.stockWs || a.stockMain) ? 0 : 1, bv = (b.stockWs || b.stockMain) ? 0 : 1;
+    if(av !== bv) return av - bv;
+    return a.sku < b.sku ? -1 : 1;
+  });
+  return {ok:true, sku: sku, siblings: list};
+}
+
 // ---- 儲位選單的字彙 ----
 // 儲位改成下拉選單之後，選項不能用寫死的表：倉庫會加架、會清空整排，
 // 寫死的表過幾個月就跟現場對不起來，而且沒有人會發現。
@@ -2737,6 +2811,78 @@ function dedupeLocationRows_(opts){
           detail: dups.slice(0, 20)};
 }
 
+// 新品建檔會在正式主檔多一列，一樣不能拿真資料亂試：
+// 挑一個「ERP 有、儲位主檔沒有」的真實品號跑完整流程，驗完把那一列刪掉。
+function testNewItemCreate_(){
+  const steps = [];
+  const ck = function(c, m){ steps.push((c ? '\u2705 ' : '\u274c ') + m); };
+  const sh = getLocMapSheet_();
+  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const src = ss.getSheetByName(LOC_SYNC_TAB);
+  if(!sh || !src) return {全部通過:false, 明細:['\u274c 找不到分頁']};
+
+  // 找一個 ERP 有、但儲位主檔沒有的真實品號
+  const idx = locIndex_(sh);
+  const n = src.getLastRow() - LOC_SYNC_FIRST_ROW + 1;
+  const head = src.getRange(LOC_SYNC_FIRST_ROW, 1, n, 2).getValues();
+  let sku = '', name = '';
+  for(let i = 0; i < n; i++){
+    const k = String(head[i][0]||'').trim();
+    if(k && !idx[k] && String(head[i][1]||'').trim()){ sku = k; name = String(head[i][1]).trim(); break; }
+  }
+  if(!sku) return {全部通過:false, 明細:['\u274c 找不到適合的測試品號（ERP有、主檔沒有）']};
+
+  const logSh = getSheet(SHEET_LOCLOG, LOCLOG_HEADER);
+  const logBefore = logSh.getLastRow();
+  let newRow = 0;
+  try{
+    // 沒開 createIfMissing 時要被擋下來
+    const blocked = changeLocation({sku: sku, toLocation:'ZZ55-5', kind:'上架',
+      staffId:'TEST', staffName:'測試員'});
+    ck(!blocked.ok && blocked.reason === 'not_found', '沒開建檔時，查無品號會被擋：' + (blocked.error||''));
+
+    // ERP 也沒有的品號，就算開了建檔也要擋
+    const bogus = changeLocation({sku:'__NO_SUCH_SKU__', toLocation:'ZZ55-5', kind:'上架',
+      createIfMissing:true, staffId:'TEST', staffName:'測試員'});
+    ck(!bogus.ok && bogus.reason === 'not_in_erp', 'ERP也查無的品號不准建檔：' + (bogus.error||''));
+
+    // 正式建檔
+    const res = changeLocation({sku: sku, toLocation:'ZZ55-5', kind:'上架', createIfMissing:true,
+      staffId:'TEST', staffName:'測試員', note:'自動測試'});
+    ck(res.ok && res.created === true, '新品建檔成功：' + JSON.stringify(res).slice(0, 120));
+    newRow = res.row;
+
+    const v = sh.getRange(newRow, 1, 1, LOCMAP_COL.note).getValues()[0];
+    ck(String(v[LOCMAP_COL.sku-1]) === sku, '品號寫入正確：' + v[LOCMAP_COL.sku-1]);
+    ck(typeof v[LOCMAP_COL.sku-1] === 'string', '品號存成文字、沒有被轉成數字（型別=' + (typeof v[LOCMAP_COL.sku-1]) + '）');
+    ck(String(v[LOCMAP_COL.name-1]).trim() === name, '品名自動從 ERP 帶入：' + String(v[LOCMAP_COL.name-1]).slice(0, 26));
+    ck(String(v[LOCMAP_COL.location-1]).trim() === 'ZZ55-5', '儲位寫入正確：' + v[LOCMAP_COL.location-1]);
+    ck(/^\d{6}/.test(String(v[LOCMAP_COL.updated-1]).trim()), '更新欄有寫：' + v[LOCMAP_COL.updated-1]);
+    ck(String(v[LOCMAP_COL.note-1]).indexOf(LOC_NOTE_PREFIX) === 0, '備註有記錄異動');
+
+    // 建完之後再查一次，應該查得到了
+    const look = lookupLocation({sku: sku});
+    ck(look.ok && look.location === 'ZZ55-5', '建檔後查得到：' + look.location);
+
+    // 再建一次不會重複建列
+    const again = changeLocation({sku: sku, toLocation:'ZZ66-6', kind:'移櫃', createIfMissing:true,
+      staffId:'TEST', staffName:'測試員'});
+    ck(again.ok && again.created === false && again.row === newRow,
+       '同一個品號再操作不會重複建列（列號 ' + again.row + '）');
+
+    ck(logSh.getLastRow() - logBefore === 2, '異動紀錄新增 ' + (logSh.getLastRow() - logBefore) + ' 列（期望2）');
+  }catch(err){
+    steps.push('\u274c 例外：' + err);
+  }finally{
+    if(newRow) sh.deleteRow(newRow);
+    const last = logSh.getLastRow();
+    if(last > logBefore){ for(let r = last; r > logBefore; r--) logSh.deleteRow(r); }
+    ck(!locIndex_(sh)[sku], '測試列已刪除（' + sku + ' 不在主檔裡了）');
+    ck(logSh.getLastRow() === logBefore, '測試寫的異動紀錄已刪乾淨');
+  }
+  return {全部通過: steps.every(function(x){ return x.indexOf('\u2705') === 0; }), 明細: steps};
+}
+
 // 排程用：每天跑一次，真的寫入
 function syncMissingLocationRowsDaily_(){
   const r = syncMissingLocationRows_({dryRun: false});
@@ -2785,6 +2931,32 @@ function analyzeLocMapWorkbook_(){
   });
   return out;
 }
+// 從「山物地圖(快取)」查一批品號的品名／規格／文山庫存。
+// 新品要建檔時，品名不該叫人重打一次——ERP 已經有了，打字只會製造不一致。
+function cacheInfoFor_(skus){
+  const want = {};
+  (skus||[]).forEach(function(x){ const k = String(x||'').trim(); if(k) want[k] = 1; });
+  const out = {};
+  if(!Object.keys(want).length) return out;
+  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const src = ss.getSheetByName(LOC_SYNC_TAB);
+  if(!src) return out;
+  const n = src.getLastRow() - LOC_SYNC_FIRST_ROW + 1;
+  if(n < 1) return out;
+  // A~C（品號/品名/規格）與 I~J（網購庫存倉/總倉）分兩段讀，不要整片 A:J 拉下來
+  const head = src.getRange(LOC_SYNC_FIRST_ROW, 1, n, 3).getValues();
+  const stock = src.getRange(LOC_SYNC_FIRST_ROW, 9, n, 2).getValues();
+  for(let i = 0; i < n; i++){
+    const k = String(head[i][0]||'').trim();
+    if(!k || !want[k] || out[k]) continue;
+    out[k] = {sku: head[i][0], baseName: String(head[i][1]||'').trim(),
+              spec: String(head[i][2]||'').trim(),
+              stockWs: String(stock[i][0]||'').trim(),
+              stockMain: String(stock[i][1]||'').trim()};
+  }
+  return out;
+}
+
 // 查一個品號現在登記在哪。給APP在送出前顯示「原儲位」用——
 // 讓人看到「從哪搬到哪」再按確定，比直接填一個新位置安全得多。
 function lookupLocation(body){
@@ -2810,7 +2982,17 @@ function lookupLocations(body){
     if(idx[sku]) found.push(readLocRow_(sh, idx[sku], sku));
     else missing.push(sku);
   });
-  return {ok:true, found: found, missing: missing};
+  // 儲位主檔沒有，不代表這個品號不存在——新品入倉時 ERP 已經有資料了，
+  // 只是每天 07:30 那支補列排程還沒跑到。這時候讓現場等到明天是不合理的：
+  // 貨就在手上，位置也已經放好了。所以把快取裡的品名帶回去，讓APP可以當場建檔。
+  const newItems = [];
+  if(missing.length){
+    const info = cacheInfoFor_(missing);
+    missing.forEach(function(sku){
+      if(info[sku]) newItems.push(Object.assign({isNew:true, location:'', locations:[], note:''}, info[sku]));
+    });
+  }
+  return {ok:true, found: found, missing: missing, newItems: newItems};
 }
 
 // 我們寫進「重要訊息 備註」的那一段長這樣，之後要靠這個前綴認出「這是系統寫的」。
@@ -3072,6 +3254,23 @@ function validateLocBody_(body){
           note: String((body && body.note) || '').trim()};
 }
 
+// 新品建檔：在主檔尾巴補一列，然後照一般流程指派儲位。
+// 型別處理跟補列排程同一套——setValues 會重新解析內容，
+// 品號「3204E204」不鎖成文字就會被存成科學記號。
+function appendLocRow_(sh, sku, baseName){
+  let lastSkuRow = 1;
+  const last = sh.getLastRow();
+  const col = sh.getRange(2, LOCMAP_COL.sku, Math.max(last - 1, 1), 1).getValues();
+  col.forEach(function(r, i){ if(String(r[0]||'').trim()) lastSkuRow = i + 2; });
+  const row = lastSkuRow + 1;
+  const probe = sh.getRange(row, LOCMAP_COL.sku, 1, 2).getValues()[0];
+  const target = (String(probe[0]||'').trim() || String(probe[1]||'').trim()) ? last + 1 : row;
+  sh.getRange(target, LOCMAP_COL.sku).setNumberFormat(typeof sku === 'string' ? '@' : '0');
+  sh.getRange(target, LOCMAP_COL.name).setNumberFormat('@');
+  sh.getRange(target, LOCMAP_COL.sku, 1, 2).setValues([[sku, baseName || '']]);
+  return target;
+}
+
 function changeLocation(body){
   const sku = String((body && body.sku) || '').trim();
   if(!sku) return {ok:false, error:'請提供品號'};
@@ -3080,13 +3279,24 @@ function changeLocation(body){
 
   const sh = getLocMapSheet_();
   if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
-  const row = locIndex_(sh)[sku];
+  let row = locIndex_(sh)[sku];
+  let created = false;
+  if(!row && body && body.createIfMissing && opt.mode !== 'remove'){
+    // 一定要在 ERP 的庫存主檔查得到才准建檔。查不到多半是掃錯或打錯，
+    // 這時候建一列出來，主檔就多一個永遠對不到任何東西的品號。
+    const info = cacheInfoFor_([sku])[sku];
+    if(!info) return {ok:false, reason:'not_in_erp',
+      error:'庫存主檔裡也沒有品號 ' + sku + '，不建檔。請確認條碼是否掃錯'};
+    row = appendLocRow_(sh, info.sku, body.baseName || info.baseName || '');
+    created = true;
+  }
   if(!row) return {ok:false, reason:'not_found', error:'文山地圖裡找不到品號 ' + sku};
 
   // 先回寫來源、再寫紀錄。回寫失敗就整個中止，
   // 不要留下一筆「紀錄說搬了、地圖上沒搬」的假資料。
   const res = applyLocChange_(sh, readLocRow_(sh, row, sku), opt);
   if(!res.ok) return res;
+  res.created = created;
   locLogRows_([res], opt);
   return Object.assign({updated: locUpdateStamp_(opt.staffName)}, res);
 }
@@ -3106,11 +3316,26 @@ function changeLocationBatch(body){
   if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
   const idx = locIndex_(sh);
 
+  const create = !!(body && body.createIfMissing) && opt.mode !== 'remove';
+  const info = create ? cacheInfoFor_(skus.filter(function(x){ return !idx[x]; })) : {};
   const results = [];
   skus.forEach(function(sku){
-    const row = idx[sku];
+    let row = idx[sku];
+    let created = false;
+    if(!row && create){
+      const c = info[sku];
+      if(!c){
+        results.push({ok:false, sku: sku, reason:'not_in_erp',
+          error:'庫存主檔裡也沒有這個品號，不建檔'});
+        return;
+      }
+      row = appendLocRow_(sh, c.sku, c.baseName || '');
+      created = true;
+    }
     if(!row){ results.push({ok:false, sku: sku, reason:'not_found', error:'文山地圖裡找不到這個品號'}); return; }
-    results.push(applyLocChange_(sh, readLocRow_(sh, row, sku), opt));
+    const r = applyLocChange_(sh, readLocRow_(sh, row, sku), opt);
+    r.created = created;
+    results.push(r);
   });
   const logged = locLogRows_(results, opt);
   const okCount = results.filter(function(r){ return r.ok; }).length;
