@@ -1442,6 +1442,45 @@ function closeCameraScan(){
 }
 document.getElementById('btnCameraClose').addEventListener('click', closeCameraScan);
 
+// 現場踩到的真實情況：Point Mobile PM85 這類手持盤點機的 Wedge 設定，
+// Suffix（結尾字元）欄位是純文字輸入，填「換行」意思的跳脫碼時，裝置並不會送出
+// 真正的 Enter 鍵事件，而是把「\」「n」兩個字面字元直接打進輸入框——瀏覽器完全看
+// 不到 keydown 的 Enter，畫面自然沒有反應，現場人員得自己點螢幕鍵盤送出。
+// 與其要求現場去猜特定裝置韌體的跳脫語法該怎麼填，不如讓網頁自己認得這個結尾記號：
+// 用 input 事件盯著輸入框內容，尾端出現「\n」（不管是真的換行字元，還是這種
+// 字面上的兩個字元）就當作一次掃描已完成，直接觸發跟按 Enter 完全相同的處理。
+// 四個掃描點（出貨/揀貨/儲位/調撥）共用這一個函式綁定，兩種結尾方式都認得，
+// 不管現場裝置韌體支不支援真正的Enter終止碼都能正常運作。
+function wireScanInput(el, handler){
+  if(!el) return;
+  el.addEventListener('keydown', function(e){
+    if(e.key !== 'Enter') return;
+    const code = el.value.trim();
+    el.value = '';
+    handler(code);
+  });
+  el.addEventListener('input', function(){
+    const v = el.value;
+    // 實測過：<input type="text"> 對真的換行字元會直接靜默過濾掉，這個分支
+    // 在目前這四個輸入框（都是 type="text"）身上永遠不會觸發——保留只是防呆，
+    // 不要當成「這條路徑有測過」。真的靠 Enter 鍵送出的（多數USB/藍牙掃描器、
+    // 手動輸入）走的是上面 keydown 那一段，不受這裡影響。
+    if(v.indexOf('\n') >= 0){
+      const code = v.split('\n')[0].trim();
+      el.value = '';
+      handler(code);
+      return;
+    }
+    if(v.length >= 2 && v.slice(-2) === '\\n'){
+      // PM85 實測的狀況：Wedge 的 Suffix 設定填的跳脫碼被裝置當成字面文字，
+      // 送出來的是「\」「n」兩個真實字元，不是一個換行字元，也不會觸發keydown的Enter。
+      const code = v.slice(0, -2).trim();
+      el.value = '';
+      handler(code);
+    }
+  });
+}
+
 // ============================================================
 // CSV 解析工具
 // ============================================================
@@ -2909,12 +2948,7 @@ async function transferClose(row, sku){
   flash('ok', '已放棄', sku, 1600);
 }
 
-document.getElementById('transferScanInput').addEventListener('keydown', function(e){
-  if(e.key !== 'Enter') return;
-  const code = e.target.value.trim();
-  e.target.value = '';
-  transferScan(code);
-});
+wireScanInput(document.getElementById('transferScanInput'), transferScan);
 
 // 小樣多尺寸多顏色是整箱一起搬的，一箱三十件逐件掃要掃三十次，
 // 而它們的目的地是同一個位置。掃一件、把同款其他規格叫出來勾一勾，
@@ -3568,12 +3602,7 @@ function scanShipmentBarcode(code){
   renderItemTable();
   checkComplete();
 }
-inputBarcode.addEventListener('keydown', e=>{
-  if(e.key !== 'Enter' || !current) return;
-  const code = inputBarcode.value.trim();
-  inputBarcode.value = '';
-  scanShipmentBarcode(code);
-});
+wireScanInput(inputBarcode, scanShipmentBarcode);
 
 function renderItemTable(){
   const tbody = document.querySelector('#itemTable tbody');
@@ -4463,12 +4492,7 @@ async function confirmLeaveOrder(){
   });
 }
 
-document.getElementById('locSkuInput').addEventListener('keydown', e=>{
-  if(e.key !== 'Enter') return;
-  const code = e.target.value.trim();
-  e.target.value = '';
-  locScan(code);
-});
+wireScanInput(document.getElementById('locSkuInput'), locScan);
 document.getElementById('locFreeInput').addEventListener('keydown', e=>{
   if(e.key === 'Enter') locSubmit();
 });
@@ -4513,12 +4537,7 @@ document.getElementById('sibNone').addEventListener('click', function(){
 document.getElementById('btnLocSubmit').addEventListener('click', locSubmit);
 
 const pickBarcodeInput = document.getElementById('pickBarcodeInput');
-pickBarcodeInput.addEventListener('keydown', e=>{
-  if(e.key !== 'Enter') return;
-  const code = e.target.value.trim();
-  e.target.value = '';
-  handlePickScan(code);
-});
+wireScanInput(pickBarcodeInput, handlePickScan);
 // 掃描槍是「鍵盤輸入」，焦點不在輸入框的話字會散落到頁面上。
 // 選好訂單／抓完批次之後就把焦點放過來，讓人可以直接連續掃。
 function focusPickScan(){
