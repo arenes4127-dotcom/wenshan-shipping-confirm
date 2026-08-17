@@ -1319,7 +1319,15 @@ let zxingLoadPromise = null;
 // 不會無止盡卡住。
 // 兩個來源都試：一個CDN被擋（防火牆／內容過濾器）不代表另一個也被擋，
 // 兩家用的網路基礎設施不一樣，多一次機會。
+// 現場實測：兩個外部 CDN（jsdelivr、unpkg）在倉庫那台裝置的網路環境下都連不上，
+// 逾時保險有正確發動，但兩個來源都失敗——最可能的原因是那個網路（很可能是有
+// 管控的公司/倉庫網路）只放行自己這個網域的流量，任何外部CDN網域都連不到，
+// 不管CDN本身多可靠都沒用。真正的解法是不要依賴外部網域：把檔案跟著APP
+// 一起放在同一個GitHub Pages網域下，那個網域既然連得到APP本身，就連得到這個檔案。
+// 同網域這個放第一個試，兩個外部CDN留著當備援（給網路環境不同、但這個網域
+// 剛好有問題的人多一條路），不會互相干擾。
 const ZXING_SOURCES = [
+  'zxing-browser.min.js',
   'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js',
   'https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js'
 ];
@@ -1450,6 +1458,11 @@ function runNativeBarcodeDetector_(video){
 }
 
 function runZXingScan_(video){
+  // 抓到的真實bug：這裡漏了清空狀態文字，畫面因此一直停在「下載掃描元件」
+  // 那句話——即使函式庫其實已經載好、鏡頭也真的在運作、掃描功能是通的，
+  // 使用者看到的畫面卻像完全卡死一樣，跟原生 BarcodeDetector 那條路徑
+  // （getUserMedia成功後就馬上清空狀態）不一致。
+  cameraSetStatus_('');
   const Z = window.ZXingBrowser;
   cameraZxingReader = new Z.BrowserMultiFormatReader();
   cameraZxingReader.decodeFromStream(cameraStream, video, function(result, err){
