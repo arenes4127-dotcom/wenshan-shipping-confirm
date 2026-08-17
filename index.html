@@ -1332,7 +1332,16 @@ let zbarLoadPromise = null;
 // 那台裝置的網路環境下都連不上，最可能是那個網路只放行自己這個網域的流量。
 // 所以這兩個檔案直接跟著APP放在同一個GitHub Pages網域下，不試外部CDN，
 // 但逾時保險還是留著（防其他原因造成的卡住）。
-const ZBAR_SOURCES = ['zbar-wasm.min.js', 'barcode-detector-polyfill.min.js'];
+// 版本號當cache-busting query string：這兩個檔案更新過一次之後才發現的坑——
+// GitHub Pages背後是Fastly CDN，不同地區/電信的邊緣節點快取更新的時間點不一樣，
+// 靠路徑相同的檔案更新內容，使用者裝置或沿路的CDN節點可能還留著舊的（甚至是
+// 還沒佈署完成當下的破損）版本，光靠使用者手動重新整理不一定能繞過。之後這兩個
+// 檔案內容有改版，一定要跟著把這個版本號也改掉，不能只改檔案內容。
+const ZBAR_ASSET_VERSION = '2026-08-17c';
+const ZBAR_SOURCES = [
+  'zbar-wasm.min.js?v=' + ZBAR_ASSET_VERSION,
+  'barcode-detector-polyfill.min.js?v=' + ZBAR_ASSET_VERSION
+];
 const ZBAR_LOAD_TIMEOUT_MS = 8000;
 
 function loadScriptWithTimeout_(src, timeoutMs){
@@ -1370,10 +1379,13 @@ async function loadZbar_(){
     try{
       // 兩個檔案有依賴順序：barcode-detector-polyfill 載入當下就會讀取
       // 全域變數 zbarWasm，一定要先把 zbar-wasm.min.js 載完才能載第二個。
-      for(let i = 0; i < ZBAR_SOURCES.length; i++){
-        await loadScriptWithTimeout_(ZBAR_SOURCES[i], ZBAR_LOAD_TIMEOUT_MS);
-      }
-      if(!window.barcodeDetectorPolyfill) throw new Error('script_loaded_but_no_global');
+      // 分開檢查兩個全域變數（而不是只在最後檢查一次），是為了萬一又出現
+      // 「網路請求成功(onload有觸發)但執行內容沒生效」這種狀況時，錯誤訊息
+      // 能直接講出是哪一步壞的，不用每次都要重新用瀏覽器工具現場排查。
+      await loadScriptWithTimeout_(ZBAR_SOURCES[0], ZBAR_LOAD_TIMEOUT_MS);
+      if(!window.zbarWasm) throw new Error('zbar-wasm 檔案下載成功但沒有生效（zbarWasm未定義）');
+      await loadScriptWithTimeout_(ZBAR_SOURCES[1], ZBAR_LOAD_TIMEOUT_MS);
+      if(!window.barcodeDetectorPolyfill) throw new Error('barcode-detector-polyfill 檔案下載成功但沒有生效（barcodeDetectorPolyfill未定義）');
       window.BarcodeDetector = window.barcodeDetectorPolyfill.BarcodeDetectorPolyfill;
     }catch(err){
       zbarLoadPromise = null;   // 失敗了，讓下次點camera按鈕可以重新再試一次
