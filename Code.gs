@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.141';
+const BACKEND_VERSION = '2026-08-17.145';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -214,6 +214,9 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   testTransferFlow_: () => testTransferFlow_(),
   debugTransferHeaders_: () => debugTransferHeaders_(),
   debugLocLogHeaders_: () => debugLocLogHeaders_(),
+  verifyArchiveResult_: () => verifyArchiveResult_(),
+  timeGetState_: () => timeGetState_(),
+  diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
   peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
@@ -393,9 +396,18 @@ function getState(){
   const orderRows = readOrderRows();
   const orders = {};
   orderRows.forEach(r=>{
+    const rawItems = safeParse(r.itemsJson, []);
+    // 已出貨的訂單不會再被揀貨/掃描，數量/已掃這些追蹤欄位對它們來說已經沒用了——
+    // 出貨當下的完整明細本來就已經存進「出貨紀錄」那份快照，這裡不用重複帶一份。
+    // 只留 sku/name/baseName/spec 是為了 findItemBySku()（隨手從任何一張訂單找品名
+    // 顯示用）這個用途還能運作，其餘欄位丟掉。887筆訂單裡六百多筆已出貨，這裡每個
+    // 品項省下的位元組乘起來，是拖慢每次開APP第一次抓資料速度的主因之一。
+    const items = r.status === 'shipped'
+      ? rawItems.map(function(it){ return {sku: it.sku, name: it.name, baseName: it.baseName, spec: it.spec}; })
+      : rawItems;
     orders[r.orderNo] = {
       orderNo: r.orderNo, store: r.store, date: cellToText(r.date),
-      items: safeParse(r.itemsJson, []), status: r.status,
+      items: items, status: r.status,
       claimedBy: r.claimedBy || '', claimedAt: r.claimedAt || '',
       shipMethod: r.shipMethod || '', routingStatus: r.routingStatus || '',
       manualClose: String(r.manualClose || '').trim(),
@@ -409,12 +421,15 @@ function getState(){
       shipStartAt: cellToText(r.shipStartAt, true) || '',
       shipDoneAt: cellToText(r.shipDoneAt, true) || ''
     };
-    // 把「已揀」狀態掛回各品項上，前端就不用自己再對一次
-    const picked = safeParse(r.pickedJson, {});
-    orders[r.orderNo].items.forEach(it=>{
-      const hit = picked[it.sku];
-      if(hit){ it.picked = true; it.pickedBy = hit.by || ''; it.pickedAt = hit.at || ''; }
-    });
+    // 把「已揀」狀態掛回各品項上，前端就不用自己再對一次——已出貨的訂單不需要，
+    // 揀貨狀態只在出貨前有意義。
+    if(r.status !== 'shipped'){
+      const picked = safeParse(r.pickedJson, {});
+      orders[r.orderNo].items.forEach(it=>{
+        const hit = picked[it.sku];
+        if(hit){ it.picked = true; it.pickedBy = hit.by || ''; it.pickedAt = hit.at || ''; }
+      });
+    }
   });
   // 出貨紀錄現在存的是「一列一品項」，同一次出貨的N個品項會連續寫N列（訂單層級欄位重複），
   // 這裡依「訂單號+完成時間」把同一次出貨的品項列重新組回一筆帶items陣列的紀錄，
@@ -1314,7 +1329,10 @@ function migrateOrderStatusToChinese_(){
 //      這時候每一張都會看起來「不在來源」，照做會把所有已出貨訂單一次全搬走）。
 //   2. 訂單編號還出現在來源資料裡 → 留著。
 //   3. 出貨完成時間距今未滿保留天數 → 留著（給來源資料一點延遲時間，也保留近期可查詢的資料）。
-const SHIPPED_ORDER_RETENTION_DAYS = 7;
+// 2026-08-17 從7天縮短到3天：即時資料裡累積了六百多筆已出貨訂單，是
+// getState() 回傳807KB、每次開APP第一次抓資料要3.75秒的主因之一。
+// 3天仍夠現場查最近出的貨，更久的歷史查Drive備份檔（每筆歸檔前都會先備份）。
+const SHIPPED_ORDER_RETENTION_DAYS = 3;
 const SHIPPED_ORDER_ARCHIVE_FOLDER_ID = '1fC7kFv-6ozYmrY1S_up55R_yslcu2qYE';
 function archiveShippedOrders_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -2889,6 +2907,109 @@ function peekTransferStage_(){
   return {exists:true, lastRow:last, 貼上目標列: TRANSFER_STAGE_FIRST_ROW,
           該列起有資料: hasData,
           第5列可見提示文字: sh.getRange('A5').getDisplayValue()};
+}
+
+// 唯讀診斷：量化「已出貨但一直沒被歸檔」的訂單，分別是被哪一道保險擋下來的。
+function diagnoseArchiveBacklog_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mirror = ss.getSheetByName(MIRROR_ORDER_SHEET_NAME);
+  const mirrorValues = mirror ? mirror.getDataRange().getValues() : [];
+  const stillInSource = {};
+  if(mirrorValues.length >= 2){
+    const iOrder = mirrorValues[0].indexOf('訂單');
+    if(iOrder >= 0){
+      for(let i = 1; i < mirrorValues.length; i++){
+        const no = String(mirrorValues[i][iOrder]||'').trim();
+        if(no) stillInSource[no] = true;
+      }
+    }
+  }
+  const cutoff = Date.now() - SHIPPED_ORDER_RETENTION_DAYS * 86400 * 1000;
+  const rows = readOrderRows().filter(function(r){ return r.status === 'shipped'; });
+  let blankUpdatedAt = 0, inSource = 0, tooNew = 0, archivable = 0;
+  const blankSamples = [];
+  rows.forEach(function(r){
+    const shippedAt = Date.parse(r.updatedAt);
+    if(stillInSource[String(r.orderNo||'').trim()]){ inSource++; return; }
+    if(isNaN(shippedAt)){
+      blankUpdatedAt++;
+      if(blankSamples.length < 5) blankSamples.push({orderNo: r.orderNo, updatedAt: String(r.updatedAt), date: String(r.date)});
+      return;
+    }
+    if(shippedAt > cutoff){ tooNew++; return; }
+    archivable++;
+  });
+  return {已出貨總數: rows.length, 來源仍存在被保留: inSource,
+          updatedAt無法解析而永久保留: blankUpdatedAt, 七天內算太新: tooNew,
+          本來就該被歸檔卻沒歸檔: archivable, blankSamples: blankSamples,
+          鏡像分頁列數: mirrorValues.length};
+}
+
+// 唯讀診斷：getState() 剛剛量到反常的20幾秒（正常應該是2~4秒），
+// 用時間戳記把每一段拆開看到底卡在哪裡，不要繼續憑猜的。
+function timeGetState_(){
+  const t = {};
+  const mark = function(k){ t[k] = Date.now(); };
+  mark('start');
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh0 = ss.getSheetByName(SHEET_ORDERS);
+  mark('afterGetSheetByName');
+
+  const lastRow = sh0.getLastRow();
+  mark('afterGetLastRow');
+
+  const orderRows = readOrderRows();
+  mark('afterReadOrderRows');
+
+  const orders = {};
+  orderRows.forEach(r=>{
+    const rawItems = safeParse(r.itemsJson, []);
+    const items = r.status === 'shipped'
+      ? rawItems.map(function(it){ return {sku: it.sku, name: it.name, baseName: it.baseName, spec: it.spec}; })
+      : rawItems;
+    orders[r.orderNo] = {orderNo: r.orderNo, status: r.status, items: items};
+  });
+  mark('afterBuildOrders');
+
+  const logRows = readRows(SHEET_LOG, LOG_HEADER);
+  mark('afterReadLogRows');
+
+  const staffRows = readRows(SHEET_STAFF, STAFF_HEADER);
+  mark('afterReadStaffRows');
+
+  const json = JSON.stringify({ok:true, orders: orders, version: BACKEND_VERSION});
+  mark('afterStringify');
+
+  const keys = Object.keys(t);
+  const deltas = {};
+  for(let i = 1; i < keys.length; i++){ deltas[keys[i]] = (t[keys[i]] - t[keys[i-1]]) + 'ms'; }
+  return {lastRow: lastRow, orderRowCount: orderRows.length, jsonBytes: json.length,
+          總耗時: (t.afterStringify - t.start) + 'ms', 各段耗時: deltas};
+}
+
+// 唯讀：確認歸檔備份檔真的存在，訂單總數與明細分頁都正確更新。
+function verifyArchiveResult_(){
+  const folder = DriveApp.getFolderById(SHIPPED_ORDER_ARCHIVE_FOLDER_ID);
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const fileName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_已出貨訂單歸檔';
+  const files = folder.getFilesByName(fileName);
+  let backupRows = -1, backupExists = false;
+  if(files.hasNext()){
+    backupExists = true;
+    const f = files.next();
+    const ss2 = SpreadsheetApp.open(f);
+    backupRows = ss2.getSheets()[0].getLastRow() - 1;
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ordersSh = ss.getSheetByName(SHEET_ORDERS);
+  const detailSh = ss.getSheetByName(SHEET_DETAIL);
+  const rows = readOrderRows();
+  const byStatus = {};
+  rows.forEach(function(r){ byStatus[r.status] = (byStatus[r.status]||0) + 1; });
+  return {備份檔案存在: backupExists, 備份筆數: backupRows,
+          訂單分頁列數: ordersSh.getLastRow(), 訂單明細分頁列數: detailSh ? detailSh.getLastRow() : '(不存在)',
+          目前各狀態筆數: byStatus};
 }
 
 function debugLocLogHeaders_(){
