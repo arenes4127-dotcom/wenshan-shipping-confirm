@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-14.124';
+const BACKEND_VERSION = '2026-08-17.128';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -131,6 +131,9 @@ function doPost(e){
       case 'getLocationVocab': result = getLocationVocab(body); break;
       case 'findSiblingSkus': result = findSiblingSkus(body); break;
       case 'listLocationContents': result = listLocationContents(body); break;
+      case 'getTransferPending': result = getTransferPending(); break;
+      case 'scanTransferBatch': result = scanTransferBatch(body.ops || []); break;
+      case 'closeTransferItem': result = closeTransferItem(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -188,7 +191,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   importProductImages_: () => importProductImages_(),
   testLocationChange_: () => testLocationChange_(),
   analyzeLocMapWorkbook_: () => analyzeLocMapWorkbook_(),
-  analyzeTransferSheet_: () => analyzeSheetStructure_({id:'1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ', gid:611981791}),
+  analyzeTransferSheet_: () => analyzeSheetStructure_({id:'1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ', gid:1717252418}),
   analyzeTransferTemplate_: () => analyzeSheetStructure_({id:'1_nWAeLo5lmOZ-zsmqVWqM99dGB0t1bSL-ZMdkWT0Q68'}),
   previewMissingLocationRows_: () => previewMissingLocationRows_(),
   syncMissingLocationRowsDaily_: () => syncMissingLocationRowsDaily_(),
@@ -198,6 +201,9 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   dedupeLocationRows_: () => dedupeLocationRows_({dryRun:false}),
   previewDedupeLocationRows_: () => dedupeLocationRows_({dryRun:true}),
   testNewItemCreate_: () => testNewItemCreate_(),
+  setupTransferStageSheet_: () => setupTransferStageSheet_(),
+  testTransferFlow_: () => testTransferFlow_(),
+  mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
   testAmendFlow_: () => testAmendFlow_(),
@@ -1945,7 +1951,7 @@ function listAutomationTriggers_(){
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
     'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_', 'releaseStaleClaims_',
-    'syncMissingLocationRowsDaily_'];
+    'syncMissingLocationRowsDaily_', 'mirrorTransferScheduled_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -1957,6 +1963,10 @@ function installAutomationTriggers_(){
   // 儲位主檔補列排 07:30：早於 9:00 的訂單同步，當天開工前新品號就已經在主檔裡，
   // 揀貨時才不會又看到一批「未建立」。也避開 19:30／20:30 那兩個會清資料的時段。
   ScriptApp.newTrigger('syncMissingLocationRowsDaily_').timeBased().atHour(7).nearMinute(30).everyDays(1).create();
+  // 調撥驗收鏡射：掃描/匯入當下已經會盡力鏡射一次，這個排程是保險——
+  // 萬一那次鏡射剛好失敗（外部試算表暫時打不開之類），20分鐘內會自己補上，
+  // 不會一直卡在「上次成功鏡射」的舊畫面。
+  ScriptApp.newTrigger('mirrorTransferScheduled_').timeBased().everyMinutes(20).create();
   // 已出貨訂單歸檔刻意排在 19:30，不能排在 20:30——
   // 「文山出貨 工作區」自己也有一個 20:30 的觸發器（dailyArchiveAndResetAuto），
   // 它會把「文山出貨V2」從模板還原、也就是清空當天的訂單資料。我們的歸檔要讀那份鏡像
@@ -2430,6 +2440,446 @@ function readLocRow_(sh, row, sku){
           locationExtra: parsed.extra,
           updated: String(v[LOCMAP_COL.updated-1]||'').trim(),
           note: String(v[LOCMAP_COL.note-1]||'').trim()};
+}
+
+// ================= 調撥驗收 =================
+// 訂單缺貨 → 分店/他倉調貨回文山 → ERP開分店調撥單 → 人工把調撥單資料貼上 → 掃描驗收。
+// 使用者明講：調回的商品可能跟訂單缺貨的品項對不上，不要自動綁訂單，
+// 驗收是獨立的一件事，只管「調撥單上寫要收幾件、實際掃到幾件」。
+//
+// 舊做法（工作區「調撥驗收」分頁）用兩欄公式做核對：
+//   應收合計 =SUMIFS(E:E,B:B,B2)　　實收合計 =COUNTIFS(P:P,B2)
+// 也就是「B欄品號」跟「P欄掃描」是兩條各自累加的清單，靠公式比對，不是逐列對應。
+// 我們搬過來時保留這個精神（以品號為單位核對，不是以整張調撥單為單位），
+// 但用後端記錄取代公式，理由：
+//   1. 那個分頁在「文山出貨 模板」裡，每天20:30被還原清空——當天沒驗完，紀錄就沒了。
+//      使用者自己都留了一份「舊『調撥驗收』的副本」手動備份，代表這件事已經咬過人。
+//   2. 沒有國際碼轉品號，掃到條碼會被判「錯誤!!!」，其實東西是對的。
+//   3. ERP貼上的欄位格式會變（舊版E是「轉撥數量」，新版E是「數量」)，不能寫死欄位。
+const SHEET_TRANSFER_STAGE = '調撥單匯入';
+const SHEET_TRANSFER = '調撥單';
+const SHEET_TRANSFERLOG = '調撥驗收紀錄';
+const TRANSFER_HEADER = ['batchId','sku','baseName','spec','qty','unit','reason','price',
+  'priceTotal','extraNote','scannedQty','status','importedAt','importedBy','doneAt'];
+const TRANSFERLOG_HEADER = ['logTime','batchId','sku','baseName','staffId','staffName','result','note'];
+// ERP匯出的欄位標籤不保證每次都一樣（親眼見過同一份調撥單新舊格式的E欄一個是「數量」
+// 一個是「轉撥數量」），所以不認欄位「在第幾欄」，改成認「表頭寫什麼字」，
+// 貼上的表頭不管長怎樣、順序怎麼排都認得出來。認不出來的欄位（圖片/轉出庫/轉入庫/
+// 庫別名稱這類）不會被丟掉，會原樣併進 extraNote，供人事後查對。
+const TRANSFER_FIELD_ALIASES = {
+  sku: ['品號', '貨號'], baseName: ['品名'], spec: ['規格'],
+  qty: ['數量', '轉撥數量'], unit: ['單位'], reason: ['原因'],
+  price: ['零售價', '售價'], priceTotal: ['零售合計', '合計']
+};
+const TRANSFER_STAGE_FIRST_ROW = 5;   // 表頭（貼上的第一列）落在這一列，資料從下一列開始
+
+// 貼上的資料夾在暫存分頁，這裡建立那張分頁：說明、匯入人員、確認匯入勾選框。
+function setupTransferStageSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_TRANSFER_STAGE);
+  if(!sh) sh = ss.insertSheet(SHEET_TRANSFER_STAGE);
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
+  sh.clear();
+  sh.clearNotes();
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).clearDataValidations();
+  try{ sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).removeCheckboxes(); }catch(e){}
+
+  sh.getRange('A1:L1').merge();
+  sh.getRange('A1').setValue('📦 調撥單匯入（貼上ERP調撥單資料）')
+    .setFontSize(14).setFontWeight('bold').setBackground('#e8f0fe');
+
+  sh.getRange('A2').setValue('匯入人員').setFontWeight('bold');
+  const staffSh = getSheet(SHEET_STAFF, STAFF_HEADER);
+  const staffRows = Math.max(staffSh.getLastRow() - 1, 1);
+  sh.getRange('B2').setDataValidation(SpreadsheetApp.newDataValidation()
+    .requireValueInRange(staffSh.getRange(2, colOf(STAFF_HEADER, 'name'), staffRows, 1), true)
+    .setAllowInvalid(false).setHelpText('請選擇匯入人員').build());
+  sh.getRange('D2').setValue('確認匯入').setFontWeight('bold');
+  sh.getRange('E2').insertCheckboxes().setValue(false);
+  sh.getRange('F2:L2').merge();
+  sh.getRange('F2').setValue('← 貼好資料、選好人員後勾這一格；勾完會自動彈回並顯示結果')
+    .setFontColor('#666666');
+
+  sh.getRange('A4:L4').merge();
+  sh.getRange('A4').setValue([
+      '① 把 ERP 匯出的調撥單資料整塊貼在下面第5列開始（要含最上面那一列表頭，例如「品號 品名 規格 數量…」）。',
+      '② 貼哪個欄位都可以，程式會照表頭文字自動對應，認不得的欄位會原樣保留在備註裡不會遺漏。',
+      '③ 上面選好「匯入人員」、勾選「確認匯入」送出。送出後這裡會清空，可以貼下一張調撥單。',
+      '驗收（掃描核對）在 APP「調撥」頁進行，不用在這裡操作。'
+    ].join('\n'))
+    .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
+  sh.setRowHeight(4, 74);
+
+  sh.getRange(TRANSFER_STAGE_FIRST_ROW - 1, 1, 1, 1)
+    .setValue('↓ 從這裡開始貼上（含表頭）').setFontColor('#999999').setFontStyle('italic');
+  [70, 110, 110, 260, 90, 90, 90, 130, 90, 90, 90, 90].forEach(function(w, i){ sh.setColumnWidth(i + 1, w); });
+  sh.setFrozenRows(4);
+  return {ok:true, 分頁: SHEET_TRANSFER_STAGE};
+}
+
+// 把暫存分頁貼上的資料轉成正式的調撥單記錄，然後清空暫存分頁。
+function importTransferStage_(sh, staffName){
+  if(!staffName) return '❌ 請先選擇匯入人員';
+  const lastRow = sh.getLastRow();
+  const headerRow = TRANSFER_STAGE_FIRST_ROW;
+  if(lastRow < headerRow + 1) return '⚠️ 沒有偵測到貼上的資料，請先貼上ERP調撥單資料再勾選';
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0];
+
+  const colMap = {};
+  Object.keys(TRANSFER_FIELD_ALIASES).forEach(function(field){
+    const aliases = TRANSFER_FIELD_ALIASES[field];
+    for(let c = 0; c < headers.length; c++){
+      if(aliases.indexOf(String(headers[c]||'').trim()) >= 0){ colMap[field] = c; break; }
+    }
+  });
+  if(colMap.sku === undefined){
+    return '❌ 找不到「品號」欄，請確認貼上的資料含表頭列（品號/品名/規格/數量…）';
+  }
+
+  const dataRows = lastRow - headerRow;
+  const values = sh.getRange(headerRow + 1, 1, dataRows, lastCol).getValues();
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const batchId = 'TR' + Utilities.formatDate(new Date(), tz, 'yyyyMMddHHmmss');
+  const now = nowStamp_();
+  const items = [];
+  values.forEach(function(r){
+    const sku = String(r[colMap.sku] || '').trim();
+    if(!sku) return;   // 空列跳過，貼上範圍常常比實際資料寬
+    const extra = [];
+    headers.forEach(function(h, c){
+      const known = Object.keys(colMap).some(function(f){ return colMap[f] === c; });
+      const v = String(r[c] || '').trim();
+      if(!known && v) extra.push(String(h).trim() + ':' + v);
+    });
+    items.push({
+      batchId: batchId, sku: sku,
+      baseName: colMap.baseName !== undefined ? String(r[colMap.baseName] || '').trim() : '',
+      spec: colMap.spec !== undefined ? String(r[colMap.spec] || '').trim() : '',
+      qty: colMap.qty !== undefined ? (Number(r[colMap.qty]) || 0) : 0,
+      unit: colMap.unit !== undefined ? String(r[colMap.unit] || '').trim() : '',
+      reason: colMap.reason !== undefined ? String(r[colMap.reason] || '').trim() : '',
+      price: colMap.price !== undefined ? r[colMap.price] : '',
+      priceTotal: colMap.priceTotal !== undefined ? r[colMap.priceTotal] : '',
+      extraNote: extra.join('｜'), scannedQty: 0, status: 'open',
+      importedAt: now, importedBy: staffName, doneAt: ''
+    });
+  });
+  if(!items.length) return '⚠️ 沒有解析到任何品項，請確認貼上的內容裡「品號」欄有資料';
+
+  const dst = getSheet(SHEET_TRANSFER, TRANSFER_HEADER);
+  const start = dst.getLastRow() + 1;
+  dst.getRange(start, colOf(TRANSFER_HEADER, 'batchId'), items.length, 1).setNumberFormat('@');
+  dst.getRange(start, colOf(TRANSFER_HEADER, 'sku'), items.length, 1).setNumberFormat('@');
+  dst.getRange(start, colOf(TRANSFER_HEADER, 'importedAt'), items.length, 1).setNumberFormat('@');
+  dst.getRange(start, 1, items.length, TRANSFER_HEADER.length)
+     .setValues(items.map(function(o){ return TRANSFER_HEADER.map(function(h){ return o[h]; }); }));
+
+  // 清空暫存區準備下一批（只清貼上的範圍，說明／勾選框那幾列不動）
+  sh.getRange(headerRow, 1, lastRow - headerRow + 1, lastCol).clearContent();
+
+  try{ mirrorTransferToWorkspace_(); }catch(err){ /* 鏡射失敗不影響匯入本身已經成功寫進我們後端 */ }
+  return '✅ 已匯入 ' + items.length + ' 個品項，批次編號 ' + batchId;
+}
+
+// 目前待驗收清單。以「開放中」的列為主，另外附上今天已完成的，
+// 讓剛掃完的人重新整理頁面後還能看到自己剛做完的結果，不會以為沒送出去。
+function getTransferPending(){
+  const rows = readRows(SHEET_TRANSFER, TRANSFER_HEADER);
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd');
+  const map = function(r){
+    return {row: r._row, batchId: r.batchId, sku: r.sku, baseName: r.baseName, spec: r.spec,
+            qty: Number(r.qty) || 0, scannedQty: Number(r.scannedQty) || 0,
+            unit: r.unit, reason: r.reason, extraNote: r.extraNote,
+            importedAt: cellToText(r.importedAt, true), importedBy: r.importedBy};
+  };
+  const open = rows.filter(function(r){ return r.status === 'open'; });
+  const recentDone = rows.filter(function(r){
+    return r.status === 'done' && String(cellToText(r.doneAt, true) || '').indexOf(today) === 0;
+  });
+  return {ok:true, items: open.map(map), recentDone: recentDone.map(map).reverse().slice(0, 30)};
+}
+
+// 掃描核對，一次可以送一批（跟揀貨掃描同一套樂觀更新＋批次送出的做法，
+// 現場連續掃描不能每掃一件就等一次網路）。
+// 以「品號」找還缺件數的最早一批（FIFO）去扣，不要求指定調撥單——
+// 這就是使用者要的「以單品項核對，不以整單核對」：現場掃到什麼就核對什麼，
+// 不用先選是哪一張調撥單。
+function scanTransferBatch(ops){
+  ops = ops || [];
+  if(!ops.length) return {ok:true, results:[]};
+  const sh = getSheet(SHEET_TRANSFER, TRANSFER_HEADER);
+  const last = sh.getLastRow();
+  const n = Math.max(last - 1, 0);
+  const vals = n ? sh.getRange(2, 1, n, TRANSFER_HEADER.length).getValues() : [];
+  const col = {};
+  TRANSFER_HEADER.forEach(function(h){ col[h] = colOf(TRANSFER_HEADER, h) - 1; });
+
+  function findOpenRow(sku){
+    let bestIdx = -1, bestTime = null;
+    for(let i = 0; i < vals.length; i++){
+      if(String(vals[i][col.sku] || '').trim() !== sku) continue;
+      if(vals[i][col.status] !== 'open') continue;
+      const qty = Number(vals[i][col.qty]) || 0;
+      const scanned = Number(vals[i][col.scannedQty]) || 0;
+      if(scanned >= qty) continue;
+      const t = String(vals[i][col.importedAt] || '');
+      if(bestIdx < 0 || t < bestTime){ bestIdx = i; bestTime = t; }
+    }
+    return bestIdx;
+  }
+
+  const changedRows = {}, logRows = [], results = [];
+  ops.forEach(function(op){
+    const sku = String(op.sku || '').trim();
+    if(!sku) return;
+    const time = op.time || nowStamp_();
+    if(op.undo){
+      const idx = vals.findIndex(function(r, i){ return i + 2 === Number(op.matchedRow); });
+      if(idx < 0){ results.push({ok:false, reason:'undo_not_found', sku: sku}); return; }
+      const scanned = Number(vals[idx][col.scannedQty]) || 0;
+      if(scanned <= 0){ results.push({ok:false, reason:'nothing_to_undo', sku: sku}); return; }
+      vals[idx][col.scannedQty] = scanned - 1;
+      vals[idx][col.status] = 'open';
+      vals[idx][col.doneAt] = '';
+      changedRows[idx] = true;
+      logRows.push({logTime: time, batchId: vals[idx][col.batchId], sku: sku,
+        baseName: vals[idx][col.baseName], staffId: op.staffId || '', staffName: op.staffName || '',
+        result: 'undo', note: ''});
+      results.push({ok:true, sku: sku, row: idx + 2, scannedQty: scanned - 1,
+        qty: vals[idx][col.qty], status: 'open', undo: true});
+      return;
+    }
+    const idx = findOpenRow(sku);
+    if(idx < 0){
+      logRows.push({logTime: time, batchId: '', sku: sku, baseName: '',
+        staffId: op.staffId || '', staffName: op.staffName || '', result: 'no_match', note: ''});
+      results.push({ok:false, reason:'no_match', sku: sku});
+      return;
+    }
+    const newScanned = (Number(vals[idx][col.scannedQty]) || 0) + 1;
+    const qty = Number(vals[idx][col.qty]) || 0;
+    const done = newScanned >= qty;
+    vals[idx][col.scannedQty] = newScanned;
+    vals[idx][col.status] = done ? 'done' : 'open';
+    if(done) vals[idx][col.doneAt] = time;
+    changedRows[idx] = true;
+    logRows.push({logTime: time, batchId: vals[idx][col.batchId], sku: sku,
+      baseName: vals[idx][col.baseName], staffId: op.staffId || '', staffName: op.staffName || '',
+      result: 'matched', note: ''});
+    results.push({ok:true, sku: sku, row: idx + 2, batchId: vals[idx][col.batchId],
+      baseName: vals[idx][col.baseName], scannedQty: newScanned, qty: qty,
+      status: vals[idx][col.status]});
+  });
+
+  Object.keys(changedRows).forEach(function(key){
+    const i = Number(key), row = i + 2;
+    sh.getRange(row, col.scannedQty + 1).setValue(vals[i][col.scannedQty]);
+    sh.getRange(row, col.status + 1).setValue(vals[i][col.status]);
+    sh.getRange(row, col.doneAt + 1).setNumberFormat('@');
+    sh.getRange(row, col.doneAt + 1).setValue(vals[i][col.doneAt]);
+  });
+
+  if(logRows.length){
+    const logSh = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER);
+    const start = logSh.getLastRow() + 1;
+    logSh.getRange(start, colOf(TRANSFERLOG_HEADER, 'logTime'), logRows.length, 1).setNumberFormat('@');
+    logSh.getRange(start, 1, logRows.length, TRANSFERLOG_HEADER.length)
+         .setValues(logRows.map(function(o){ return TRANSFERLOG_HEADER.map(function(h){ return o[h]; }); }));
+  }
+
+  try{ mirrorTransferToWorkspace_(); }catch(err){}
+  return {ok:true, results: results};
+}
+
+// 手動放棄一筆（ERP資料key錯、這批貨其實不會來了之類）。
+// 只允許對還是「open」的列動作，已經完成或已經放棄過的不能重複操作。
+function closeTransferItem(body){
+  const row = Number((body && body.row) || 0);
+  const reason = String((body && body.reason) || '').trim();
+  const staffId = String((body && body.staffId) || '').trim();
+  const staffName = String((body && body.staffName) || '').trim();
+  if(!row) return {ok:false, error:'請提供列號'};
+  if(!staffName) return {ok:false, error:'請先選擇人員'};
+  const sh = getSheet(SHEET_TRANSFER, TRANSFER_HEADER);
+  if(row < 2 || row > sh.getLastRow()) return {ok:false, error:'找不到這一列'};
+  const v = sh.getRange(row, 1, 1, TRANSFER_HEADER.length).getValues()[0];
+  const status = v[colOf(TRANSFER_HEADER, 'status') - 1];
+  if(status !== 'open') return {ok:false, error:'這筆已經不是待處理狀態了（' + status + '）'};
+  const sku = v[colOf(TRANSFER_HEADER, 'sku') - 1];
+  const now = nowStamp_();
+  sh.getRange(row, colOf(TRANSFER_HEADER, 'status')).setValue('cancelled');
+  sh.getRange(row, colOf(TRANSFER_HEADER, 'doneAt')).setNumberFormat('@');
+  sh.getRange(row, colOf(TRANSFER_HEADER, 'doneAt')).setValue(now);
+  getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER).appendRow([now,
+    v[colOf(TRANSFER_HEADER, 'batchId') - 1], sku, v[colOf(TRANSFER_HEADER, 'baseName') - 1],
+    staffId, staffName, 'cancelled', reason]);
+  try{ mirrorTransferToWorkspace_(); }catch(err){}
+  return {ok:true, row: row, sku: sku};
+}
+
+// ---- 鏡射回「文山出貨 工作區」的「調撥驗收」分頁 ----
+// 使用者已同意破例寫入，但只限這一個分頁；除此之外任何分頁都不寫。
+// 只寫 B~J（品項清單）跟 P（掃描序列）；A/K/L/M/N/O/Q 完全不碰——
+// M應收合計/N實收合計/Q檢驗是那個分頁本來就有的公式，我們沒有新增或修改任何公式，
+// 只是把資料放進公式會讀的欄位，讓它們自己算。
+const TRANSFER_WORKBOOK_ID = '1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ';
+const TRANSFER_MIRROR_TAB = '調撥驗收';
+const TRANSFER_MIRROR_FIRST_ROW = 2;
+const TRANSFER_MIRROR_MAX_ROWS = 200;   // 該分頁公式鋪到約219列，抓200留一點餘裕
+
+function mirrorTransferToWorkspace_(){
+  const ss = SpreadsheetApp.openById(TRANSFER_WORKBOOK_ID);
+  const sh = ss.getSheetByName(TRANSFER_MIRROR_TAB);
+  if(!sh) return {ok:false, error:'找不到「' + TRANSFER_MIRROR_TAB + '」分頁'};
+
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd');
+  const rows = readRows(SHEET_TRANSFER, TRANSFER_HEADER);
+  // 只鏡射「還在處理」或「今天完成」的——那個分頁本來就每天20:30被清空重來，
+  // 鏡射太久以前完成的批次進去，會讓人誤以為是今天發生的事。
+  const visible = rows.filter(function(r){
+    if(r.status === 'cancelled') return false;
+    if(r.status === 'open') return true;
+    return String(cellToText(r.doneAt, true) || '').indexOf(today) === 0;
+  });
+  const visibleIds = {};
+  visible.forEach(function(r){ visibleIds[r.batchId] = true; });
+  const items = visible.slice(-TRANSFER_MIRROR_MAX_ROWS);
+
+  const itemBlock = [];
+  for(let i = 0; i < TRANSFER_MIRROR_MAX_ROWS; i++){
+    const r = items[i];
+    itemBlock.push(r ? [r.sku, r.baseName, r.spec, r.qty, r.unit, r.reason, r.price, r.priceTotal]
+                      : ['', '', '', '', '', '', '', '']);
+  }
+  // B~I 沒有「圖片」欄（那是舊ERP貼上習慣才有，我們的資料不含圖片檔），
+  // 每次鏡射都重寫一次表頭，這樣即使凌晨被模板還原、表頭跟著沒了，下一次鏡射會自動補回來。
+  sh.getRange(1, 2, 1, 8).setValues([['品號', '品名', '規格', '數量', '單位', '原因', '零售價', '零售合計']]);
+  sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 2, TRANSFER_MIRROR_MAX_ROWS, 1).setNumberFormat('@'); // B品號
+  sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 2, TRANSFER_MIRROR_MAX_ROWS, 8).setValues(itemBlock);
+
+  const logs = readRows(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER)
+    .filter(function(r){ return r.result === 'matched' && visibleIds[r.batchId]; })
+    .slice(-TRANSFER_MIRROR_MAX_ROWS);
+  const pBlock = [];
+  for(let i = 0; i < TRANSFER_MIRROR_MAX_ROWS; i++){ pBlock.push([logs[i] ? logs[i].sku : '']); }
+  sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 16, TRANSFER_MIRROR_MAX_ROWS, 1).setNumberFormat('@'); // P驗收
+  sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 16, TRANSFER_MIRROR_MAX_ROWS, 1).setValues(pBlock);
+
+  return {ok:true, items: items.length, scans: logs.length};
+}
+
+function mirrorTransferScheduled_(){
+  try{ mirrorTransferToWorkspace_(); }
+  catch(err){ Logger.log('mirrorTransferToWorkspace_ 失敗：' + err); }
+}
+
+// 這個功能碰兩份資料：我們自己的後端（隨便測沒關係），跟破例可寫的工作區
+// 「調撥驗收」分頁（別人也在看的正式檔案）。做法：全程只用一個 ZZ 開頭、
+// 真實資料不可能撞到的測試品號，測完把後端的測試列刪乾淨，
+// 再手動呼叫一次鏡射，把工作區那邊也沖乾淨（讓它變回只反映真實資料的樣子）。
+function testTransferFlow_(){
+  const steps = [];
+  const ck = function(c, m){ steps.push((c ? '✅ ' : '❌ ') + m); };
+  const TEST_SKU = 'ZZ-TEST-TRANSFER-8891';
+  const dst = getSheet(SHEET_TRANSFER, TRANSFER_HEADER);
+  const logSh = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER);
+  const beforeRows = dst.getLastRow();
+  const beforeLog = logSh.getLastRow();
+
+  try{
+    // ---- 模擬「暫存分頁貼上→匯入」整段流程，用真的暫存分頁跑，測完清空 ----
+    setupTransferStageSheet_();   // 確保分頁存在且結構正確（說明列/人員下拉/勾選框）
+    const stageSh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_TRANSFER_STAGE);
+    const headerRow = TRANSFER_STAGE_FIRST_ROW;
+    stageSh.getRange(headerRow, 1, 1, 4).setValues([['品號', '品名', '規格', '數量']]);
+    stageSh.getRange(headerRow + 1, 1, 2, 4).setValues([
+      [TEST_SKU, '測試調撥商品', '測試規格', 3],
+      [TEST_SKU + '-B', '測試調撥商品B', '規格B', 1]
+    ]);
+    const noStaff = importTransferStage_(stageSh, '');
+    ck(noStaff.indexOf('❌') === 0, '沒選人員時匯入被擋：' + noStaff);
+    stageSh.getRange(headerRow, 1, 1, 4).setValues([['品號', '品名', '規格', '數量']]);
+    stageSh.getRange(headerRow + 1, 1, 2, 4).setValues([
+      [TEST_SKU, '測試調撥商品', '測試規格', 3],
+      [TEST_SKU + '-B', '測試調撥商品B', '規格B', 1]
+    ]);
+    const msg = importTransferStage_(stageSh, '測試員');
+    ck(msg.indexOf('✅') === 0 && msg.indexOf('2 個品項') > 0, '匯入成功：' + msg);
+    ck(stageSh.getRange(headerRow, 1).getValue() === '', '匯入後暫存區已清空');
+
+    const pending1 = getTransferPending();
+    const mine = pending1.items.filter(function(x){ return x.sku === TEST_SKU || x.sku === TEST_SKU + '-B'; });
+    ck(mine.length === 2, '待驗收清單看得到剛匯入的2筆：' + mine.length);
+    const mainItem = mine.find(function(x){ return x.sku === TEST_SKU; });
+    ck(mainItem && mainItem.qty === 3 && mainItem.scannedQty === 0, '應收3、已掃0：' + JSON.stringify(mainItem));
+
+    // ---- 掃描：3件應收，掃2件應該還是open，第3件掃完變done ----
+    const r1 = scanTransferBatch([
+      {sku: TEST_SKU, staffId:'T', staffName:'測試員', time: nowStamp_()},
+      {sku: TEST_SKU, staffId:'T', staffName:'測試員', time: nowStamp_()}
+    ]);
+    ck(r1.ok && r1.results.every(function(x){ return x.ok; }) && r1.results[1].scannedQty === 2
+       && r1.results[1].status === 'open', '掃2件（應收3）仍是open：' + JSON.stringify(r1.results[1]));
+
+    const r2 = scanTransferBatch([{sku: TEST_SKU, staffId:'T', staffName:'測試員', time: nowStamp_()}]);
+    ck(r2.ok && r2.results[0].scannedQty === 3 && r2.results[0].status === 'done',
+       '掃第3件變done：' + JSON.stringify(r2.results[0]));
+
+    const r3 = scanTransferBatch([{sku: TEST_SKU, staffId:'T', staffName:'測試員', time: nowStamp_()}]);
+    ck(!r3.results[0].ok && r3.results[0].reason === 'no_match', '已收滿的品號再掃被判查無：' + JSON.stringify(r3.results[0]));
+
+    // ---- 掃不存在的品號 ----
+    const rMiss = scanTransferBatch([{sku:'ZZ-NOT-A-TRANSFER-ITEM', staffId:'T', staffName:'測試員', time: nowStamp_()}]);
+    ck(!rMiss.results[0].ok && rMiss.results[0].reason === 'no_match', '掃完全不在清單裡的品號被判查無');
+
+    // ---- 撤銷 ----
+    const matchedRow = r2.results[0].row;
+    const undo = scanTransferBatch([{sku: TEST_SKU, undo:true, matchedRow: matchedRow, staffId:'T', staffName:'測試員'}]);
+    ck(undo.results[0].ok && undo.results[0].scannedQty === 2 && undo.results[0].status === 'open',
+       '撤銷後回到2件、狀態open：' + JSON.stringify(undo.results[0]));
+
+    // ---- 放棄第二筆 ----
+    const other = pending1.items.find(function(x){ return x.sku === TEST_SKU + '-B'; });
+    const bad = closeTransferItem({row: other.row, reason:'測試', staffId:'T', staffName:'測試員'});
+    ck(bad.ok, '手動放棄成功：' + JSON.stringify(bad));
+    const closeAgain = closeTransferItem({row: other.row, reason:'測試', staffId:'T', staffName:'測試員'});
+    ck(!closeAgain.ok, '已放棄的不能再放棄一次：' + closeAgain.error);
+
+    // ---- 鏡射：確認測試品號真的寫進工作區（證明鏡射函式有在動作），再馬上清乾淨 ----
+    const mirrorRes = mirrorTransferToWorkspace_();
+    ck(mirrorRes.ok, '鏡射執行成功：' + JSON.stringify(mirrorRes));
+    const mss = SpreadsheetApp.openById(TRANSFER_WORKBOOK_ID);
+    const mirrorSh = mss.getSheetByName(TRANSFER_MIRROR_TAB);
+    const mirrorVals = mirrorSh.getRange(2, 2, TRANSFER_MIRROR_MAX_ROWS, 1).getValues();
+    const foundInMirror = mirrorVals.some(function(r){ return String(r[0]).trim() === TEST_SKU; });
+    ck(foundInMirror, '測試品號有出現在工作區「調撥驗收」分頁裡（證明鏡射真的寫進去了）');
+
+    ck(logSh.getLastRow() - beforeLog === 7, '異動紀錄新增 ' + (logSh.getLastRow() - beforeLog) + ' 列（期望7：3次成功掃描+2次查無+1次撤銷+1次放棄）');
+  }catch(err){
+    steps.push('❌ 例外：' + err);
+  }finally{
+    // 清掉後端測試資料
+    const last = dst.getLastRow();
+    for(let r = last; r > beforeRows; r--) dst.deleteRow(r);
+    const lastLog = logSh.getLastRow();
+    for(let r = lastLog; r > beforeLog; r--) logSh.deleteRow(r);
+    // 再鏡射一次，把工作區那邊也沖回「只剩真實資料」的樣子
+    let cleaned = false;
+    try{
+      const mirrorRes2 = mirrorTransferToWorkspace_();
+      const mss2 = SpreadsheetApp.openById(TRANSFER_WORKBOOK_ID);
+      const mirrorSh2 = mss2.getSheetByName(TRANSFER_MIRROR_TAB);
+      const mirrorVals2 = mirrorSh2.getRange(2, 2, TRANSFER_MIRROR_MAX_ROWS, 1).getValues();
+      cleaned = !mirrorVals2.some(function(r){ return String(r[0]).indexOf('ZZ-TEST-TRANSFER') === 0; })
+        && mirrorRes2.ok;
+    }catch(err){}
+    steps.push((dst.getLastRow() === beforeRows ? '✅ ' : '❌ ') + '後端測試列已刪除還原');
+    steps.push((cleaned ? '✅ ' : '❌ ') + '工作區「調撥驗收」分頁已沖回不含測試資料的狀態');
+  }
+  return {全部通過: steps.every(function(x){ return x.indexOf('✅') === 0; }), 明細: steps};
 }
 
 // ---- 貨架商品查詢 ----
@@ -4312,6 +4762,17 @@ function onEdit(e){
   try{
     if(!e || !e.range) return;
     const sh = e.range.getSheet();
+    if(sh.getName() === SHEET_TRANSFER_STAGE){
+      if(e.range.getA1Notation() !== 'E2') return;
+      if(e.range.getValue() !== true) return;
+      const staffName = String(sh.getRange('B2').getValue() || '').trim();
+      let msg;
+      try{ msg = importTransferStage_(sh, staffName); }
+      catch(err){ msg = '❌ 匯入失敗：' + err; }
+      sh.getRange('E2').setValue(false);
+      sh.getRange('F2').setValue(msg);
+      return;
+    }
     if(sh.getName() !== SHEET_AMEND) return;
     const a1 = e.range.getA1Notation();
     if(a1 === 'B2'){

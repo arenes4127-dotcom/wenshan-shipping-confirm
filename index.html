@@ -229,6 +229,16 @@
   .loc-preview .note{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5;}
   .loc-preview .note.warn{color:#d98324;}
 
+  /* 調撥驗收卡片：一列一個待驗收品項（同品號跨批次分開列，方便對到是哪張調撥單） */
+  .tr-row{display:flex;gap:9px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--border);}
+  .tr-row:last-child{border-bottom:none;}
+  .tr-row.done{opacity:.6;}
+  .tr-row .body{flex:1;min-width:0;}
+  .tr-count{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:15px;font-weight:800;margin-top:2px;}
+  .tr-count .left{color:var(--danger);}
+  .tr-count .left.zero{color:var(--accent);}
+  .tr-actions{display:flex;flex-direction:column;gap:5px;align-items:flex-end;}
+
   /* 貨架查詢結果：一格一組，組頭是儲位 */
   .q-group{margin-top:14px;}
   .q-group .head{display:flex;justify-content:space-between;align-items:center;gap:8px;
@@ -483,6 +493,29 @@
           </div>
         </div>
       </div>
+    </section>
+
+    <!-- ============ 調撥驗收 ============ -->
+    <section id="view-transfer" class="view">
+      <div class="section-label">調撥驗收</div>
+      <div class="card">
+        <p class="hint" style="margin-top:0;">調撥單資料在後端試算表「調撥單匯入」分頁貼上匯入；這裡只做掃描核對，
+          以品號為單位——掃到什麼就核對什麼，不用先選是哪一張調撥單。</p>
+        <label class="field" style="margin-bottom:8px;">
+          <span>驗收人員</span>
+          <select id="transferStaffSelect"></select>
+        </label>
+        <label class="field" style="margin-bottom:0;">
+          <span>掃描或輸入商品條碼／貨號</span>
+          <input id="transferScanInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+        </label>
+      </div>
+
+      <div class="section-label">待驗收（<span id="transferPendingCount">0</span>）</div>
+      <div class="card"><div id="transferPendingList"></div></div>
+
+      <div class="section-label">今天已完成</div>
+      <div class="card"><div id="transferDoneList"></div></div>
     </section>
 
     <!-- ============ 訂單資料 ============ -->
@@ -797,6 +830,10 @@
     <button data-goto="loc">
       <span class="ic"><svg viewBox="0 0 24 24"><path d="M12 21s-7-5.5-7-11a7 7 0 0114 0c0 5.5-7 11-7 11z"/><circle cx="12" cy="10" r="2.5"/></svg></span>
       儲位
+    </button>
+    <button data-goto="transfer">
+      <span class="ic"><svg viewBox="0 0 24 24"><path d="M4 7h11l-3-3M20 17H9l3 3"/></svg></span>
+      調撥
     </button>
     <button data-goto="orders">
       <span class="ic"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></svg></span>
@@ -1165,6 +1202,11 @@ async function gotoView(name){
     renderLocHistory();
     loadLocVocab();
     setTimeout(function(){ const el = document.getElementById('locSkuInput'); if(el) el.focus(); }, 40);
+  }
+  if(name==='transfer'){
+    renderStaffSelects();
+    loadTransferPending();
+    setTimeout(function(){ const el = document.getElementById('transferScanInput'); if(el) el.focus(); }, 40);
   }
   if(name==='log') renderLog();
   if(name==='settings') renderSettings();
@@ -2477,6 +2519,208 @@ function addShelfGroupToBatch(loc){
   renderLocBatch();
 }
 
+// ================= 調撥驗收 =================
+// 訂單缺貨→分店/他倉調貨回文山→ERP開調撥單→貼上匯入→掃描驗收。
+// 使用者明講：調回的商品可能跟訂單缺貨的品項對不上，這裡刻意不綁訂單，
+// 只管「調撥單上寫要收幾件、實際掃到幾件」，跟出貨、揀貨是三件獨立的事。
+//
+// 匯入在後端試算表的「調撥單匯入」分頁做（貼上ERP資料、勾選確認），
+// 這裡（APP）只負責驗收掃描——分成兩處操作是刻意的：貼資料是坐在電腦前的動作，
+// 掃描驗收是站在貨堆前的動作，硬要塞進同一個畫面兩邊都不會順手。
+//
+// 刻意不做成揀貨那種「本機先反應、排隊批次送出」：驗收掃描的節奏比出貨/揀貨慢得多
+// （核對調撥單本來就不是搶時間的事），换來的是「每一次掃描的結果都是後端當下的真相」，
+// 不用處理「本機顯示的還缺件數」跟「後端實際還缺件數」對不齊的情況——
+// 尤其這是多人可能同時在核對同一張調撥單的場景，看到即時真相比看到瞬間反應更重要。
+let transferPending = [];   // 目前開放中的待驗收品項（一列＝一筆調撥單裡的一個品號）
+let transferDone = [];      // 今天已完成的（含被人工放棄的不會出現在這裡）
+let transferLastRow = {};   // sku -> 最近一次成功掃描命中的列號，給「撤銷」用
+
+function transferStaff(){
+  const sel = document.getElementById('transferStaffSelect');
+  return sel ? staff.find(function(s){ return s.id === sel.value; }) : null;
+}
+
+async function loadTransferPending(){
+  if(!hasBackend()) return;
+  let res;
+  try{ res = await apiPost('getTransferPending', {}); }
+  catch(err){ flash('err', '讀取待驗收清單失敗', err.message || '', 2200); return; }
+  if(!res || !res.ok) return;
+  transferPending = res.items || [];
+  transferDone = res.recentDone || [];
+  renderTransferLists();
+}
+
+function transferSortKey_(it){
+  return String(it.sku) + '|' + String(it.importedAt || '');
+}
+
+function renderTransferLists(){
+  const pendingBox = document.getElementById('transferPendingList');
+  const doneBox = document.getElementById('transferDoneList');
+  document.getElementById('transferPendingCount').textContent = transferPending.length;
+
+  if(!transferPending.length){
+    pendingBox.innerHTML = '<p class="hint" style="margin:0;">目前沒有待驗收的調撥品項。</p>';
+  } else {
+    const list = transferPending.slice().sort(function(a, b){
+      return transferSortKey_(a) < transferSortKey_(b) ? -1 : 1;
+    });
+    pendingBox.innerHTML = list.map(transferRowHtml).join('');
+  }
+
+  if(!transferDone.length){
+    doneBox.innerHTML = '<p class="hint" style="margin:0;">今天還沒有驗收完成的品項。</p>';
+  } else {
+    doneBox.innerHTML = transferDone.map(function(it){ return transferRowHtml(it, true); }).join('');
+  }
+}
+
+function transferRowHtml(it, isDone){
+  const left = it.qty - it.scannedQty;
+  const safeSku = String(it.sku).replace(/'/g, "\\'");
+  return '<div class="tr-row' + (isDone ? ' done' : '') + '">' + thumbHtml(it.sku, it.baseName) +
+    '<div class="body">' +
+      '<div class="sku-badge">' + escapeHtml(it.sku) + '</div>' +
+      '<div style="font-weight:700;margin-top:3px;font-size:13px;">' + escapeHtml(it.baseName || '（無品名）') +
+        (it.spec ? '　' + escapeHtml(it.spec) : '') + '</div>' +
+      '<div class="tr-count">應收 ' + it.qty + '　已掃 ' + it.scannedQty +
+        (isDone ? '' : '　<span class="left' + (left <= 0 ? ' zero' : '') + '">還缺 ' + Math.max(left, 0) + '</span>') +
+      '</div>' +
+      '<div class="hint" style="margin-top:2px;">' + escapeHtml(it.importedBy || '') + '　' + escapeHtml(it.importedAt || '') +
+        (it.reason ? '　' + escapeHtml(it.reason) : '') + '</div>' +
+      (it.extraNote ? '<div class="hint" style="margin-top:1px;">' + escapeHtml(it.extraNote.slice(0, 60)) + '</div>' : '') +
+    '</div>' +
+    (isDone ? '' :
+      '<div class="tr-actions">' +
+        '<button class="btn gray sm" ' + (it.scannedQty > 0 ? '' : 'disabled') +
+          ' onclick="transferUndo(\'' + safeSku + '\')">撤銷上一筆</button>' +
+        '<button class="btn gray sm" onclick="transferClose(' + it.row + ',\'' + safeSku + '\')">放棄</button>' +
+      '</div>') +
+  '</div>';
+}
+
+// 找本機清單裡「這個品號還缺件數、且是最早匯入」的那一筆，跟後端 FIFO 邏輯同一套規則。
+// 純粹用來決定「掃到這個條碼時要不要顯示樂觀提示」，真正扣件數還是等後端回應為準。
+function transferFindLocalRow(sku){
+  let best = null;
+  transferPending.forEach(function(it){
+    if(it.sku !== sku) return;
+    if(it.scannedQty >= it.qty) return;
+    if(!best || String(it.importedAt) < String(best.importedAt)) best = it;
+  });
+  return best;
+}
+
+function transferApplyResult_(r){
+  // 後端回應是真相，找到對應列就地更新；找不到（例如剛好變成done被移出pending）就重新整批刷新，
+  // 避免本機清單跟後端狀態兜不起來。
+  const idx = transferPending.findIndex(function(x){ return x.row === r.row; });
+  if(idx < 0){ loadTransferPending(); return; }
+  transferPending[idx].scannedQty = r.scannedQty;
+  if(r.status === 'done'){
+    const done = transferPending.splice(idx, 1)[0];
+    transferDone.unshift(done);
+  }
+  renderTransferLists();
+}
+
+async function transferScan(code){
+  const raw = String(code || '').trim();
+  if(!raw) return;
+  if(!hasBackend()){ errorBeep(); flash('err', '需要連線', '調撥驗收要連上後端才能用', 1800); return; }
+  const staffObj = transferStaff();
+  if(!staffObj){ errorBeep(); flash('err', '請先選擇驗收人員', '', 1600); return; }
+
+  const cands = [raw].concat(barcodeMap[raw] || []);
+  let target = cands.find(function(s){ return transferFindLocalRow(s); });
+  if(!target) target = cands[0];   // 本機都對不到就還是送給後端判斷，後端看得到最新真相
+
+  const el = document.getElementById('transferScanInput');
+  if(el) el.disabled = true;
+  let res;
+  try{
+    res = await apiPost('scanTransferBatch', {ops: [{
+      sku: target, staffId: staffObj.id, staffName: staffObj.name, time: new Date().toLocaleString('zh-TW')
+    }]});
+  }catch(err){
+    errorBeep(); flash('err', '掃描失敗', err.message || '', 2200);
+    if(el){ el.disabled = false; el.focus(); }
+    return;
+  }
+  if(el){ el.disabled = false; el.focus(); }
+  const r = (res && res.results && res.results[0]) || null;
+  if(!r || !r.ok){
+    errorBeep();
+    flash('err', '找不到這個品號的待驗收項目', '「' + raw + '」目前沒有調撥單在等它，或已經收滿了', 2600);
+    return;
+  }
+  okBeep();
+  transferLastRow[r.sku] = r.row;
+  transferApplyResult_(r);
+  flash('ok', r.baseName || r.sku, '已掃 ' + r.scannedQty + ' / ' + r.qty, 1400);
+}
+
+async function transferUndo(sku){
+  const row = transferLastRow[sku];
+  if(!row){ errorBeep(); flash('err', '這個品號沒有可撤銷的紀錄', '重新整理頁面後撤銷紀錄會清空，只能撤銷這次開啟後自己掃的', 2600); return; }
+  const staffObj = transferStaff();
+  if(!staffObj){ errorBeep(); flash('err', '請先選擇驗收人員', '', 1600); return; }
+  let res;
+  try{
+    res = await apiPost('scanTransferBatch', {ops: [{
+      sku: sku, undo: true, matchedRow: row, staffId: staffObj.id, staffName: staffObj.name,
+      time: new Date().toLocaleString('zh-TW')
+    }]});
+  }catch(err){ errorBeep(); flash('err', '撤銷失敗', err.message || '', 2200); return; }
+  const r = (res && res.results && res.results[0]) || null;
+  if(!r || !r.ok){
+    errorBeep();
+    flash('err', '撤銷失敗', (r && r.reason === 'nothing_to_undo') ? '這一筆已經是0件，沒有能再撤銷的' : '', 2200);
+    return;
+  }
+  okBeep();
+  // 撤銷可能把一筆從「已完成」救回「待驗收」，本機清單結構對不上時直接整批刷新最單純
+  const inPending = transferPending.some(function(x){ return x.row === r.row; });
+  if(!inPending){ loadTransferPending(); return; }
+  transferApplyResult_(r);
+  flash('ok', '已撤銷', sku, 1400);
+}
+
+async function transferClose(row, sku){
+  const staffObj = transferStaff();
+  if(!staffObj){ errorBeep(); flash('err', '請先選擇驗收人員', '', 1600); return; }
+  const it = transferPending.find(function(x){ return x.row === row; });
+  const ok = await confirmWithImage({
+    title: '放棄這筆調撥驗收',
+    sku: sku,
+    lines: [
+      {text: (it && it.baseName) || sku, strong: true},
+      {text: '貨號：' + sku},
+      {text: it ? ('應收 ' + it.qty + '　已掃 ' + it.scannedQty) : ''}
+    ],
+    warn: '這筆之後不會再出現在待驗收清單，也不會再被鏡射到工作區的「調撥驗收」分頁。確定這批貨不會來了、或這筆資料是打錯的，才放棄。',
+    okText: '確定放棄'
+  });
+  if(!ok) return;
+  let res;
+  try{ res = await apiPost('closeTransferItem', {row: row, staffId: staffObj.id, staffName: staffObj.name, reason: '現場人工放棄'}); }
+  catch(err){ errorBeep(); flash('err', '放棄失敗', err.message || '', 2200); return; }
+  if(!res || !res.ok){ errorBeep(); flash('err', '放棄失敗', (res && res.error) || '', 2600); return; }
+  okBeep();
+  transferPending = transferPending.filter(function(x){ return x.row !== row; });
+  renderTransferLists();
+  flash('ok', '已放棄', sku, 1600);
+}
+
+document.getElementById('transferScanInput').addEventListener('keydown', function(e){
+  if(e.key !== 'Enter') return;
+  const code = e.target.value.trim();
+  e.target.value = '';
+  transferScan(code);
+});
+
 // 小樣多尺寸多顏色是整箱一起搬的，一箱三十件逐件掃要掃三十次，
 // 而它們的目的地是同一個位置。掃一件、把同款其他規格叫出來勾一勾，
 // 實測 57% 的品號能這樣展開，平均一群 10.2 個規格。
@@ -3708,6 +3952,13 @@ function renderStaffSelects(){
     locSel.innerHTML = optionsHtml;
     locSel.value = (keep && staff.find(s=>s.id===keep)) ? keep
       : ((pickSel && pickSel.value) || currentStaffId);
+  }
+  const transferSel = document.getElementById('transferStaffSelect');
+  if(transferSel){
+    const keep = transferSel.value;
+    transferSel.innerHTML = optionsHtml;
+    transferSel.value = (keep && staff.find(s=>s.id===keep)) ? keep
+      : ((locSel && locSel.value) || currentStaffId);
   }
   const staffObj = staff.find(s=>s.id===currentStaffId);
   document.getElementById('headerStaffName').textContent = staffObj ? staffObj.name : '未選擇';
