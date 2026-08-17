@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.132';
+const BACKEND_VERSION = '2026-08-17.136';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -212,6 +212,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   testTransferFlow_: () => testTransferFlow_(),
   debugTransferHeaders_: () => debugTransferHeaders_(),
   debugLocLogHeaders_: () => debugLocLogHeaders_(),
+  peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
@@ -2525,6 +2526,13 @@ function setupTransferStageSheet_(){
 
   sh.getRange(TRANSFER_STAGE_FIRST_ROW - 1, 1, 1, 1)
     .setValue('↓ 從這裡開始貼上（含表頭）').setFontColor('#999999').setFontStyle('italic');
+  // 附註直接掛在真正要點的那一格上，滑鼠移過去就跳出來——
+  // 不要只靠上面那行文字提示，人常常看不出箭頭是指這一格還是再下一格。
+  sh.getRange(TRANSFER_STAGE_FIRST_ROW, 1).setNote([
+    '就是這裡：點這一格，把 ERP 匯出的調撥單資料整塊貼上（Ctrl+V）。',
+    '要含最上面那一列表頭（品號/品名/規格/數量…），不能只貼資料不貼表頭。',
+    '貼在第幾欄不用計較，程式是照表頭文字對應，不是照欄位位置。'
+  ].join('\n'));
   [70, 110, 110, 260, 90, 90, 90, 130, 90, 90, 90, 90].forEach(function(w, i){ sh.setColumnWidth(i + 1, w); });
   sh.setFrozenRows(4);
   return {ok:true, 分頁: SHEET_TRANSFER_STAGE};
@@ -2795,6 +2803,20 @@ function mirrorTransferScheduled_(){
 // 再手動呼叫一次鏡射，把工作區那邊也沖乾淨（讓它變回只反映真實資料的樣子）。
 // 唯讀診斷：確認調撥相關分頁目前實際顯示的表頭文字（getSheet 會照 HEADER_LABELS
 // 翻譯，沒登記在裡面的欄位代碼會直接顯示英文，這個函式就是用來抓漏。
+// 唯讀：確認暫存分頁目前有沒有人已經貼了資料在等匯入——
+// setupTransferStageSheet_ 會整片 clear()，重跑前一定要先確認不會沖掉別人正在用的東西。
+function peekTransferStage_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_TRANSFER_STAGE);
+  if(!sh) return {exists:false};
+  const last = sh.getLastRow();
+  const from5 = last >= TRANSFER_STAGE_FIRST_ROW
+    ? sh.getRange(TRANSFER_STAGE_FIRST_ROW, 1, last - TRANSFER_STAGE_FIRST_ROW + 1, sh.getLastColumn()).getValues()
+    : [];
+  const hasData = from5.some(function(r){ return r.some(function(v){ return String(v||'').trim(); }); });
+  return {exists:true, lastRow:last, 第5列起有資料: hasData,
+          A5附註: sh.getRange(TRANSFER_STAGE_FIRST_ROW, 1).getNote()};
+}
+
 function debugLocLogHeaders_(){
   return {儲位異動紀錄: getSheet(SHEET_LOCLOG, LOCLOG_HEADER).getRange(1,1,1,LOCLOG_HEADER.length).getDisplayValues()[0]};
 }
