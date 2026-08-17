@@ -1305,33 +1305,35 @@ function flash(kind, big, sub, ms){
 // 也就不會因為各自維護而慢慢長出不一樣的行為。
 //
 // 優先用瀏覽器原生 BarcodeDetector（Android Chrome 有支援，免下載、辨識快）；
-// 沒有的裝置（主要是 iOS Safari）才動態載入 ZXing 當備援，多數人根本不會載到那個檔案。
+// 沒有的裝置（主要是 iOS Safari）才動態載入 zbar-wasm + polyfill 當備援。
+// 這個 polyfill 實作的是跟原生 BarcodeDetector 完全相同的介面（一樣是
+// new BarcodeDetector({formats}).detect(video/canvas)），所以不用另外寫
+// 一套解碼迴圈——載入完成後把 window.BarcodeDetector 指到 polyfill 提供的
+// class，剩下的解碼流程（runNativeBarcodeDetector_）原生和polyfill共用同一份。
+//
+// 2026-08-17 實測換過一輪：原本用 zxing-js（純JS重寫版），使用者反映清楚對準
+// 條碼還是掃不出來。查證後改用 zbar-wasm（C library ZBar 編譯成 WebAssembly，
+// 比純JS重寫版更貼近原生解碼引擎的辨識邏輯，發票/存摺類APP常用的辨識引擎
+// 也是這個路線）。同時發現 iOS Safari 完全不支援 getUserMedia 的
+// focusMode/applyConstraints 對焦控制（Chrome for Android 才有）——先前那個
+// 「開連續自動對焦」的fix在iOS Safari上其實是靜默無效的no-op，這就是為什麼
+// 光靠那個fix沒解決問題。既然對焦控制不到，改從另一個能控制的地方下手：
+// 裁切+放大畫面中間對準框那一帶再丟給解碼器（見 runNativeBarcodeDetector_），
+// 不管換哪套解碼引擎都有效，也是市面上條碼掃描SDK常見的做法。
 let cameraStream = null;
 let cameraRafId = null;
-let cameraZxingReader = null;
 let cameraOnResult = null;
-let zxingLoadPromise = null;
+let zbarLoadPromise = null;
 
 // 現場實測過的真實故障：CDN 請求卡住不動，瀏覽器既不觸發 onload 也不觸發
 // onerror（可能是網路內容過濾器直接把封包吞掉、不回應也不像正常的連線失敗），
 // 畫面因此永遠停在「第一次使用需要下載掃描元件…」，沒有任何錯誤訊息、
-// 使用者也不知道該怎麼辦。所以每個來源都自己包一個逾時保險，逾時就當失敗處理，
-// 不會無止盡卡住。
-// 兩個來源都試：一個CDN被擋（防火牆／內容過濾器）不代表另一個也被擋，
-// 兩家用的網路基礎設施不一樣，多一次機會。
-// 現場實測：兩個外部 CDN（jsdelivr、unpkg）在倉庫那台裝置的網路環境下都連不上，
-// 逾時保險有正確發動，但兩個來源都失敗——最可能的原因是那個網路（很可能是有
-// 管控的公司/倉庫網路）只放行自己這個網域的流量，任何外部CDN網域都連不到，
-// 不管CDN本身多可靠都沒用。真正的解法是不要依賴外部網域：把檔案跟著APP
-// 一起放在同一個GitHub Pages網域下，那個網域既然連得到APP本身，就連得到這個檔案。
-// 同網域這個放第一個試，兩個外部CDN留著當備援（給網路環境不同、但這個網域
-// 剛好有問題的人多一條路），不會互相干擾。
-const ZXING_SOURCES = [
-  'zxing-browser.min.js',
-  'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js',
-  'https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js'
-];
-const ZXING_LOAD_TIMEOUT_MS = 8000;
+// 使用者也不知道該怎麼辦。現場實測過兩個外部CDN（jsdelivr、unpkg）在倉庫
+// 那台裝置的網路環境下都連不上，最可能是那個網路只放行自己這個網域的流量。
+// 所以這兩個檔案直接跟著APP放在同一個GitHub Pages網域下，不試外部CDN，
+// 但逾時保險還是留著（防其他原因造成的卡住）。
+const ZBAR_SOURCES = ['zbar-wasm.min.js', 'barcode-detector-polyfill.min.js'];
+const ZBAR_LOAD_TIMEOUT_MS = 8000;
 
 function loadScriptWithTimeout_(src, timeoutMs){
   return new Promise(function(resolve, reject){
@@ -1361,23 +1363,24 @@ function loadScriptWithTimeout_(src, timeoutMs){
   });
 }
 
-async function loadZXing_(){
-  if(window.ZXingBrowser) return;
-  if(zxingLoadPromise) return zxingLoadPromise;
-  zxingLoadPromise = (async function(){
-    let lastErr = null;
-    for(let i = 0; i < ZXING_SOURCES.length; i++){
-      try{
-        await loadScriptWithTimeout_(ZXING_SOURCES[i], ZXING_LOAD_TIMEOUT_MS);
-        if(window.ZXingBrowser) return;   // 這個來源真的載成功了
-        lastErr = new Error('script_loaded_but_no_global');
-      }catch(err){ lastErr = err; }
-      // 這個來源失敗，換下一個試——不要整個放棄
+async function loadZbar_(){
+  if(window.BarcodeDetector) return;
+  if(zbarLoadPromise) return zbarLoadPromise;
+  zbarLoadPromise = (async function(){
+    try{
+      // 兩個檔案有依賴順序：barcode-detector-polyfill 載入當下就會讀取
+      // 全域變數 zbarWasm，一定要先把 zbar-wasm.min.js 載完才能載第二個。
+      for(let i = 0; i < ZBAR_SOURCES.length; i++){
+        await loadScriptWithTimeout_(ZBAR_SOURCES[i], ZBAR_LOAD_TIMEOUT_MS);
+      }
+      if(!window.barcodeDetectorPolyfill) throw new Error('script_loaded_but_no_global');
+      window.BarcodeDetector = window.barcodeDetectorPolyfill.BarcodeDetectorPolyfill;
+    }catch(err){
+      zbarLoadPromise = null;   // 失敗了，讓下次點camera按鈕可以重新再試一次
+      throw new Error('相機掃描元件下載失敗，請檢查網路連線或稍後再試：' + (err && err.message));
     }
-    zxingLoadPromise = null;   // 全部失敗，讓下次點camera按鈕可以重新整批再試一次
-    throw new Error('相機掃描元件下載失敗，請檢查網路連線或稍後再試（已嘗試2個來源）：' + (lastErr && lastErr.message));
   })();
-  return zxingLoadPromise;
+  return zbarLoadPromise;
 }
 
 function cameraSetStatus_(text){
@@ -1423,6 +1426,9 @@ async function openCameraScan(onResult){
   // 手再怎麼晃，都不會重新對焦——這是條碼明明看起來清楚卻解不出來的常見成因。
   // 有支援連續自動對焦就開，裝置/瀏覽器不支援這裡會直接丟錯，接不到也沒關係，
   // 不影響掃描主流程照樣運作。
+  // 查證過：iOS Safari 完全不支援這組 API（Chrome for Android才有），這段在
+  // iOS Safari上必定是靜默no-op；留著不刪是因為Android瀏覽器上仍然有效，
+  // 且成本是零（try/catch包住，失敗不影響任何東西）。
   try{
     const track = cameraStream.getVideoTracks()[0];
     const caps = track && track.getCapabilities ? track.getCapabilities() : null;
@@ -1431,28 +1437,35 @@ async function openCameraScan(onResult){
     }
   }catch(err){ /* 不支援連續對焦就算了，不影響掃描 */ }
 
-  if('BarcodeDetector' in window){
-    runNativeBarcodeDetector_(video);
-    return;
+  if(!('BarcodeDetector' in window)){
+    cameraSetStatus_('第一次使用需要下載掃描元件，最多等15秒，逾時會顯示原因…');
+    try{ await loadZbar_(); }
+    catch(err){
+      // closeCameraScan() 自己會把狀態文字清成空字串——如果緊接著呼叫，
+      // 使用者根本來不及看到這則訊息，畫面就已經關掉了。
+      // 相機這時候已經開著，鏡頭要關掉，但訊息要留在畫面上讓人讀到，
+      // 所以這裡只清相機資源，不呼叫會一併清掉文字的 closeCameraScan()。
+      cameraSetStatus_(String((err && err.message) || err));
+      if(cameraStream){ cameraStream.getTracks().forEach(function(t){ t.stop(); }); cameraStream = null; }
+      video.srcObject = null;
+      return;
+    }
+    cameraSetStatus_('');
   }
-  cameraSetStatus_('第一次使用需要下載掃描元件，最多等15秒，逾時會顯示原因…');
-  try{ await loadZXing_(); }
-  catch(err){
-    // closeCameraScan() 自己會把狀態文字清成空字串——如果緊接著呼叫，
-    // 使用者根本來不及看到這則訊息，畫面就已經關掉了。
-    // 相機這時候已經開著，鏡頭要關掉，但訊息要留在畫面上讓人讀到，
-    // 所以這裡只清相機資源，不呼叫會一併清掉文字的 closeCameraScan()。
-    cameraSetStatus_(String((err && err.message) || err));
-    if(cameraStream){ cameraStream.getTracks().forEach(function(t){ t.stop(); }); cameraStream = null; }
-    video.srcObject = null;
-    return;
-  }
-  runZXingScan_(video);
+  runNativeBarcodeDetector_(video);
 }
 
 function runNativeBarcodeDetector_(video){
   // 常見1D條碼格式都列進去；code_128最常見（大部分出貨/儲位條碼都是這種），
   // ean_13/upc_a是零售商品條碼（掃到外包裝上的國際碼時會用到）。
+  // window.BarcodeDetector 這時候可能是瀏覽器原生的，也可能是 loadZbar_()
+  // 換上去的 polyfill——兩邊介面完全一樣，這個函式不用分兩種寫法。
+  //
+  // 這裡本來試過「裁切放大畫面中間對準框那一帶再解碼」，理論上應該對小條碼
+  // 更有利，但實測發現這個解碼器對裁切框留的邊界極度敏感——裁切框只要比
+  // 條碼本身的實際範圍寬個10%，解碼就會失敗；框留寬一點（貼近使用者看到的
+  // 對準框大小）反而更常失敗。真實鏡頭下不可能精準到「裁切框剛好等於條碼
+  // 大小」，這個做法會比不裁切更不穩定，所以放棄，改回對整張畫面直接解碼。
   const detector = new window.BarcodeDetector({
     formats: ['code_128', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_39', 'qr_code']
   });
@@ -1475,26 +1488,6 @@ function runNativeBarcodeDetector_(video){
   cameraRafId = requestAnimationFrame(tick);
 }
 
-function runZXingScan_(video){
-  // 抓到的真實bug：這裡漏了清空狀態文字，畫面因此一直停在「下載掃描元件」
-  // 那句話——即使函式庫其實已經載好、鏡頭也真的在運作、掃描功能是通的，
-  // 使用者看到的畫面卻像完全卡死一樣，跟原生 BarcodeDetector 那條路徑
-  // （getUserMedia成功後就馬上清空狀態）不一致。
-  cameraSetStatus_('');
-  const Z = window.ZXingBrowser;
-  // 倉庫條碼全部是1D格式（Code128/EAN/UPC等），改用1D專用的reader，
-  // 每一幀不用再浪費時間嘗試辨識QR code/Datamatrix這些用不到的2D格式，
-  // 對1D條碼本身的辨識速度和準確度都會比較好。
-  cameraZxingReader = new Z.BrowserMultiFormatOneDReader();
-  cameraZxingReader.decodeFromStream(cameraStream, video, function(result, err){
-    if(result) handleCameraResult_(result.getText());
-    // err 是「這一幀沒解出東西」的正常情況（NotFoundException），不用理它，
-    // ZXing 自己會繼續下一幀，只有真的解出結果才處理。
-  }).catch(function(err){
-    cameraSetStatus_('相機掃描初始化失敗：' + (err && err.message || err));
-  });
-}
-
 function handleCameraResult_(code){
   const cb = cameraOnResult;
   closeCameraScan();
@@ -1507,10 +1500,6 @@ function closeCameraScan(){
   document.getElementById('cameraMask').classList.remove('show');
   cameraSetStatus_('');
   if(cameraRafId){ cancelAnimationFrame(cameraRafId); cameraRafId = null; }
-  if(cameraZxingReader){
-    try{ cameraZxingReader.reset(); }catch(err){}
-    cameraZxingReader = null;
-  }
   // 一定要把鏡頭關掉，不然使用者離開這個畫面之後相機指示燈還亮著、
   // 電也一直在耗，而且下次要用相機的APP可能會覺得裝置被佔用打不開。
   if(cameraStream){
