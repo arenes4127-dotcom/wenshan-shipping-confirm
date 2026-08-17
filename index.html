@@ -1385,8 +1385,14 @@ async function loadZbar_(){
       await loadScriptWithTimeout_(ZBAR_SOURCES[0], ZBAR_LOAD_TIMEOUT_MS);
       if(!window.zbarWasm) throw new Error('zbar-wasm 檔案下載成功但沒有生效（zbarWasm未定義）');
       await loadScriptWithTimeout_(ZBAR_SOURCES[1], ZBAR_LOAD_TIMEOUT_MS);
-      if(!window.barcodeDetectorPolyfill) throw new Error('barcode-detector-polyfill 檔案下載成功但沒有生效（barcodeDetectorPolyfill未定義）');
-      window.BarcodeDetector = window.barcodeDetectorPolyfill.BarcodeDetectorPolyfill;
+      // 注意：barcode-detector-polyfill.min.js 裡是用 const 宣告（不是 var），
+      // 這種寫法在classic script的最外層不會掛到 window 上，只會存在全域
+      // 「詞法作用域」裡，只能用裸變數名稱 barcodeDetectorPolyfill 存取，
+      // window.barcodeDetectorPolyfill 一定是 undefined（這是所有瀏覽器
+      // 一致的標準行為，之前誤以為是Safari特有問題或快取問題，都不是，
+      // 是這裡的存取方式本身寫錯了）。
+      if(typeof barcodeDetectorPolyfill === 'undefined') throw new Error('barcode-detector-polyfill 檔案下載成功但沒有生效');
+      window.BarcodeDetector = barcodeDetectorPolyfill.BarcodeDetectorPolyfill;
     }catch(err){
       zbarLoadPromise = null;   // 失敗了，讓下次點camera按鈕可以重新再試一次
       throw new Error('相機掃描元件下載失敗，請檢查網路連線或稍後再試：' + (err && err.message));
