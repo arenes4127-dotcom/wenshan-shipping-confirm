@@ -1312,16 +1312,63 @@ let cameraZxingReader = null;
 let cameraOnResult = null;
 let zxingLoadPromise = null;
 
-function loadZXing_(){
-  if(window.ZXingBrowser) return Promise.resolve();
-  if(zxingLoadPromise) return zxingLoadPromise;
-  zxingLoadPromise = new Promise(function(resolve, reject){
+// 現場實測過的真實故障：CDN 請求卡住不動，瀏覽器既不觸發 onload 也不觸發
+// onerror（可能是網路內容過濾器直接把封包吞掉、不回應也不像正常的連線失敗），
+// 畫面因此永遠停在「第一次使用需要下載掃描元件…」，沒有任何錯誤訊息、
+// 使用者也不知道該怎麼辦。所以每個來源都自己包一個逾時保險，逾時就當失敗處理，
+// 不會無止盡卡住。
+// 兩個來源都試：一個CDN被擋（防火牆／內容過濾器）不代表另一個也被擋，
+// 兩家用的網路基礎設施不一樣，多一次機會。
+const ZXING_SOURCES = [
+  'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js',
+  'https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js'
+];
+const ZXING_LOAD_TIMEOUT_MS = 8000;
+
+function loadScriptWithTimeout_(src, timeoutMs){
+  return new Promise(function(resolve, reject){
     const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js';
-    s.onload = resolve;
-    s.onerror = function(){ reject(new Error('相機掃描元件下載失敗，請檢查網路連線')); };
+    let done = false;
+    const timer = setTimeout(function(){
+      if(done) return;
+      done = true;
+      s.remove();
+      reject(new Error('timeout'));
+    }, timeoutMs);
+    s.src = src;
+    s.onload = function(){
+      if(done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    s.onerror = function(){
+      if(done) return;
+      done = true;
+      clearTimeout(timer);
+      s.remove();
+      reject(new Error('load_error'));
+    };
     document.head.appendChild(s);
   });
+}
+
+async function loadZXing_(){
+  if(window.ZXingBrowser) return;
+  if(zxingLoadPromise) return zxingLoadPromise;
+  zxingLoadPromise = (async function(){
+    let lastErr = null;
+    for(let i = 0; i < ZXING_SOURCES.length; i++){
+      try{
+        await loadScriptWithTimeout_(ZXING_SOURCES[i], ZXING_LOAD_TIMEOUT_MS);
+        if(window.ZXingBrowser) return;   // 這個來源真的載成功了
+        lastErr = new Error('script_loaded_but_no_global');
+      }catch(err){ lastErr = err; }
+      // 這個來源失敗，換下一個試——不要整個放棄
+    }
+    zxingLoadPromise = null;   // 全部失敗，讓下次點camera按鈕可以重新整批再試一次
+    throw new Error('相機掃描元件下載失敗，請檢查網路連線或稍後再試（已嘗試2個來源）：' + (lastErr && lastErr.message));
+  })();
   return zxingLoadPromise;
 }
 
@@ -1362,7 +1409,7 @@ async function openCameraScan(onResult){
     runNativeBarcodeDetector_(video);
     return;
   }
-  cameraSetStatus_('第一次使用需要下載掃描元件…');
+  cameraSetStatus_('第一次使用需要下載掃描元件，最多等15秒，逾時會顯示原因…');
   try{ await loadZXing_(); }
   catch(err){
     // closeCameraScan() 自己會把狀態文字清成空字串——如果緊接著呼叫，
