@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.130';
+const BACKEND_VERSION = '2026-08-17.132';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -102,7 +102,10 @@ const HEADER_LABELS = {
   // 調撥驗收
   batchId:'調撥批次', unit:'單位', reason:'原因', price:'零售價', priceTotal:'零售合計',
   extraNote:'其他欄位備註', scannedQty:'已掃數量', importedAt:'匯入時間', importedBy:'匯入人員',
-  doneAt:'完成時間', checkerId:'驗收人員工號', checkerName:'驗收人員姓名'
+  doneAt:'完成時間', checkerId:'驗收人員工號', checkerName:'驗收人員姓名',
+  // 儲位異動
+  fromLocation:'原儲位', toLocation:'新儲位', writeBack:'回寫結果', mode:'異動模式',
+  moverId:'異動人員工號', moverName:'異動人員姓名'
 };
 
 function doGet(e){
@@ -208,6 +211,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupTransferStageSheet_: () => setupTransferStageSheet_(),
   testTransferFlow_: () => testTransferFlow_(),
   debugTransferHeaders_: () => debugTransferHeaders_(),
+  debugLocLogHeaders_: () => debugLocLogHeaders_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
@@ -2343,7 +2347,9 @@ const LOCMAP_SOURCE_ID = '1hZ6fJU7CZyx79NRqSErmJBPkRssegublxK0TgniXbs4';
 const LOCMAP_TAB = ' 文山倉儲位';
 const LOCMAP_COL = {sku:1, name:2, location:3, updated:4, note:12};
 const SHEET_LOCLOG = '儲位異動紀錄';
-const LOCLOG_HEADER = ['logTime','sku','baseName','fromLocation','toLocation','kind','staffId','staffName','note','writeBack','mode'];
+// staffId/staffName 在別的分頁已經是「包貨人員」的翻譯，這裡是儲位異動不是包貨，
+// 改用不撞名的代碼，跟調撥驗收紀錄的 checkerId/checkerName 同樣理由。
+const LOCLOG_HEADER = ['logTime','sku','baseName','fromLocation','toLocation','kind','moverId','moverName','note','writeBack','mode'];
 // 異動類型。跟原因下拉同樣的理由：自由填寫的話同一件事會有十種寫法，之後統計不出東西。
 const LOC_CHANGE_KINDS = ['上架', '移櫃', '揀貨時發現', '盤點調整', '其他'];
 
@@ -2789,6 +2795,10 @@ function mirrorTransferScheduled_(){
 // 再手動呼叫一次鏡射，把工作區那邊也沖乾淨（讓它變回只反映真實資料的樣子）。
 // 唯讀診斷：確認調撥相關分頁目前實際顯示的表頭文字（getSheet 會照 HEADER_LABELS
 // 翻譯，沒登記在裡面的欄位代碼會直接顯示英文，這個函式就是用來抓漏。
+function debugLocLogHeaders_(){
+  return {儲位異動紀錄: getSheet(SHEET_LOCLOG, LOCLOG_HEADER).getRange(1,1,1,LOCLOG_HEADER.length).getDisplayValues()[0]};
+}
+
 function debugTransferHeaders_(){
   const t = getSheet(SHEET_TRANSFER, TRANSFER_HEADER).getRange(1,1,1,TRANSFER_HEADER.length).getDisplayValues()[0];
   const l = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER).getRange(1,1,1,TRANSFERLOG_HEADER.length).getDisplayValues()[0];
@@ -3847,7 +3857,7 @@ function locLogRows_(results, opt){
     const o = {
       logTime: nowStamp_(), sku: r.sku, baseName: r.baseName,
       fromLocation: r.from, toLocation: r.to, kind: opt.kind,
-      staffId: opt.staffId, staffName: opt.staffName, note: opt.note,
+      moverId: opt.staffId, moverName: opt.staffName, note: opt.note,
       writeBack: r.writeBack, mode: r.mode
     };
     rows.push(LOCLOG_HEADER.map(function(h){ return o[h]; }));
