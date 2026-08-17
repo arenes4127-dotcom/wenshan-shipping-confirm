@@ -1399,7 +1399,13 @@ async function openCameraScan(onResult){
 
   try{
     cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: {facingMode: {ideal: 'environment'}}
+      // 解析度太低是條碼掃不出來的常見原因之一（畫面模糊、線條黏在一起辨識不出間距）。
+      // 用 ideal 而非 exact，裝置支援不到也不會直接掉error，會退回它能給的最大解析度。
+      video: {
+        facingMode: {ideal: 'environment'},
+        width: {ideal: 1920},
+        height: {ideal: 1080}
+      }
     });
   }catch(err){
     // 現場最常見的兩種狀況分開講清楚，不要只丟一句「相機開啟失敗」——
@@ -1412,6 +1418,18 @@ async function openCameraScan(onResult){
   }
   video.srcObject = cameraStream;
   cameraSetStatus_('');
+
+  // 手機瀏覽器很多預設是「開鏡頭當下對焦一次就固定」，之後條碼再怎麼移近移遠、
+  // 手再怎麼晃，都不會重新對焦——這是條碼明明看起來清楚卻解不出來的常見成因。
+  // 有支援連續自動對焦就開，裝置/瀏覽器不支援這裡會直接丟錯，接不到也沒關係，
+  // 不影響掃描主流程照樣運作。
+  try{
+    const track = cameraStream.getVideoTracks()[0];
+    const caps = track && track.getCapabilities ? track.getCapabilities() : null;
+    if(caps && caps.focusMode && caps.focusMode.includes('continuous')){
+      await track.applyConstraints({advanced: [{focusMode: 'continuous'}]});
+    }
+  }catch(err){ /* 不支援連續對焦就算了，不影響掃描 */ }
 
   if('BarcodeDetector' in window){
     runNativeBarcodeDetector_(video);
@@ -1464,7 +1482,10 @@ function runZXingScan_(video){
   // （getUserMedia成功後就馬上清空狀態）不一致。
   cameraSetStatus_('');
   const Z = window.ZXingBrowser;
-  cameraZxingReader = new Z.BrowserMultiFormatReader();
+  // 倉庫條碼全部是1D格式（Code128/EAN/UPC等），改用1D專用的reader，
+  // 每一幀不用再浪費時間嘗試辨識QR code/Datamatrix這些用不到的2D格式，
+  // 對1D條碼本身的辨識速度和準確度都會比較好。
+  cameraZxingReader = new Z.BrowserMultiFormatOneDReader();
   cameraZxingReader.decodeFromStream(cameraStream, video, function(result, err){
     if(result) handleCameraResult_(result.getText());
     // err 是「這一幀沒解出東西」的正常情況（NotFoundException），不用理它，
