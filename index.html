@@ -528,7 +528,10 @@
           <div id="completeBox" style="display:none;margin-top:18px;padding:18px;background:var(--panel2);border-radius:var(--radius-sm);border:1px solid var(--accent-dim);">
             <h2 style="color:var(--accent);">商品核對完成</h2>
             <p class="hint">包貨人員：<b style="color:var(--text);" id="completeStaffName"></b> — 請掃描運單編號以完成出貨紀錄</p>
-            <input id="inputFinalWaybill" class="scan-input" type="text" placeholder="請掃描運單編號" autocomplete="off">
+            <div class="scan-row">
+              <input id="inputFinalWaybill" class="scan-input" type="text" placeholder="請掃描運單編號" autocomplete="off">
+              <button type="button" class="btn-camera" onclick="openCameraScan(finalizeShipment)" title="用相機掃描">📷</button>
+            </div>
             <div class="row" style="margin-top:12px;">
               <button class="btn green" id="btnConfirm">完成出貨</button>
             </div>
@@ -4133,9 +4136,12 @@ document.getElementById('btnAbort').addEventListener('click', async ()=>{
   }
 });
 
-async function finalizeShipment(){
+async function finalizeShipment(waybillOverride){
   if(!current) return;
-  const waybill = inputFinalWaybill.value.trim();
+  // 「完成出貨」按鈕點擊事件會把 MouseEvent 當成第一個參數傳進來，不是字串，
+  // 這時候還是要照原本邏輯去讀輸入框目前的值；只有真的透過 wireScanInput
+  // 掃描觸發時，才會拿到字串型別的運單號（輸入框那時已經被清空了，不能再讀它）。
+  const waybill = (typeof waybillOverride === 'string' ? waybillOverride : inputFinalWaybill.value).trim();
   const finalMsg = document.getElementById('finalMsg');
   if(!waybill){
     errorBeep();
@@ -4213,7 +4219,7 @@ async function finalizeShipment(){
   renderLog();
 }
 document.getElementById('btnConfirm').addEventListener('click', finalizeShipment);
-inputFinalWaybill.addEventListener('keydown', e=>{ if(e.key==='Enter') finalizeShipment(); });
+wireScanInput(inputFinalWaybill, finalizeShipment);
 
 // ============================================================
 // 出貨紀錄
