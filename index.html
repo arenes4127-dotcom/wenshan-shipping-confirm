@@ -70,6 +70,32 @@
   .scan-input:focus{border-color:var(--blue);outline:none;}
   .scan-input::placeholder{color:var(--muted2);font-size:18px;}
 
+  /* 條碼掃描器現場數量不夠，加相機掃描當備援。按鈕跟輸入框並排，
+     不要單獨佔一列——這是偶爾才用的備援手段，不該搶輸入框的視覺優先權。 */
+  .scan-row{display:flex;gap:8px;align-items:stretch;}
+  .scan-row .scan-input{flex:1;min-width:0;}
+  .btn-camera{flex:none;width:60px;font-size:24px;border-radius:var(--radius);
+    background:var(--panel3);border:2px solid var(--border);color:var(--text);
+    display:flex;align-items:center;justify-content:center;}
+  .btn-camera:active{background:var(--panel2);}
+
+  /* 相機掃描全螢幕覆蓋層 */
+  .camera-mask{position:fixed;inset:0;background:#000;z-index:1200;display:none;flex-direction:column;}
+  .camera-mask.show{display:flex;}
+  .camera-mask video{flex:1;width:100%;object-fit:cover;background:#000;}
+  .camera-mask .frame{position:absolute;left:10%;right:10%;top:38%;height:24%;
+    border:3px solid var(--accent);border-radius:12px;pointer-events:none;
+    box-shadow:0 0 0 2000px rgba(0,0,0,.35);}
+  .camera-mask .top{position:absolute;top:0;left:0;right:0;padding:16px;
+    display:flex;justify-content:space-between;align-items:center;z-index:2;
+    background:linear-gradient(rgba(0,0,0,.6),transparent);}
+  .camera-mask .hint2{position:absolute;bottom:24px;left:0;right:0;text-align:center;
+    color:#fff;font-size:14px;padding:0 20px;z-index:2;text-shadow:0 1px 3px rgba(0,0,0,.8);}
+  .camera-mask .status{position:absolute;top:60px;left:0;right:0;text-align:center;
+    color:#fff;font-size:15px;padding:0 20px;z-index:2;}
+  .camera-mask .close-btn{background:rgba(255,255,255,.15);color:#fff;border:none;
+    border-radius:20px;padding:8px 16px;font-size:14px;}
+
   /* ---- status pill ---- */
   .pill{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:999px;font-size:13px;font-weight:600;}
   .pill.wait{background:var(--panel3);color:var(--muted);}
@@ -384,6 +410,17 @@
     <div class="hintline">點畫面任一處關閉</div>
   </div>
 
+  <div class="camera-mask" id="cameraMask">
+    <div class="top">
+      <span style="color:#fff;font-size:14px;">對準條碼</span>
+      <button class="close-btn" id="btnCameraClose">✕ 取消</button>
+    </div>
+    <video id="cameraVideo" autoplay playsinline muted></video>
+    <div class="frame"></div>
+    <div class="status" id="cameraStatus"></div>
+    <div class="hint2">把條碼放進框框內，會自動辨識，不用按快門</div>
+  </div>
+
   <main>
 
     <!-- ============ 首頁 ============ -->
@@ -476,7 +513,10 @@
           </div>
 
           <div style="margin-top:14px;">
-            <input id="inputBarcode" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+            <div class="scan-row">
+              <input id="inputBarcode" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+              <button type="button" class="btn-camera" onclick="openCameraScan(scanShipmentBarcode)" title="用相機掃描">📷</button>
+            </div>
           </div>
           <div class="row" style="margin-top:12px;">
             <button class="btn gray sm" id="btnAbort">取消此單／重新掃訂單號</button>
@@ -507,7 +547,10 @@
         </label>
         <label class="field" style="margin-bottom:0;">
           <span>掃描或輸入商品條碼／貨號</span>
-          <input id="transferScanInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+          <div class="scan-row">
+            <input id="transferScanInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+            <button type="button" class="btn-camera" onclick="openCameraScan(transferScan)" title="用相機掃描">📷</button>
+          </div>
         </label>
       </div>
 
@@ -568,7 +611,10 @@
       <div class="card" id="pickScanBox">
         <label class="field" style="margin-bottom:8px;">
           <span>掃描商品條碼直接打勾（也可以直接點卡片）</span>
-          <input id="pickBarcodeInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+          <div class="scan-row">
+            <input id="pickBarcodeInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+            <button type="button" class="btn-camera" onclick="openCameraScan(handlePickScan)" title="用相機掃描">📷</button>
+          </div>
         </label>
         <p class="hint" id="pickScanHint" style="margin:0;">掃到的商品會自動打勾；重複掃同一件會提醒，不會被取消。</p>
       </div>
@@ -646,7 +692,10 @@
           <b>同一批要一起搬的（同商品多顏色、多尺寸）可以連續掃，最後一次送出。</b></p>
         <label class="field" style="margin-bottom:10px;">
           <span>掃描或輸入商品條碼／貨號</span>
-          <input id="locSkuInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+          <div class="scan-row">
+            <input id="locSkuInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+            <button type="button" class="btn-camera" onclick="openCameraScan(locScan)" title="用相機掃描">📷</button>
+          </div>
         </label>
         <button class="btn gray block" id="btnShelfQuery">🔍 查詢貨架上有哪些商品</button>
       </div>
@@ -1246,6 +1295,152 @@ function flash(kind, big, sub, ms){
   clearTimeout(flash._t);
   flash._t = setTimeout(()=>{ el.className='flash'; }, ms||900);
 }
+
+// ============================================================
+// 相機掃描（條碼掃描器數量不夠時的備援）
+// ============================================================
+// 設計成「相機解碼出字串後，直接呼叫跟鍵盤輸入完全相同的處理函式」——
+// 出貨/揀貨/儲位/調撥四個掃描點原本就是各自一個 (code) => void 的函式，
+// 呼叫端只要把那個函式傳進來，不用替相機另外寫一套判斷邏輯，兩種輸入方式
+// 也就不會因為各自維護而慢慢長出不一樣的行為。
+//
+// 優先用瀏覽器原生 BarcodeDetector（Android Chrome 有支援，免下載、辨識快）；
+// 沒有的裝置（主要是 iOS Safari）才動態載入 ZXing 當備援，多數人根本不會載到那個檔案。
+let cameraStream = null;
+let cameraRafId = null;
+let cameraZxingReader = null;
+let cameraOnResult = null;
+let zxingLoadPromise = null;
+
+function loadZXing_(){
+  if(window.ZXingBrowser) return Promise.resolve();
+  if(zxingLoadPromise) return zxingLoadPromise;
+  zxingLoadPromise = new Promise(function(resolve, reject){
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js';
+    s.onload = resolve;
+    s.onerror = function(){ reject(new Error('相機掃描元件下載失敗，請檢查網路連線')); };
+    document.head.appendChild(s);
+  });
+  return zxingLoadPromise;
+}
+
+function cameraSetStatus_(text){
+  const el = document.getElementById('cameraStatus');
+  if(el) el.textContent = text || '';
+}
+
+async function openCameraScan(onResult){
+  cameraOnResult = onResult;
+  const mask = document.getElementById('cameraMask');
+  const video = document.getElementById('cameraVideo');
+  mask.classList.add('show');
+  cameraSetStatus_('請允許使用相機權限…');
+
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    cameraSetStatus_('這個瀏覽器不支援相機掃描，請改用實體掃描器或手動輸入');
+    return;
+  }
+
+  try{
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: {facingMode: {ideal: 'environment'}}
+    });
+  }catch(err){
+    // 現場最常見的兩種狀況分開講清楚，不要只丟一句「相機開啟失敗」——
+    // 權限被拒是設定問題，裝置沒相機是硬體問題，人要知道該找哪一邊解決
+    const denied = err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError');
+    cameraSetStatus_(denied
+      ? '沒有取得相機權限，請到瀏覽器設定允許這個網站使用相機'
+      : '找不到可用的相機（' + (err && err.message || err) + '）');
+    return;
+  }
+  video.srcObject = cameraStream;
+  cameraSetStatus_('');
+
+  if('BarcodeDetector' in window){
+    runNativeBarcodeDetector_(video);
+    return;
+  }
+  cameraSetStatus_('第一次使用需要下載掃描元件…');
+  try{ await loadZXing_(); }
+  catch(err){
+    // closeCameraScan() 自己會把狀態文字清成空字串——如果緊接著呼叫，
+    // 使用者根本來不及看到這則訊息，畫面就已經關掉了。
+    // 相機這時候已經開著，鏡頭要關掉，但訊息要留在畫面上讓人讀到，
+    // 所以這裡只清相機資源，不呼叫會一併清掉文字的 closeCameraScan()。
+    cameraSetStatus_(String((err && err.message) || err));
+    if(cameraStream){ cameraStream.getTracks().forEach(function(t){ t.stop(); }); cameraStream = null; }
+    video.srcObject = null;
+    return;
+  }
+  runZXingScan_(video);
+}
+
+function runNativeBarcodeDetector_(video){
+  // 常見1D條碼格式都列進去；code_128最常見（大部分出貨/儲位條碼都是這種），
+  // ean_13/upc_a是零售商品條碼（掃到外包裝上的國際碼時會用到）。
+  const detector = new window.BarcodeDetector({
+    formats: ['code_128', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_39', 'qr_code']
+  });
+  let busy = false;
+  const tick = async function(){
+    if(!cameraStream) return;   // 已經關閉了，不要再排下一輪
+    if(!busy && video.readyState >= 2){
+      busy = true;
+      try{
+        const codes = await detector.detect(video);
+        if(codes && codes.length){
+          handleCameraResult_(codes[0].rawValue);
+          return;   // handleCameraResult_ 會關閉相機，不用再排下一輪
+        }
+      }catch(err){ /* 單一幀解碼失敗很常見（模糊/角度不對），忽略繼續下一幀 */ }
+      busy = false;
+    }
+    cameraRafId = requestAnimationFrame(tick);
+  };
+  cameraRafId = requestAnimationFrame(tick);
+}
+
+function runZXingScan_(video){
+  const Z = window.ZXingBrowser;
+  cameraZxingReader = new Z.BrowserMultiFormatReader();
+  cameraZxingReader.decodeFromStream(cameraStream, video, function(result, err){
+    if(result) handleCameraResult_(result.getText());
+    // err 是「這一幀沒解出東西」的正常情況（NotFoundException），不用理它，
+    // ZXing 自己會繼續下一幀，只有真的解出結果才處理。
+  }).catch(function(err){
+    cameraSetStatus_('相機掃描初始化失敗：' + (err && err.message || err));
+  });
+}
+
+function handleCameraResult_(code){
+  const cb = cameraOnResult;
+  closeCameraScan();
+  if(!code) return;
+  okBeep();
+  if(cb) cb(String(code).trim());
+}
+
+function closeCameraScan(){
+  document.getElementById('cameraMask').classList.remove('show');
+  cameraSetStatus_('');
+  if(cameraRafId){ cancelAnimationFrame(cameraRafId); cameraRafId = null; }
+  if(cameraZxingReader){
+    try{ cameraZxingReader.reset(); }catch(err){}
+    cameraZxingReader = null;
+  }
+  // 一定要把鏡頭關掉，不然使用者離開這個畫面之後相機指示燈還亮著、
+  // 電也一直在耗，而且下次要用相機的APP可能會覺得裝置被佔用打不開。
+  if(cameraStream){
+    cameraStream.getTracks().forEach(function(t){ t.stop(); });
+    cameraStream = null;
+  }
+  const video = document.getElementById('cameraVideo');
+  if(video) video.srcObject = null;
+  cameraOnResult = null;
+}
+document.getElementById('btnCameraClose').addEventListener('click', closeCameraScan);
 
 // ============================================================
 // CSV 解析工具
@@ -3341,11 +3536,11 @@ function closeScanScreen(){
   setTimeout(()=>inputOrder.focus(), 50);
 }
 
-inputBarcode.addEventListener('keydown', e=>{
-  if(e.key !== 'Enter' || !current) return;
-  const code = inputBarcode.value.trim();
-  inputBarcode.value = '';
-  if(!code) return;
+// 拆成獨立函式（不是留在 keydown 裡）是因為相機掃描要呼叫同一套判斷邏輯——
+// 不管條碼是掃描器打字進來的還是相機解碼出來的，「這是不是這張訂單上的東西」
+// 判斷結果都必須一模一樣，不能有兩套邏輯將來各自改壞。
+function scanShipmentBarcode(code){
+  if(!current || !code) return;
   // 先直接比對品號，比對不到再查條碼對照表轉換成品號後重試（掃到外包裝條碼時用）
   let item = current.items.find(i=>i.sku===code);
   if(!item && barcodeMap[code]){
@@ -3372,6 +3567,12 @@ inputBarcode.addEventListener('keydown', e=>{
   okBeep();
   renderItemTable();
   checkComplete();
+}
+inputBarcode.addEventListener('keydown', e=>{
+  if(e.key !== 'Enter' || !current) return;
+  const code = inputBarcode.value.trim();
+  inputBarcode.value = '';
+  scanShipmentBarcode(code);
 });
 
 function renderItemTable(){
