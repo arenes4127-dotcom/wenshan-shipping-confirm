@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.145';
+const BACKEND_VERSION = '2026-08-17.148';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -216,6 +216,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   debugLocLogHeaders_: () => debugLocLogHeaders_(),
   verifyArchiveResult_: () => verifyArchiveResult_(),
   timeGetState_: () => timeGetState_(),
+  timeLookupLocations_: (arg) => timeLookupLocations_(arg),
+  releaseOrderClaimNow_: (arg) => releaseOrderClaimNow_(arg && arg.orderNo),
   diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
   peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
@@ -2517,9 +2519,63 @@ function removeLocFromCell_(raw, target){
   return out.trim().replace(/^[、,，/／]+|[、,，/／]+$/g, '').trim();
 }
 
-// 品號→列號索引。整欄只讀一次，批次移動N件才不會變成N次全表掃描
-//（7,088列，一次讀就要一秒級，批次20件逐件查會慢到不能用）。
+// 品號→列號索引。整欄只讀一次，批次移動N件才不會變成N次全表掃描。
+// 2026-08-17 實測：這張表已經長到 17,087 列（舊註解寫的7,088列是很久以前的數字，
+// 表一直在成長），單純掃這一欄就要1.6秒，佔了整支查詢的大部分時間。而且不是
+// 只有這裡在付這個成本——lookupLocations/lookupLocation/changeLocation/
+// changeLocationBatch每一次呼叫都各自重新掃一次整欄，同一次現場批次掃描作業裡
+// 掃N件条碼就整欄重掃N次。所以加上跨次呼叫的快取（CacheService，5分鐘＋讀寫都
+// 包try/catch，快取壞掉/過期就直接退回原本「重新掃整欄」的行為，不影響正確性，
+// 只是拿不到加速）。
+//
+// 快取的是「品號→列號」這個索引本身，不是儲位內容——每個品號實際的儲位/備註
+// 內容，呼叫端(readLocRow_)每次都還是會用列號現查現讀，不會因為索引被快取就
+// 顯示過期的儲位資料。索引唯一可能過期的情況是「表格本身的列被搬動」，這張表
+// 只有兩個地方會真的刪列（dedupeLocationRows_ 正式執行、testNewItemCreate_
+// 測試清理），兩個都是人手動觸發的維護/測試功能，不是日常操作會經過的路徑，
+// 且兩處都已經補上清快取；新增列(appendLocRow_)只會加在後面不影響既有列號，
+// 一樣補了清快取讓新品能立刻查到，但就算沒清也不會查到錯的資料，只是要等
+// 快取過期才查得到剛新增的那筆（而且这情況本來就有「查不到→視為新品」的
+// 既有備援機制接住）。
+const LOCMAP_INDEX_CACHE_TTL_SEC = 300;
+const LOCMAP_INDEX_CACHE_SHARDS = 10;
+function locIndexCacheKeys_(){
+  const keys = [];
+  for(let i = 0; i < LOCMAP_INDEX_CACHE_SHARDS; i++) keys.push('locIdxV1_' + i);
+  return keys;
+}
+function locIndexCacheGet_(){
+  const cache = CacheService.getScriptCache();
+  const keys = locIndexCacheKeys_();
+  const vals = cache.getAll(keys);
+  if(Object.keys(vals).length < keys.length) return null;   // 任何一片沒中都當全部沒中
+  const idx = {};
+  for(let i = 0; i < keys.length; i++) Object.assign(idx, JSON.parse(vals[keys[i]]));
+  return idx;
+}
+function locIndexCacheSet_(idx){
+  const cache = CacheService.getScriptCache();
+  const keys = locIndexCacheKeys_();
+  const shards = keys.map(function(){ return {}; });
+  Object.keys(idx).forEach(function(k){
+    let h = 0;
+    for(let i = 0; i < k.length; i++) h = (h * 31 + k.charCodeAt(i)) >>> 0;
+    shards[h % keys.length][k] = idx[k];
+  });
+  const payload = {};
+  keys.forEach(function(k, i){ payload[k] = JSON.stringify(shards[i]); });
+  cache.putAll(payload, LOCMAP_INDEX_CACHE_TTL_SEC);
+}
+function locIndexCacheClear_(){
+  CacheService.getScriptCache().removeAll(locIndexCacheKeys_());
+}
+
 function locIndex_(sh){
+  try{
+    const cached = locIndexCacheGet_();
+    if(cached) return cached;
+  }catch(err){ /* 快取讀取失敗就當沒快取，往下照原本邏輯重新掃描 */ }
+
   const lastRow = sh.getLastRow();
   const skus = sh.getRange(2, LOCMAP_COL.sku, lastRow - 1, 1).getValues();
   const idx = {};
@@ -2527,6 +2583,7 @@ function locIndex_(sh){
     const k = String(skus[i][0]||'').trim();
     if(k && idx[k] === undefined) idx[k] = i + 2;
   }
+  try{ locIndexCacheSet_(idx); }catch(err){ /* 存快取失敗不影響這次結果，只是這次沒加速到 */ }
   return idx;
 }
 
@@ -3592,6 +3649,9 @@ function dedupeLocationRows_(opts){
   if(!dryRun && deletable.length){
     deletable.slice().sort(function(a,b){ return b.row - a.row; })
       .forEach(function(d){ dst.deleteRow(d.row); });
+    // 刪列會讓後面所有列往上位移，快取的品號→列號索引整批作廢，一定要清掉
+    // 讓下次查詢重新掃描，不然會拿舊索引對到搬位後的錯誤列號。
+    try{ locIndexCacheClear_(); }catch(err){}
     getSheet(SHEET_SYSLOG, SYSLOG_HEADER).appendRow([nowStamp_(), '儲位主檔去重', '', '',
       '刪除 ' + deletable.length + ' 列重複且空白的品號：'
       + deletable.map(function(d){ return d.sku; }).join('、')]);
@@ -3665,7 +3725,7 @@ function testNewItemCreate_(){
   }catch(err){
     steps.push('\u274c 例外：' + err);
   }finally{
-    if(newRow) sh.deleteRow(newRow);
+    if(newRow){ sh.deleteRow(newRow); try{ locIndexCacheClear_(); }catch(err){} }
     const last = logSh.getLastRow();
     if(last > logBefore){ for(let r = last; r > logBefore; r--) logSh.deleteRow(r); }
     ck(!locIndex_(sh)[sku], '測試列已刪除（' + sku + ' 不在主檔裡了）');
@@ -3819,6 +3879,49 @@ function lookupLocation(body){
   const row = locIndex_(sh)[sku];
   if(!row) return {ok:false, reason:'not_found', sku: sku};
   return readLocRow_(sh, row, sku);
+}
+
+// 暫時性診斷用：跟 lookupLocations 完全一樣的邏輯，但每一步都打時間戳記，
+// 用來查證使用者反映「查詢比較久」實際慢在哪一段。用完可以刪掉，不是常駐功能。
+function timeLookupLocations_(body){
+  const t = {};
+  const mark = function(k){ t[k] = Date.now(); };
+  mark('start');
+
+  const skus = (body && body.skus) || ['3065ST487LU'];
+  const sh = getLocMapSheet_();
+  mark('afterGetLocMapSheet');
+  if(!sh) return {ok:false, error:'找不到分頁'};
+
+  const idx = locIndex_(sh);
+  mark('afterLocIndex');
+
+  const found = [], missing = [];
+  skus.forEach(function(raw){
+    const sku = String(raw||'').trim();
+    if(!sku) return;
+    if(idx[sku]) found.push(readLocRow_(sh, idx[sku], sku));
+    else missing.push(sku);
+  });
+  mark('afterReadRows');
+
+  const newItems = [];
+  if(missing.length){
+    const info = cacheInfoFor_(missing);
+    mark('afterCacheInfoFor');
+    missing.forEach(function(sku){
+      if(info[sku]) newItems.push(Object.assign({isNew:true, location:'', locations:[], note:''}, info[sku]));
+    });
+  }
+
+  const keys = Object.keys(t);
+  const deltas = {};
+  for(let i = 1; i < keys.length; i++){
+    deltas[keys[i-1] + '→' + keys[i]] = (t[keys[i]] - t[keys[i-1]]) + 'ms';
+  }
+  return {ok:true, totalMs: Date.now() - t.start, deltas: deltas,
+          skuCount: skus.length, foundCount: found.length, missingCount: missing.length,
+          locMapLastRow: sh.getLastRow()};
 }
 
 // 一次查多個品號（批次移動用）：整欄只讀一次
@@ -4120,6 +4223,7 @@ function appendLocRow_(sh, sku, baseName){
   sh.getRange(target, LOCMAP_COL.sku).setNumberFormat(typeof sku === 'string' ? '@' : '0');
   sh.getRange(target, LOCMAP_COL.name).setNumberFormat('@');
   sh.getRange(target, LOCMAP_COL.sku, 1, 2).setValues([[sku, baseName || '']]);
+  try{ locIndexCacheClear_(); }catch(err){ /* 清快取失敗頂多晚5分鐘才查得到新品，不影響正確性 */ }
   return target;
 }
 
@@ -5614,6 +5718,23 @@ function inspectSourceSpreadsheet_(ssId){
 }
 
 // 把所有逾時的認領一次放回待出貨。每次同步（自動排程4次＋手動按同步）都會跑一次。
+// 手動立即釋放「單一」訂單的認領狀態，不受 STALE_CLAIM_MINUTES 時限限制——
+// releaseStaleClaims_ 只處理「久放沒人管」的逾時認領，這支是給「剛剛才誤觸發認領、
+// 現在就要馬上放回去」這種情境用（例如測試/誤操作意外呼叫了 claimOrder）。
+// 2026-08-17：測試相機掃描訂單號功能時，不小心對正式後端的真實訂單
+// 2608126M46EH1T 呼叫到 claimOrder，用這支函式立刻放回去，避免真的包貨人員
+// 看到這張訂單顯示「處理中」而困惑。
+function releaseOrderClaimNow_(orderNo){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const rows = readOrderRows();
+  const r = rows.find(function(x){ return x.orderNo === orderNo; });
+  if(!r) return {ok:false, error:'找不到訂單 ' + orderNo};
+  if(r.status !== 'scanning') return {ok:false, error:'訂單目前狀態是「' + r.status + '」，不是 scanning，不需要釋放'};
+  sh.getRange(r._row, colOf(ORDERS_HEADER,'status'), 1, 3).setValues([[statusToText('pending'), '', '']]);
+  appendSysLog_('手動立即釋放認領', orderNo, r.claimedBy, '非逾時、人工立即釋放（原認領時間 ' + r.claimedAt + '）');
+  return {ok:true, orderNo: orderNo, wasClaimedAt: r.claimedAt, wasClaimedBy: r.claimedBy};
+}
+
 function releaseStaleClaims_(){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const rows = readOrderRows();

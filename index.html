@@ -485,7 +485,10 @@
         </div>
 
         <div id="stage-order">
-          <input id="inputOrder" class="scan-input" type="text" placeholder="請掃描訂單號" autocomplete="off">
+          <div class="scan-row">
+            <input id="inputOrder" class="scan-input" type="text" placeholder="請掃描訂單號" autocomplete="off">
+            <button type="button" class="btn-camera" onclick="openCameraScan(scanOrder)" title="用相機掃描">📷</button>
+          </div>
           <p class="hint" style="margin-top:14px;">用掃描機（鍵盤模擬模式）對準訂單條碼掃描，或用鍵盤輸入後按 Enter。</p>
         </div>
 
@@ -581,7 +584,10 @@
       <div class="card" id="pickSingleBox">
         <label class="field" style="margin-bottom:8px;">
           <span>掃描或輸入訂單號</span>
-          <input id="pickOrderInput" class="scan-input" type="text" placeholder="請掃描訂單號" autocomplete="off">
+          <div class="scan-row">
+            <input id="pickOrderInput" class="scan-input" type="text" placeholder="請掃描訂單號" autocomplete="off">
+            <button type="button" class="btn-camera" onclick="openCameraScan(scanPickOrder)" title="用相機掃描">📷</button>
+          </div>
         </label>
         <div class="row">
           <button class="btn gray sm" id="btnPickClearOrder">換一張</button>
@@ -3460,9 +3466,8 @@ const inputOrder = document.getElementById('inputOrder');
 const inputBarcode = document.getElementById('inputBarcode');
 const inputFinalWaybill = document.getElementById('inputFinalWaybill');
 
-inputOrder.addEventListener('keydown', async e=>{
-  if(e.key !== 'Enter') return;
-  const code = inputOrder.value.trim();
+async function scanOrder(code){
+  code = String(code||'').trim();
   inputOrder.value = '';
   if(!code) return;
   if(!currentStaffId || !staff.find(s=>s.id===currentStaffId)){
@@ -3576,7 +3581,8 @@ inputOrder.addEventListener('keydown', async e=>{
         markClaimUnverified(code, mySession, err.message);
       });
   }
-});
+}
+wireScanInput(inputOrder, scanOrder);
 
 // ---- 離線容錯：認領沒拿到也讓人員繼續掃，背景持續重試 ----
 // 網路斷線時無法確認別人有沒有在處理同一張。這裡選擇讓人員繼續作業（現場斷線多半只是一下下），
@@ -4635,10 +4641,10 @@ function focusPickScan(){
   }, 60);
 }
 
-document.getElementById('pickOrderInput').addEventListener('keydown', async e=>{
-  if(e.key !== 'Enter') return;
-  const code = e.target.value.trim();
-  e.target.value = '';
+async function scanPickOrder(code){
+  const el = document.getElementById('pickOrderInput');
+  code = String(code||'').trim();
+  el.value = '';
   if(!code) return;
   const o = orders[code];
   if(!o || o.status !== 'pending' || isManuallyClosed(o)){
@@ -4652,7 +4658,8 @@ document.getElementById('pickOrderInput').addEventListener('keydown', async e=>{
   okBeep();
   renderPickList();
   focusPickScan();
-});
+}
+wireScanInput(document.getElementById('pickOrderInput'), scanPickOrder);
 document.getElementById('btnPickClearOrder').addEventListener('click', async ()=>{
   if(!(await confirmLeaveOrder())) return;
   pickCurrentOrder = '';
