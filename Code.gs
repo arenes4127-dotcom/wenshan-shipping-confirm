@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.128';
+const BACKEND_VERSION = '2026-08-17.130';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -98,7 +98,11 @@ const HEADER_LABELS = {
   pickedJson:'已揀品項(JSON)', specialNote:'特殊註記', pickerId:'揀貨人工號', pickerName:'揀貨人姓名', location:'儲位', action:'動作', kind:'類型', result:'揀貨結果',
   itemsOverrideJson:'品項修改(JSON)',
   pickDoneAt:'揀貨完成時間', pickDoneBy:'揀貨完成人',
-  createdAt:'進單時間', pickStartAt:'開始揀貨時間', shipStartAt:'開始掃描時間', shipDoneAt:'出貨完成時間'
+  createdAt:'進單時間', pickStartAt:'開始揀貨時間', shipStartAt:'開始掃描時間', shipDoneAt:'出貨完成時間',
+  // 調撥驗收
+  batchId:'調撥批次', unit:'單位', reason:'原因', price:'零售價', priceTotal:'零售合計',
+  extraNote:'其他欄位備註', scannedQty:'已掃數量', importedAt:'匯入時間', importedBy:'匯入人員',
+  doneAt:'完成時間', checkerId:'驗收人員工號', checkerName:'驗收人員姓名'
 };
 
 function doGet(e){
@@ -203,6 +207,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   testNewItemCreate_: () => testNewItemCreate_(),
   setupTransferStageSheet_: () => setupTransferStageSheet_(),
   testTransferFlow_: () => testTransferFlow_(),
+  debugTransferHeaders_: () => debugTransferHeaders_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
   testApplyItemOps_: () => testApplyItemOps_(),
@@ -2461,7 +2466,9 @@ const SHEET_TRANSFER = '調撥單';
 const SHEET_TRANSFERLOG = '調撥驗收紀錄';
 const TRANSFER_HEADER = ['batchId','sku','baseName','spec','qty','unit','reason','price',
   'priceTotal','extraNote','scannedQty','status','importedAt','importedBy','doneAt'];
-const TRANSFERLOG_HEADER = ['logTime','batchId','sku','baseName','staffId','staffName','result','note'];
+// staffId/staffName/result 這三個代碼在別的分頁已經有「包貨人員」「揀貨結果」的翻譯，
+// 借用會顯示錯的語境（這裡是驗收，不是包貨也不是揀貨），改用不撞名的代碼。
+const TRANSFERLOG_HEADER = ['logTime','batchId','sku','baseName','checkerId','checkerName','checkResult','note'];
 // ERP匯出的欄位標籤不保證每次都一樣（親眼見過同一份調撥單新舊格式的E欄一個是「數量」
 // 一個是「轉撥數量」），所以不認欄位「在第幾欄」，改成認「表頭寫什麼字」，
 // 貼上的表頭不管長怎樣、順序怎麼排都認得出來。認不出來的欄位（圖片/轉出庫/轉入庫/
@@ -2645,8 +2652,8 @@ function scanTransferBatch(ops){
       vals[idx][col.doneAt] = '';
       changedRows[idx] = true;
       logRows.push({logTime: time, batchId: vals[idx][col.batchId], sku: sku,
-        baseName: vals[idx][col.baseName], staffId: op.staffId || '', staffName: op.staffName || '',
-        result: 'undo', note: ''});
+        baseName: vals[idx][col.baseName], checkerId: op.staffId || '', checkerName: op.staffName || '',
+        checkResult: 'undo', note: ''});
       results.push({ok:true, sku: sku, row: idx + 2, scannedQty: scanned - 1,
         qty: vals[idx][col.qty], status: 'open', undo: true});
       return;
@@ -2654,7 +2661,7 @@ function scanTransferBatch(ops){
     const idx = findOpenRow(sku);
     if(idx < 0){
       logRows.push({logTime: time, batchId: '', sku: sku, baseName: '',
-        staffId: op.staffId || '', staffName: op.staffName || '', result: 'no_match', note: ''});
+        checkerId: op.staffId || '', checkerName: op.staffName || '', checkResult: 'no_match', note: ''});
       results.push({ok:false, reason:'no_match', sku: sku});
       return;
     }
@@ -2666,8 +2673,8 @@ function scanTransferBatch(ops){
     if(done) vals[idx][col.doneAt] = time;
     changedRows[idx] = true;
     logRows.push({logTime: time, batchId: vals[idx][col.batchId], sku: sku,
-      baseName: vals[idx][col.baseName], staffId: op.staffId || '', staffName: op.staffName || '',
-      result: 'matched', note: ''});
+      baseName: vals[idx][col.baseName], checkerId: op.staffId || '', checkerName: op.staffName || '',
+      checkResult: 'matched', note: ''});
     results.push({ok:true, sku: sku, row: idx + 2, batchId: vals[idx][col.batchId],
       baseName: vals[idx][col.baseName], scannedQty: newScanned, qty: qty,
       status: vals[idx][col.status]});
@@ -2761,7 +2768,7 @@ function mirrorTransferToWorkspace_(){
   sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 2, TRANSFER_MIRROR_MAX_ROWS, 8).setValues(itemBlock);
 
   const logs = readRows(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER)
-    .filter(function(r){ return r.result === 'matched' && visibleIds[r.batchId]; })
+    .filter(function(r){ return r.checkResult === 'matched' && visibleIds[r.batchId]; })
     .slice(-TRANSFER_MIRROR_MAX_ROWS);
   const pBlock = [];
   for(let i = 0; i < TRANSFER_MIRROR_MAX_ROWS; i++){ pBlock.push([logs[i] ? logs[i].sku : '']); }
@@ -2780,6 +2787,14 @@ function mirrorTransferScheduled_(){
 // 「調撥驗收」分頁（別人也在看的正式檔案）。做法：全程只用一個 ZZ 開頭、
 // 真實資料不可能撞到的測試品號，測完把後端的測試列刪乾淨，
 // 再手動呼叫一次鏡射，把工作區那邊也沖乾淨（讓它變回只反映真實資料的樣子）。
+// 唯讀診斷：確認調撥相關分頁目前實際顯示的表頭文字（getSheet 會照 HEADER_LABELS
+// 翻譯，沒登記在裡面的欄位代碼會直接顯示英文，這個函式就是用來抓漏。
+function debugTransferHeaders_(){
+  const t = getSheet(SHEET_TRANSFER, TRANSFER_HEADER).getRange(1,1,1,TRANSFER_HEADER.length).getDisplayValues()[0];
+  const l = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER).getRange(1,1,1,TRANSFERLOG_HEADER.length).getDisplayValues()[0];
+  return {調撥單: t, 調撥驗收紀錄: l};
+}
+
 function testTransferFlow_(){
   const steps = [];
   const ck = function(c, m){ steps.push((c ? '✅ ' : '❌ ') + m); };
