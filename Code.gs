@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.136';
+const BACKEND_VERSION = '2026-08-17.141';
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -208,6 +208,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   dedupeLocationRows_: () => dedupeLocationRows_({dryRun:false}),
   previewDedupeLocationRows_: () => dedupeLocationRows_({dryRun:true}),
   testNewItemCreate_: () => testNewItemCreate_(),
+  markSystemSheetsWithNotes_: () => markSystemSheetsWithNotes_(),
+  debugTransferStageA4A5_: () => debugTransferStageA4A5_(),
   setupTransferStageSheet_: () => setupTransferStageSheet_(),
   testTransferFlow_: () => testTransferFlow_(),
   debugTransferHeaders_: () => debugTransferHeaders_(),
@@ -294,6 +296,65 @@ function authorizeDriveAccess_(){
   Logger.log('時間觸發器管理權限授權成功。');
 }
 
+// 這幾張分頁完全由程式讀寫（掃描、匯入、排程都會直接改資料），
+// 人手動改欄位或資料，輕則下次系統寫入時被蓋掉、重則欄位對不上造成資料錯位——
+// 這種錯不會報錯，只會在某個沒人注意的地方悄悄算錯。所以每張都掛一個附註提醒。
+const SYSTEM_SHEET_WARNING = [
+  '\u26a0\ufe0f 此分頁由「文山出貨確認系統」自動讀寫，不是給人手動填的表單。',
+  '請勿手動新增、刪除欄位，或直接修改儲存格內容——',
+  '下次系統寫入時可能被覆蓋，欄位順序被打亂更會讓資料整批對錯位置，而且不會有任何錯誤提示。',
+  '有異動需求請透過 APP 操作，或找系統維護人員。'
+].join('\n');
+// 「訂單」多一句：這張表雖然大部分是系統維護，但「人工結案」那一欄是刻意留給人用下拉選的。
+const ORDERS_SHEET_WARNING = [SYSTEM_SHEET_WARNING, '',
+  '例外：「人工結案」欄位是設計給人工用下拉選單選擇的，這一欄可以正常手動選。'
+].join('\n');
+// 「人員」的理由更具體：APP 存人員名單時會把這張表整份清掉重寫，手動改的東西留不住。
+const STAFF_SHEET_WARNING = [
+  '\u26a0\ufe0f 建議透過 APP「人員管理」新增／刪除人員，不要直接改這張表。',
+  '原因：APP 存人員名單時（新增/刪除任何一位），這張表會被整份清空重寫一次，',
+  '直接在這裡手動改的內容會在下一次存檔時被蓋掉，不會保留。'
+].join('\n');
+// 故意做成函式、不是頂層 const 直接組物件：SHEET_LOCLOG / SHEET_TRANSFER / SHEET_TRANSFERLOG
+// 這幾個代碼宣告在檔案後面幾千行的地方，頂層程式碼是照順序整份執行的，
+// 在它們宣告「之前」的地方就引用，會直接丟 ReferenceError 把整個後端弄掛
+// （這個坑真的踩過——部署後 doPost 直接回「Cannot access 'SHEET_LOCLOG' before initialization」，
+// 所有API瞬間全部打不通）。包成函式、等被呼叫時才組物件，那時候整份檔案早就載入完了。
+function systemSheetNotesMap_(){
+  const notes = {};
+  notes[SHEET_ORDERS] = ORDERS_SHEET_WARNING;
+  notes[SHEET_STAFF] = STAFF_SHEET_WARNING;
+  [SHEET_LOG, SHEET_SYSLOG, SHEET_PICKLOG, SHEET_LOCLOG, SHEET_TRANSFER, SHEET_TRANSFERLOG]
+    .forEach(function(n){ notes[n] = SYSTEM_SHEET_WARNING; });
+  // 這 5 張版面是自訂的（不是走 getSheet()），各自的建立函式裡本來就有各自的附註，
+  // 這裡是給「回填」用的同一套文字，跟那幾個函式裡寫的內容一致。
+  notes[SHEET_DASHBOARD] = [SYSTEM_SHEET_WARNING, '',
+    '這頁另外全部是公式，手動改任何一格會把公式蓋掉、那一格就不會再自動更新。'].join('\n');
+  notes[SHEET_KPI] = [SYSTEM_SHEET_WARNING, '',
+    '這頁的數字全部是公式算出來的，手動改任何一格會把公式蓋掉、那一格就不會再自動更新。'].join('\n');
+  notes[SHEET_DAILY_STATS] = SYSTEM_SHEET_WARNING;
+  notes[SHEET_DETAIL] = [SYSTEM_SHEET_WARNING, '',
+    '這頁每次同步都會整份重建，手動改的內容留不住。'].join('\n');
+  notes[SHEET_PRODUCT_IMAGE] = [SYSTEM_SHEET_WARNING, '',
+    '這頁每次匯入都會整份重建，手動改的內容留不住。'].join('\n');
+  return notes;
+}
+
+// 一次性：把警語附註補回已經存在的分頁（新分頁在 getSheet() 建立當下就會自動附上，
+// 這個函式是給部署當下就已經存在的舊分頁用的，之後不需要再跑）。
+function markSystemSheetsWithNotes_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const notes = systemSheetNotesMap_();
+  const done = [], missing = [];
+  Object.keys(notes).forEach(function(name){
+    const sh = ss.getSheetByName(name);
+    if(!sh){ missing.push(name); return; }
+    sh.getRange(1, 1).setNote(notes[name]);
+    done.push(name);
+  });
+  return {ok:true, 已加附註: done, 分頁不存在略過: missing};
+}
+
 function getSheet(name, header){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(name);
@@ -305,6 +366,9 @@ function getSheet(name, header){
   if(!sh){
     sh = ss.insertSheet(name);
     sh.appendRow(displayHeader);
+    // 新建立的分頁如果是系統維護清單裡的一員，當下就把警語附上，不用等回填函式。
+    const note = systemSheetNotesMap_()[name];
+    if(note) sh.getRange(1, 1).setNote(note);
   } else {
     // 不管是剛建立、沿用舊分頁、或標題被手動改過，都強制對齊成目前這套中文標題
     sh.getRange(1, 1, 1, displayHeader.length).setValues([displayHeader]);
@@ -908,6 +972,8 @@ function setupKpiSheet_(){
   };
 
   sh.getRange('A1').setValue('📊 揀貨・出貨 KPI（資料來源：每日統計，每天20:00寫入一列）');
+  sh.getRange('A1').setNote([SYSTEM_SHEET_WARNING, '',
+    '這頁的數字全部是公式算出來的，手動改任何一格會把公式蓋掉、那一格就不會再自動更新。'].join('\n'));
   sh.getRange('A1:H1').merge().setFontSize(15).setFontWeight('bold')
     .setBackground('#1c4587').setFontColor('#ffffff');
   sh.getRange('A2').setFormula('="更新於 "&TEXT(NOW(),"yyyy/MM/dd HH:mm")&"　｜　每日統計目前 "&COUNTA(' + D + '!$' + dateCol + '$2:$' + dateCol + ')&" 天資料"');
@@ -1041,6 +1107,7 @@ function appendDailyStats_(){
   // 欄位只增不減、也不改順序，既有資料才不會錯位（跟訂單分頁同一個原則）。
   sh.getRange(1, 1, 1, header.length).setValues([header])
     .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange('A1').setNote(SYSTEM_SHEET_WARNING);
   // 同一天重複執行就覆蓋那一列，不要多寫一列——手動補跑或觸發器重試都可能發生，
   // 一天兩列會讓之後任何加總、平均都默默算錯。
   const lastRow = sh.getLastRow();
@@ -1380,6 +1447,8 @@ function setupDashboardSheet_(){
   sh.getRange('A1').setValue('文山出貨　即時儀表板');
   sh.getRange('A1:O1').merge().setFontSize(18).setFontWeight('bold')
     .setBackground('#1c4587').setFontColor('#ffffff').setHorizontalAlignment('center');
+  sh.getRange('A1').setNote([SYSTEM_SHEET_WARNING, '',
+    '這頁另外全部是公式，手動改任何一格會把公式蓋掉、那一格就不會再自動更新。'].join('\n'));
   sh.getRange('A2').setFormula(
     '="資料即時連動，開啟或來源異動時自動更新　｜　本頁最後計算時間："&TEXT(NOW(),"yyyy/MM/dd HH:mm:ss")'
   );
@@ -2023,6 +2092,8 @@ function rebuildOrderDetailSheet_(){
   });
   sh.clearContents();
   sh.getRange(1, 1, 1, DETAIL_DISPLAY_HEADER.length).setValues([DETAIL_DISPLAY_HEADER]);
+  sh.getRange('A1').setNote([SYSTEM_SHEET_WARNING, '',
+    '這頁每次同步都會整份重建，手動改的內容留不住。'].join('\n'));
   if(out.length){
     sh.getRange(2, 1, out.length, DETAIL_DISPLAY_HEADER.length).setValues(out);
   }
@@ -2485,7 +2556,7 @@ const TRANSFER_FIELD_ALIASES = {
   qty: ['數量', '轉撥數量'], unit: ['單位'], reason: ['原因'],
   price: ['零售價', '售價'], priceTotal: ['零售合計', '合計']
 };
-const TRANSFER_STAGE_FIRST_ROW = 5;   // 表頭（貼上的第一列）落在這一列，資料從下一列開始
+const TRANSFER_STAGE_FIRST_ROW = 6;   // 表頭（貼上的第一列）落在這一列，資料從下一列開始
 
 // 貼上的資料夾在暫存分頁，這裡建立那張分頁：說明、匯入人員、確認匯入勾選框。
 function setupTransferStageSheet_(){
@@ -2516,7 +2587,7 @@ function setupTransferStageSheet_(){
 
   sh.getRange('A4:L4').merge();
   sh.getRange('A4').setValue([
-      '① 把 ERP 匯出的調撥單資料整塊貼在下面第5列開始（要含最上面那一列表頭，例如「品號 品名 規格 數量…」）。',
+      '① 把 ERP 匯出的調撥單資料整塊貼在下面第' + TRANSFER_STAGE_FIRST_ROW + '列開始（要含最上面那一列表頭，例如「品號 品名 規格 數量…」）。',
       '② 貼哪個欄位都可以，程式會照表頭文字自動對應，認不得的欄位會原樣保留在備註裡不會遺漏。',
       '③ 上面選好「匯入人員」、勾選「確認匯入」送出。送出後這裡會清空，可以貼下一張調撥單。',
       '驗收（掃描核對）在 APP「調撥」頁進行，不用在這裡操作。'
@@ -2524,17 +2595,19 @@ function setupTransferStageSheet_(){
     .setFontSize(10).setFontColor('#666666').setWrap(true).setVerticalAlignment('middle');
   sh.setRowHeight(4, 74);
 
-  sh.getRange(TRANSFER_STAGE_FIRST_ROW - 1, 1, 1, 1)
-    .setValue('↓ 從這裡開始貼上（含表頭）').setFontColor('#999999').setFontStyle('italic');
-  // 附註直接掛在真正要點的那一格上，滑鼠移過去就跳出來——
-  // 不要只靠上面那行文字提示，人常常看不出箭頭是指這一格還是再下一格。
-  sh.getRange(TRANSFER_STAGE_FIRST_ROW, 1).setNote([
-    '就是這裡：點這一格，把 ERP 匯出的調撥單資料整塊貼上（Ctrl+V）。',
-    '要含最上面那一列表頭（品號/品名/規格/數量…），不能只貼資料不貼表頭。',
-    '貼在第幾欄不用計較，程式是照表頭文字對應，不是照欄位位置。'
-  ].join('\n'));
+  // 原本這行跟上面①②③的說明擠在同一列，會把說明蓋掉——現在自己獨立一列，
+  // 而且直接把「就是這裡」的完整提醒寫成看得到的文字，不要只靠滑鼠移過去才跳出來的附註，
+  // 人常常不知道要去點哪一格才有附註可以看。
+  sh.getRange('A5:L5').merge();
+  sh.getRange('A5').setValue(
+      '↓ 從這裡開始貼上（含表頭）：點下面這一格，把 ERP 匯出的調撥單資料整塊貼上（Ctrl+V）。' +
+      '要含最上面那一列表頭（品號/品名/規格/數量…），不能只貼資料不貼表頭；貼在第幾欄不用計較，程式是照表頭文字對應，不是照欄位位置。'
+    )
+    .setFontSize(11).setFontColor('#1c4587').setFontWeight('bold').setWrap(true).setVerticalAlignment('middle');
+  sh.setRowHeight(5, 40);
+
   [70, 110, 110, 260, 90, 90, 90, 130, 90, 90, 90, 90].forEach(function(w, i){ sh.setColumnWidth(i + 1, w); });
-  sh.setFrozenRows(4);
+  sh.setFrozenRows(5);
   return {ok:true, 分頁: SHEET_TRANSFER_STAGE};
 }
 
@@ -2813,12 +2886,18 @@ function peekTransferStage_(){
     ? sh.getRange(TRANSFER_STAGE_FIRST_ROW, 1, last - TRANSFER_STAGE_FIRST_ROW + 1, sh.getLastColumn()).getValues()
     : [];
   const hasData = from5.some(function(r){ return r.some(function(v){ return String(v||'').trim(); }); });
-  return {exists:true, lastRow:last, 第5列起有資料: hasData,
-          A5附註: sh.getRange(TRANSFER_STAGE_FIRST_ROW, 1).getNote()};
+  return {exists:true, lastRow:last, 貼上目標列: TRANSFER_STAGE_FIRST_ROW,
+          該列起有資料: hasData,
+          第5列可見提示文字: sh.getRange('A5').getDisplayValue()};
 }
 
 function debugLocLogHeaders_(){
   return {儲位異動紀錄: getSheet(SHEET_LOCLOG, LOCLOG_HEADER).getRange(1,1,1,LOCLOG_HEADER.length).getDisplayValues()[0]};
+}
+
+function debugTransferStageA4A5_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_TRANSFER_STAGE);
+  return {A4: sh.getRange('A4').getDisplayValue(), A5: sh.getRange('A5').getDisplayValue()};
 }
 
 function debugTransferHeaders_(){
@@ -4104,6 +4183,8 @@ function importProductImages_(){
   Object.keys(specMap).forEach(function(k){ allSkus[k] = 1; });
   const out = Object.keys(allSkus).map(function(k){ return [k, map[k] || '', specMap[k] || '']; });
   sh.getRange(1, 1, 1, 3).setValues([['貨號','圖片ID','規格圖ID']]).setFontWeight('bold');
+  sh.getRange('A1').setNote([SYSTEM_SHEET_WARNING, '',
+    '這頁每次匯入都會整份重建，手動改的內容留不住。'].join('\n'));
   if(out.length){
     // 貨號欄設成文字格式：有些貨號是純數字，被當數字會掉前導零、長的還會變科學記號
     sh.getRange(2, 1, out.length, 1).setNumberFormat('@');
