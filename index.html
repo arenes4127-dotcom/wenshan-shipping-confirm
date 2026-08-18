@@ -385,6 +385,22 @@
     </div>
   </div>
 
+  <div class="confirm-mask" id="locAuditMask">
+    <div class="confirm-box" style="max-width:520px;">
+      <h3>盤點儲位：<span class="loc-badge" id="auditLocLabel" style="font-size:16px;"></span></h3>
+      <p class="hint" style="margin-top:0;">把這個位置上實際擺著的商品一件一件掃過，掃到但地圖上還沒登記在這個儲位的，按「完成盤點」時會自動幫它加上這個儲位（不會動到它原本其他的存放點）。</p>
+      <div class="scan-row">
+        <input id="auditScanInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+        <button type="button" class="btn-camera" onclick="openCameraScan(auditScan)" title="用相機掃描">📷</button>
+      </div>
+      <div id="auditResult"></div>
+      <div class="row" style="margin-top:12px;gap:8px;">
+        <button class="btn gray" id="auditCancel">取消</button>
+        <button class="btn green" id="auditFinish" style="flex:1;">完成盤點</button>
+      </div>
+    </div>
+  </div>
+
   <div class="confirm-mask" id="sibMask">
     <div class="confirm-box">
       <h3 id="sibTitle">同款其他規格</h3>
@@ -2811,6 +2827,7 @@ function renderShelfResult(){
       '<span class="loc-badge">' + escapeHtml(loc) + '</span>' +
       '<span class="hint">' + list.length + ' 個品號</span>' +
       '<button class="btn gray sm" onclick="addShelfGroupToBatch(\'' + escapeHtml(safe) + '\')">整格加入異動清單</button>' +
+      '<button class="btn gray sm" onclick="startLocAudit(\'' + escapeHtml(safe) + '\')">📋 盤點這個儲位</button>' +
       '</div>';
     html += list.map(function(it){
       const zero = !it.stockWs && !it.stockMain;
@@ -2848,6 +2865,131 @@ function addShelfGroupToBatch(loc){
   okBeep();
   flash('ok', loc + ' 整格加入 ' + picked.length + ' 個品號', '關掉查詢就可以指定新位置', 2400);
   renderLocBatch();
+}
+
+// ================= 儲位盤點（選定一個儲位，掃現場實際有的東西比對） =================
+// 跟上面「整格加入異動清單」不一樣：那個是「地圖說這裡有什麼→我要搬去哪」，
+// 這裡反過來是「現場實際擺什麼→跟地圖記錄的比對，缺登記的自動補上」。
+// 只補（mode:'add'），不會因為現場沒掃到某個品號就把它從這個儲位移除——
+// 盤點當下漏掃很正常，不能因為漏掃就誤判成「東西不見了」而動了資料。
+let auditTarget = '';       // 正在盤點的儲位字串，例如 "K09-1"
+let auditExisting = {};     // 地圖上原本就登記在這個儲位的品號 {sku: item}
+let auditConfirmed = {};    // 掃到、且地圖上本來就有登記的品號（核對一致）
+let auditNew = {};          // 掃到、但地圖上這個儲位還沒登記的品號（完成盤點時會新增）
+
+function startLocAudit(loc){
+  if(!shelfResult) return;
+  auditTarget = loc;
+  auditExisting = {};
+  shelfResult.items.filter(function(it){ return it.matched === loc; })
+    .forEach(function(it){ auditExisting[it.sku] = it; });
+  auditConfirmed = {};
+  auditNew = {};
+  document.getElementById('auditLocLabel').textContent = loc;
+  renderAuditUi();
+  document.getElementById('shelfMask').classList.remove('show');
+  document.getElementById('locAuditMask').classList.add('show');
+  setTimeout(function(){ const el = document.getElementById('auditScanInput'); if(el) el.focus(); }, 50);
+}
+
+async function auditScan(code){
+  const raw = String(code||'').trim();
+  if(!raw) return;
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位盤點要連上後端才能用',1800); return; }
+  const cands = [raw].concat(barcodeMap[raw] || []);
+  const alreadyScanned = cands.some(function(k){ return auditConfirmed[k] || auditNew[k]; });
+  if(alreadyScanned){ errorBeep(); flash('err','這件剛剛掃過了', raw, 1400); return; }
+
+  // 先看地圖上原本記錄的資料裡有沒有——這個不用等後端，反應更快，
+  // 而且盤點時「本來就在這裡」是最常見的情況。
+  const hitExisting = cands.filter(function(k){ return auditExisting[k]; });
+  if(hitExisting.length){
+    hitExisting.forEach(function(k){ auditConfirmed[k] = auditExisting[k]; });
+    okBeep();
+    renderAuditUi();
+    setTimeout(function(){ const el = document.getElementById('auditScanInput'); if(el) el.focus(); }, 40);
+    return;
+  }
+
+  let res;
+  try{ res = await apiPost('lookupLocations', {skus: cands}); }
+  catch(err){ errorBeep(); flash('err','查詢失敗', err.message||'', 1800); return; }
+  const found = (res && res.found) || [];
+  const fresh = (res && res.newItems) || [];
+  const rows = found.concat(fresh);
+  if(!rows.length){
+    errorBeep();
+    flash('err','查不到這個貨號', '「' + raw + '」儲位主檔和庫存主檔都沒有，請確認條碼', 2800);
+    return;
+  }
+  rows.forEach(function(f){
+    if(auditExisting[f.sku]){ auditConfirmed[f.sku] = auditExisting[f.sku]; }
+    else if(!auditNew[f.sku]){ auditNew[f.sku] = f; }
+  });
+  okBeep();
+  renderAuditUi();
+  setTimeout(function(){ const el = document.getElementById('auditScanInput'); if(el) el.focus(); }, 40);
+}
+
+function renderAuditUi(){
+  const box = document.getElementById('auditResult');
+  const existingCount = Object.keys(auditExisting).length;
+  const confirmedCount = Object.keys(auditConfirmed).length;
+  const newList = Object.keys(auditNew).map(function(k){ return auditNew[k]; });
+  let html = '<div class="q-sum">地圖上原本登記 <b>' + existingCount + '</b> 件，'
+    + '已核對到 <b>' + confirmedCount + '</b> 件'
+    + (newList.length ? '，另外掃到 <b style="color:var(--accent);">' + newList.length + '</b> 件地圖上還沒登記在這裡' : '')
+    + '。</div>';
+  if(newList.length){
+    html += '<div class="q-group"><div class="head"><span class="hint">完成盤點時會幫這些加上「' + escapeHtml(auditTarget) + '」</span></div>';
+    html += newList.map(function(it){
+      return '<div class="q-item">' + thumbHtml(it.sku, it.baseName) +
+        '<div class="t"><b>' + escapeHtml(it.sku) + '</b>' +
+          '<div>' + escapeHtml((it.baseName || '').slice(0, 46)) + '</div>' +
+          (it.location ? '<div style="color:var(--muted);">目前在 ' + escapeHtml(it.location) + '</div>'
+                        : '<div style="color:var(--muted);">目前沒有登記儲位</div>') +
+        '</div></div>';
+    }).join('');
+    html += '</div>';
+  }
+  box.innerHTML = html;
+}
+
+async function finishLocAudit(){
+  const skus = Object.keys(auditNew);
+  if(!skus.length){
+    document.getElementById('locAuditMask').classList.remove('show');
+    flash('ok','盤點完成','跟地圖記錄的一致，沒有需要新增的品號',2200);
+    return;
+  }
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位盤點要連上後端才能用',1800); return; }
+  const staffObj = staff.find(function(s){ return s.id === document.getElementById('locStaffSelect').value; });
+  if(!staffObj){ errorBeep(); flash('err','請先選擇人員','儲位那頁上方要選一個人員才能送出',1800); return; }
+  const btn = document.getElementById('auditFinish');
+  btn.disabled = true;
+  let res;
+  try{
+    res = await apiPost('changeLocationBatch', {
+      skus: skus, toLocation: auditTarget, mode: 'add', kind: '盤點調整',
+      createIfMissing: true, staffId: staffObj.id, staffName: staffObj.name,
+      note: '儲位盤點：現場掃到，地圖上原本沒登記在這個儲位'
+    });
+  }catch(err){
+    btn.disabled = false;
+    errorBeep(); flash('err','送出失敗', err.message||'', 2200);
+    return;
+  }
+  btn.disabled = false;
+  if(!res || !res.okCount){
+    errorBeep();
+    flash('err','新增失敗', (res && res.results && res.results[0] && res.results[0].error) || '', 2400);
+    return;
+  }
+  okBeep();
+  document.getElementById('locAuditMask').classList.remove('show');
+  flash('ok', auditTarget + ' 盤點完成', '新增了 ' + res.okCount + ' 個品號的儲位登記'
+    + (res.failCount ? '（' + res.failCount + ' 個失敗，可能剛好被別人異動）' : ''), 3000);
+  shelfResult = null;   // 資料已經變了，關掉的查詢結果不能再用，下次重開要重查
 }
 
 // ================= 調撥驗收 =================
@@ -4618,6 +4760,14 @@ document.getElementById('qClose').addEventListener('click', function(){
 });
 document.getElementById('shelfMask').addEventListener('click', function(e){
   if(e.target === document.getElementById('shelfMask')) document.getElementById('shelfMask').classList.remove('show');
+});
+wireScanInput(document.getElementById('auditScanInput'), auditScan);
+document.getElementById('auditFinish').addEventListener('click', finishLocAudit);
+document.getElementById('auditCancel').addEventListener('click', function(){
+  document.getElementById('locAuditMask').classList.remove('show');
+});
+document.getElementById('locAuditMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('locAuditMask')) document.getElementById('locAuditMask').classList.remove('show');
 });
 document.getElementById('sibOk').addEventListener('click', function(){ closeSiblings(true); });
 document.getElementById('sibCancel').addEventListener('click', function(){ closeSiblings(false); });

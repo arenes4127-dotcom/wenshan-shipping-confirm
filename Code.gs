@@ -21,7 +21,20 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.148';
+const BACKEND_VERSION = '2026-08-17.150';
+
+// 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
+// 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
+// 重開一次），就是白付第二次的開檔成本。這裡不是CacheService那種跨次呼叫快取——
+// _ssMemo_ 只是一個模組層級的物件，Apps Script 每次執行(doGet/doPost)都是全新的
+// 全域作用域，不會殘留到下一次呼叫，所以在「同一次執行內」重複用同一個Spreadsheet
+// 物件是安全的，不會有資料過期的問題（實際的儲存格資料還是即時從API讀，跟什麼時候
+// openById無關）。全部 SpreadsheetApp.openById(...) 呼叫都改用這個。
+const _ssMemo_ = {};
+function openSheetMemo_(id){
+  if(!_ssMemo_[id]) _ssMemo_[id] = SpreadsheetApp.openById(id);
+  return _ssMemo_[id];
+}
 
 // 分頁標籤跟欄位標題都用繁體中文，方便直接打開試算表看。內部程式邏輯（讀寫用的key）
 // 還是用英文代碼，兩者分開靠 HEADER_LABELS 對應，不用整份程式碼牽動風險太大的改法。
@@ -1966,7 +1979,7 @@ function buildNativeStatusMap_(){
 
 function syncNativeOrderSheet_(){
   const map = buildNativeStatusMap_();
-  const ss = SpreadsheetApp.openById(NATIVE_SHEET_ID);
+  const ss = openSheetMemo_(NATIVE_SHEET_ID);
   const sh = ss.getSheetByName(NATIVE_ORDER_TAB);
   if(!sh){ Logger.log('舊核對表單找不到「'+NATIVE_ORDER_TAB+'」分頁，略過'); return {ok:false, reason:'找不到分頁'}; }
   const lastRow = sh.getLastRow();
@@ -2446,7 +2459,7 @@ const LOCLOG_HEADER = ['logTime','sku','baseName','fromLocation','toLocation','k
 const LOC_CHANGE_KINDS = ['上架', '移櫃', '揀貨時發現', '盤點調整', '其他'];
 
 function getLocMapSheet_(){
-  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   let sh = ss.getSheetByName(LOCMAP_TAB);
   if(sh) return sh;
   // 名稱有前後空白很容易被對方順手改掉，找不到就用去空白後的名稱再找一次
@@ -2537,25 +2550,26 @@ function removeLocFromCell_(raw, target){
 // 一樣補了清快取讓新品能立刻查到，但就算沒清也不會查到錯的資料，只是要等
 // 快取過期才查得到剛新增的那筆（而且这情況本來就有「查不到→視為新品」的
 // 既有備援機制接住）。
-const LOCMAP_INDEX_CACHE_TTL_SEC = 300;
-const LOCMAP_INDEX_CACHE_SHARDS = 10;
-function locIndexCacheKeys_(){
+// 通用的「分片快取」工具——不是只有儲位主檔的品號索引需要這套，任何大到會
+// 超過CacheService單一key 100KB上限的索引都能重用（下面 LOC_SYNC_TAB 的
+// 品號索引也是同一套）。prefix不同就是完全獨立的快取，不會互相蓋到。
+function shardedCacheKeys_(prefix, shardCount){
   const keys = [];
-  for(let i = 0; i < LOCMAP_INDEX_CACHE_SHARDS; i++) keys.push('locIdxV1_' + i);
+  for(let i = 0; i < shardCount; i++) keys.push(prefix + i);
   return keys;
 }
-function locIndexCacheGet_(){
+function shardedCacheGet_(prefix, shardCount){
   const cache = CacheService.getScriptCache();
-  const keys = locIndexCacheKeys_();
+  const keys = shardedCacheKeys_(prefix, shardCount);
   const vals = cache.getAll(keys);
   if(Object.keys(vals).length < keys.length) return null;   // 任何一片沒中都當全部沒中
   const idx = {};
   for(let i = 0; i < keys.length; i++) Object.assign(idx, JSON.parse(vals[keys[i]]));
   return idx;
 }
-function locIndexCacheSet_(idx){
+function shardedCacheSet_(prefix, shardCount, idx, ttlSec){
   const cache = CacheService.getScriptCache();
-  const keys = locIndexCacheKeys_();
+  const keys = shardedCacheKeys_(prefix, shardCount);
   const shards = keys.map(function(){ return {}; });
   Object.keys(idx).forEach(function(k){
     let h = 0;
@@ -2564,11 +2578,17 @@ function locIndexCacheSet_(idx){
   });
   const payload = {};
   keys.forEach(function(k, i){ payload[k] = JSON.stringify(shards[i]); });
-  cache.putAll(payload, LOCMAP_INDEX_CACHE_TTL_SEC);
+  cache.putAll(payload, ttlSec);
 }
-function locIndexCacheClear_(){
-  CacheService.getScriptCache().removeAll(locIndexCacheKeys_());
+function shardedCacheClear_(prefix, shardCount){
+  CacheService.getScriptCache().removeAll(shardedCacheKeys_(prefix, shardCount));
 }
+
+const LOCMAP_INDEX_CACHE_TTL_SEC = 300;
+const LOCMAP_INDEX_CACHE_SHARDS = 10;
+function locIndexCacheGet_(){ return shardedCacheGet_('locIdxV1_', LOCMAP_INDEX_CACHE_SHARDS); }
+function locIndexCacheSet_(idx){ shardedCacheSet_('locIdxV1_', LOCMAP_INDEX_CACHE_SHARDS, idx, LOCMAP_INDEX_CACHE_TTL_SEC); }
+function locIndexCacheClear_(){ shardedCacheClear_('locIdxV1_', LOCMAP_INDEX_CACHE_SHARDS); }
 
 function locIndex_(sh){
   try{
@@ -2899,7 +2919,7 @@ const TRANSFER_MIRROR_FIRST_ROW = 2;
 const TRANSFER_MIRROR_MAX_ROWS = 200;   // 該分頁公式鋪到約219列，抓200留一點餘裕
 
 function mirrorTransferToWorkspace_(){
-  const ss = SpreadsheetApp.openById(TRANSFER_WORKBOOK_ID);
+  const ss = openSheetMemo_(TRANSFER_WORKBOOK_ID);
   const sh = ss.getSheetByName(TRANSFER_MIRROR_TAB);
   if(!sh) return {ok:false, error:'找不到「' + TRANSFER_MIRROR_TAB + '」分頁'};
 
@@ -3155,7 +3175,7 @@ function testTransferFlow_(){
     // ---- 鏡射：確認測試品號真的寫進工作區（證明鏡射函式有在動作），再馬上清乾淨 ----
     const mirrorRes = mirrorTransferToWorkspace_();
     ck(mirrorRes.ok, '鏡射執行成功：' + JSON.stringify(mirrorRes));
-    const mss = SpreadsheetApp.openById(TRANSFER_WORKBOOK_ID);
+    const mss = openSheetMemo_(TRANSFER_WORKBOOK_ID);
     const mirrorSh = mss.getSheetByName(TRANSFER_MIRROR_TAB);
     const mirrorVals = mirrorSh.getRange(2, 2, TRANSFER_MIRROR_MAX_ROWS, 1).getValues();
     const foundInMirror = mirrorVals.some(function(r){ return String(r[0]).trim() === TEST_SKU; });
@@ -3174,7 +3194,7 @@ function testTransferFlow_(){
     let cleaned = false;
     try{
       const mirrorRes2 = mirrorTransferToWorkspace_();
-      const mss2 = SpreadsheetApp.openById(TRANSFER_WORKBOOK_ID);
+      const mss2 = openSheetMemo_(TRANSFER_WORKBOOK_ID);
       const mirrorSh2 = mss2.getSheetByName(TRANSFER_MIRROR_TAB);
       const mirrorVals2 = mirrorSh2.getRange(2, 2, TRANSFER_MIRROR_MAX_ROWS, 1).getValues();
       cleaned = !mirrorVals2.some(function(r){ return String(r[0]).indexOf('ZZ-TEST-TRANSFER') === 0; })
@@ -3293,7 +3313,7 @@ function skuFamilyKey_(sku){ return String(sku||'').trim().replace(SIZE_SUFFIX_R
 function findSiblingSkus(body){
   const sku = String((body && body.sku) || '').trim();
   if(!sku) return {ok:false, error:'請提供品號'};
-  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   const sib = {};
 
   // (1) 蝦皮商品ID
@@ -3484,12 +3504,45 @@ const LOC_SYNC_COL = {sku:1, name:2};
 // 不看 K（商品在途倉）：那是還在路上的貨，還沒上架。等它到了會落進 I 或 J，
 // 隔天這支排程自然會補進來——不會漏，只是晚一天。
 const LOC_SYNC_STOCK_COLS = [9, 10];   // I 網購庫存倉、J 總倉
+
+// 品號→列號索引，套用跟 locIndex_ 完全一樣的快取模式（見那邊的說明），只是
+// 換一張表：這張「山物地圖(快取)」實測有25,539列，比「文山倉儲位」還大，
+// cacheInfoFor_ 原本整欄讀A~C、I~J兩段下來要4秒多，佔了「查不到品號、
+// 順便查ERP資料建新品」這條路徑的絕大部分時間。
+// 這張表是 IMPORTRANGE 從外部來源鏡射進來的（見上面「為什麼不用公式做」那段
+// 說明），Code.gs 完全沒有寫入這張表的路徑，列被外部來源搬動的時機不受我們
+// 控制、沒有事件可以掛「寫入時清快取」——所以這裡純粹只能靠TTL自然過期界定
+// 過期範圍，跟 locIndex_ 那種「找得到寫入點就補清快取」不同。5分鐘的暫時性
+// 誤差，換來的是「新品建檔」這個非交易關鍵、單純顯示品名/規格/庫存數字的功能
+// 快很多，判斷上可以接受。
+const SRC_INDEX_CACHE_TTL_SEC = 300;
+const SRC_INDEX_CACHE_SHARDS = 15;
+function srcIndexCacheGet_(){ return shardedCacheGet_('srcIdxV1_', SRC_INDEX_CACHE_SHARDS); }
+function srcIndexCacheSet_(idx){ shardedCacheSet_('srcIdxV1_', SRC_INDEX_CACHE_SHARDS, idx, SRC_INDEX_CACHE_TTL_SEC); }
+function srcSkuIndex_(src){
+  try{
+    const cached = srcIndexCacheGet_();
+    if(cached) return cached;
+  }catch(err){ /* 快取讀取失敗就當沒快取，往下照原本邏輯重新掃描 */ }
+
+  const n = src.getLastRow() - LOC_SYNC_FIRST_ROW + 1;
+  const idx = {};
+  if(n >= 1){
+    const skus = src.getRange(LOC_SYNC_FIRST_ROW, LOC_SYNC_COL.sku, n, 1).getValues();
+    for(let i = 0; i < skus.length; i++){
+      const k = String(skus[i][0]||'').trim();
+      if(k && idx[k] === undefined) idx[k] = i + LOC_SYNC_FIRST_ROW;
+    }
+  }
+  try{ srcIndexCacheSet_(idx); }catch(err){ /* 存快取失敗不影響這次結果，只是這次沒加速到 */ }
+  return idx;
+}
 const LOC_SYNC_MIN_SOURCE_ROWS = 1000;   // 來源看起來是空的就整個放棄（IMPORTRANGE 載入中）
 
 function syncMissingLocationRows_(opts){
   opts = opts || {};
   const dryRun = opts.dryRun !== false;   // 預設乾跑；要真的寫必須明確傳 dryRun:false
-  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   const src = ss.getSheetByName(LOC_SYNC_TAB);
   const dst = getLocMapSheet_();
   if(!src) return {ok:false, error:'找不到「' + LOC_SYNC_TAB + '」分頁'};
@@ -3581,7 +3634,7 @@ function syncMissingLocationRows_(opts){
 function repairScientificSkus_(opts){
   opts = opts || {};
   const dryRun = opts.dryRun !== false;
-  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   const src = ss.getSheetByName(LOC_SYNC_TAB);
   const dst = getLocMapSheet_();
   if(!src || !dst) return {ok:false, error:'找不到分頁'};
@@ -3668,7 +3721,7 @@ function testNewItemCreate_(){
   const steps = [];
   const ck = function(c, m){ steps.push((c ? '\u2705 ' : '\u274c ') + m); };
   const sh = getLocMapSheet_();
-  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   const src = ss.getSheetByName(LOC_SYNC_TAB);
   if(!sh || !src) return {全部通過:false, 明細:['\u274c 找不到分頁']};
 
@@ -3750,7 +3803,7 @@ function previewMissingLocationRows_(){
 // 這些決定了功能能不能原樣搬過來。
 function analyzeSheetStructure_(opts){
   opts = opts || {};
-  const ss = SpreadsheetApp.openById(opts.id);
+  const ss = openSheetMemo_(opts.id);
   const out = {name: ss.getName(), sheets: []};
   ss.getSheets().forEach(function(sh){
     out.sheets.push({name: sh.getName(), gid: sh.getSheetId(),
@@ -3809,7 +3862,7 @@ function analyzeSheetStructure_(opts){
 // 唯讀：把「文山地圖」整份的結構攤開來看（分頁、欄位、哪些欄是公式拉來的）。
 // 要改一份別人也在用的試算表的結構之前，得先知道現在有什麼、誰在餵它、誰在吃它。
 function analyzeLocMapWorkbook_(){
-  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   const out = {name: ss.getName(), url: ss.getUrl(), sheets: []};
   ss.getSheets().forEach(function(sh){
     const rows = sh.getLastRow(), cols = sh.getLastColumn();
@@ -3845,27 +3898,27 @@ function analyzeLocMapWorkbook_(){
 }
 // 從「山物地圖(快取)」查一批品號的品名／規格／文山庫存。
 // 新品要建檔時，品名不該叫人重打一次——ERP 已經有了，打字只會製造不一致。
+// 2026-08-17：原本整欄讀A~C、I~J兩段（25,539列），單次呼叫要4秒多，改成
+// 先查（有快取的）品號→列號索引，再針對真正要找的那幾個品號各自現查現讀
+// 那一列的A~J（見 srcSkuIndex_ 上面的說明，這張表是IMPORTRANGE鏡射進來的，
+// 只能靠索引快取TTL界定過期範圍，庫存數字本身每次都是即時讀，不會顯示
+// 過期的庫存量）。
 function cacheInfoFor_(skus){
   const want = {};
   (skus||[]).forEach(function(x){ const k = String(x||'').trim(); if(k) want[k] = 1; });
   const out = {};
   if(!Object.keys(want).length) return out;
-  const ss = SpreadsheetApp.openById(LOCMAP_SOURCE_ID);
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   const src = ss.getSheetByName(LOC_SYNC_TAB);
   if(!src) return out;
-  const n = src.getLastRow() - LOC_SYNC_FIRST_ROW + 1;
-  if(n < 1) return out;
-  // A~C（品號/品名/規格）與 I~J（網購庫存倉/總倉）分兩段讀，不要整片 A:J 拉下來
-  const head = src.getRange(LOC_SYNC_FIRST_ROW, 1, n, 3).getValues();
-  const stock = src.getRange(LOC_SYNC_FIRST_ROW, 9, n, 2).getValues();
-  for(let i = 0; i < n; i++){
-    const k = String(head[i][0]||'').trim();
-    if(!k || !want[k] || out[k]) continue;
-    out[k] = {sku: head[i][0], baseName: String(head[i][1]||'').trim(),
-              spec: String(head[i][2]||'').trim(),
-              stockWs: String(stock[i][0]||'').trim(),
-              stockMain: String(stock[i][1]||'').trim()};
-  }
+  const idx = srcSkuIndex_(src);
+  Object.keys(want).forEach(function(k){
+    const row = idx[k];
+    if(!row) return;
+    const v = src.getRange(row, 1, 1, 10).getValues()[0];   // A~J一次讀（單列，不用再分段）
+    out[k] = {sku: v[0], baseName: String(v[1]||'').trim(), spec: String(v[2]||'').trim(),
+              stockWs: String(v[8]||'').trim(), stockMain: String(v[9]||'').trim()};
+  });
   return out;
 }
 
@@ -4325,7 +4378,7 @@ const SHEET_PRODUCT_IMAGE = '商品主圖';
 // 跑不完——請求直接超時、分頁也沒建出來。直接讀儲存格快得多，而且只讀需要的那幾欄。
 const PRODUCT_IMAGE_TAB = '商品規格對照';
 function importProductImages_(){
-  const src = SpreadsheetApp.openById(PRODUCT_IMAGE_SOURCE_ID);
+  const src = openSheetMemo_(PRODUCT_IMAGE_SOURCE_ID);
   const sh0 = src.getSheetByName(PRODUCT_IMAGE_TAB) || src.getSheets()[0];
   const lastRow = sh0.getLastRow();
   if(lastRow < 2) return {ok:false, error:'來源分頁沒有資料列'};
@@ -4370,7 +4423,7 @@ function importProductImages_(){
   const specMap = {};
   let specSkipped = 0, specForeign = 0;
   try{
-    const src2 = SpreadsheetApp.openById(SPEC_IMAGE_SOURCE_ID);
+    const src2 = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
     const sh2 = src2.getSheetByName(SPEC_IMAGE_TAB) || src2.getSheets()[0];
     const last2 = sh2.getLastRow();
     if(last2 >= 2){
@@ -5488,7 +5541,7 @@ const LOGISTICS_SOURCE_ID = '1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ';
 const LOGISTICS_TAB = '統計V2';
 const LOGISTICS_FIRST_DATA_ROW = 9;
 function readLogisticsScans_(){
-  const ss = SpreadsheetApp.openById(LOGISTICS_SOURCE_ID);
+  const ss = openSheetMemo_(LOGISTICS_SOURCE_ID);
   const sh = ss.getSheetByName(LOGISTICS_TAB);
   if(!sh) return null; // 讀不到就回傳null，讓呼叫端知道要整個略過，不要當成「大家都沒掃」
   const lastRow = sh.getLastRow();
@@ -5581,7 +5634,7 @@ function hourlySync_(){
 // arg 格式：'試算表ID|分頁名稱'
 function inspectSheetFormulas_(arg){
   const parts = String(arg||'').split('|');
-  const ss = SpreadsheetApp.openById(parts[0]);
+  const ss = openSheetMemo_(parts[0]);
   const sh = ss.getSheetByName(parts[1]);
   if(!sh) return {error:'找不到分頁 '+parts[1]};
   const lastCol = Math.min(sh.getLastColumn(), 40);
@@ -5621,7 +5674,7 @@ function findSheetOwner_(tabName){
     const f = files.next(); n++;
     checked.push(f.getName());
     try{
-      const ss = SpreadsheetApp.openById(f.getId());
+      const ss = openSheetMemo_(f.getId());
       if(ss.getSheetByName(tabName)) hits.push({名稱: f.getName(), id: f.getId()});
     }catch(e){}
   }
@@ -5645,7 +5698,7 @@ function findScriptProjects_(keyword){
 
 // 唯讀診斷用：評估「特殊註記」值不值得接進來——看多少訂單真的有註記、內容長什麼樣。
 function inspectSpecialNotes_(){
-  const ss = SpreadsheetApp.openById('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
+  const ss = openSheetMemo_('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
   const sh = ss.getSheetByName('蝦proV2');
   if(!sh) return {error:'找不到蝦proV2'};
   const lastRow = sh.getLastRow();
@@ -5671,7 +5724,7 @@ function inspectSpecialNotes_(){
 
 // 唯讀診斷用：看「蝦proV2」的過刷欄實際存了什麼值（已過刷 vs 未過刷分別長怎樣）。
 function inspectScanTab_(){
-  const ss = SpreadsheetApp.openById('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
+  const ss = openSheetMemo_('1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
   const sh = ss.getSheetByName('蝦proV2');
   if(!sh) return {error:'找不到蝦proV2'};
   const lastRow = sh.getLastRow();
@@ -5703,7 +5756,7 @@ function inspectScanTab_(){
 // 唯讀診斷用：列出來源試算表有哪些分頁、各自的表頭跟資料量，用來確認要接哪一個分頁。
 // 只讀不寫。確認完之後這個函式可以刪掉。
 function inspectSourceSpreadsheet_(ssId){
-  const ss = SpreadsheetApp.openById(ssId || '1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
+  const ss = openSheetMemo_(ssId || '1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ');
   return ss.getSheets().map(sh=>{
     const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
     let header = [];
