@@ -395,16 +395,52 @@
   <div class="confirm-mask" id="recordLocPickMask">
     <div class="confirm-box" style="max-width:520px;">
       <h3>紀錄儲位商品</h3>
-      <p class="hint" style="margin-top:0;">至少選到格位（層可以先不選），系統會自己找出這個位置目前真正的名稱，直接開始掃描登記。</p>
+      <p class="hint" style="margin-top:0;">至少選到格位（層可以先不選），系統會自己找出這個位置目前真正的名稱，直接開始掃描登記。文山有開放零售，掛衣架、花車這種臨時儲位不在貨架的區/格系統裡，選「其他（自行輸入）」直接打名稱就能建立。</p>
       <div class="row" style="gap:8px;align-items:flex-end;">
         <label class="field" style="flex:1.2;margin-bottom:0;"><span>區</span><select id="rZone"></select></label>
         <label class="field" style="flex:1;margin-bottom:0;" id="rSlotField"><span>格位</span><select id="rSlot"></select></label>
         <label class="field" style="flex:1;margin-bottom:0;" id="rLevelField"><span>層</span><select id="rLevel"></select></label>
       </div>
+      <label class="field" id="rFreeField" style="display:none;margin-top:8px;">
+        <span>臨時儲位名稱</span>
+        <input id="rFreeInput" type="text" placeholder="例如 花車1、掛衣架A" autocomplete="off">
+      </label>
       <p id="recordLocPickError" class="hint" style="color:var(--danger);margin-top:8px;display:none;"></p>
       <div class="row" style="margin-top:12px;gap:8px;">
         <button class="btn gray" id="rClose">取消</button>
         <button class="btn block" id="rStart">開始紀錄</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="confirm-mask" id="clearLocPickMask">
+    <div class="confirm-box" style="max-width:520px;">
+      <h3>清空儲位</h3>
+      <p class="hint" style="margin-top:0;">臨時儲位（花車、掛衣架）撤掉時，用這裡把地圖上還掛著這個位置的商品一次清掉。選一個位置，系統會列出目前登記在那裡的商品讓你確認。</p>
+      <div class="row" style="gap:8px;align-items:flex-end;">
+        <label class="field" style="flex:1.2;margin-bottom:0;"><span>區</span><select id="cZone"></select></label>
+        <label class="field" style="flex:1;margin-bottom:0;" id="cSlotField"><span>格位</span><select id="cSlot"></select></label>
+        <label class="field" style="flex:1;margin-bottom:0;" id="cLevelField"><span>層</span><select id="cLevel"></select></label>
+      </div>
+      <label class="field" id="cFreeField" style="display:none;margin-top:8px;">
+        <span>臨時儲位名稱</span>
+        <input id="cFreeInput" type="text" placeholder="例如 花車1、掛衣架A" autocomplete="off">
+      </label>
+      <p id="clearLocPickError" class="hint" style="color:var(--danger);margin-top:8px;display:none;"></p>
+      <div class="row" style="margin-top:12px;gap:8px;">
+        <button class="btn gray" id="cClose">取消</button>
+        <button class="btn block" id="cQuery">查詢這個位置</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="confirm-mask" id="clearLocMask">
+    <div class="confirm-box" style="max-width:520px;">
+      <h3>清空儲位：<span class="loc-badge" id="clearLocLabel" style="font-size:16px;"></span></h3>
+      <div id="clearLocResult"></div>
+      <div class="row" style="margin-top:12px;gap:8px;">
+        <button class="btn gray" id="clearLocCancel">取消</button>
+        <button class="btn danger block" id="clearLocConfirm">確定清空</button>
       </div>
     </div>
   </div>
@@ -748,6 +784,7 @@
         </label>
         <button class="btn gray block" id="btnShelfQuery">🔍 查詢貨架上有哪些商品</button>
         <button class="btn gray block" id="btnRecordLoc" style="margin-top:8px;">📋 紀錄儲位商品</button>
+        <button class="btn gray block" id="btnClearLoc" style="margin-top:8px;">🧹 清空儲位</button>
       </div>
 
       <div class="card" id="locBatchBox" style="display:none;">
@@ -2832,8 +2869,32 @@ function qFillSlots(){
 // 「紀錄儲位商品」自己的區/格位/層選單，跟上面查詢貨架用的 qZone/qSlot/qLevel
 // 是分開的兩組（各自對應不同的彈窗，不能共用同一組id）——這裡刻意不留「全部」
 // 選項，因為紀錄一定要對到單一明確的位置，不像查詢可以查整格、整區。
-function rFillZones(){
-  const sel = document.getElementById('rZone');
+// 「紀錄儲位商品」跟「清空儲位」都需要同一組「區/格位/層/自行輸入」選單，
+// 各自有自己的一組元素id（跟loc*/q*一樣，各功能各自一份，不共用DOM）。
+// 這兩個共用函式只抽「組查詢條件」跟「送查詢＋依結果分類」這段邏輯——
+// 這段之前踩過真實的坑（見 buildLocQueryFromPicker_ 內的說明），拆出來共用
+// 是為了不要在清空儲位那邊重寫一次、又重踩一次同樣的坑。
+function rebuildLocSelects_(ids){
+  const zone = document.getElementById(ids.zone).value;
+  const isText = zone.indexOf('__t__') === 0;
+  const isFree = zone === '__free__';
+  document.getElementById(ids.slotField).style.display = (isText || isFree) ? 'none' : '';
+  document.getElementById(ids.levelField).style.display = (isText || isFree) ? 'none' : '';
+  document.getElementById(ids.freeField).style.display = isFree ? '' : 'none';
+  if(isText || isFree) return;
+  const z = locZoneInfo(zone);
+  document.getElementById(ids.slot).innerHTML = '<option value="">請選格位</option>' +
+    ((z && z.slots) || []).map(function(n){
+      return '<option value="' + n + '">' + locPadSlot(z, n) + '</option>';
+    }).join('');
+  document.getElementById(ids.level).innerHTML = '<option value="">不分層（含所有層）</option>' +
+    ((z && z.levels) || []).map(function(n){
+      return '<option value="' + n + '">第 ' + n + ' 層</option>';
+    }).join('');
+}
+
+function fillZoneSelect_(selId){
+  const sel = document.getElementById(selId);
   const lists = locZoneList();
   let html = '';
   if(lists.shelf.length){
@@ -2846,79 +2907,80 @@ function rFillZones(){
       return '<option value="__t__' + escapeHtml(t.code) + '">' + escapeHtml(t.code) + '</option>';
     }).join('') + '</optgroup>';
   }
+  html += '<option value="__free__">其他（自行輸入，臨時儲位用）</option>';
   sel.innerHTML = html;
-  rFillSlots();
 }
 
-function rFillSlots(){
-  const zone = document.getElementById('rZone').value;
-  const isText = zone.indexOf('__t__') === 0;
-  document.getElementById('rSlotField').style.display = isText ? 'none' : '';
-  document.getElementById('rLevelField').style.display = isText ? 'none' : '';
-  if(isText) return;
-  const z = locZoneInfo(zone);
-  document.getElementById('rSlot').innerHTML = '<option value="">請選格位</option>' +
-    ((z && z.slots) || []).map(function(n){
-      return '<option value="' + n + '">' + locPadSlot(z, n) + '</option>';
-    }).join('');
-  document.getElementById('rLevel').innerHTML = '<option value="">不分層（含所有層）</option>' +
-    ((z && z.levels) || []).map(function(n){
-      return '<option value="' + n + '">第 ' + n + ' 層</option>';
-    }).join('');
-}
+const R_PICKER_IDS = {zone:'rZone', slot:'rSlot', level:'rLevel', slotField:'rSlotField', levelField:'rLevelField', freeField:'rFreeField'};
+const C_PICKER_IDS = {zone:'cZone', slot:'cSlot', level:'cLevel', slotField:'cSlotField', levelField:'cLevelField', freeField:'cFreeField'};
+function rFillZones(){ fillZoneSelect_('rZone'); rFillSlots(); }
+function rFillSlots(){ rebuildLocSelects_(R_PICKER_IDS); }
+function cFillZones(){ fillZoneSelect_('cZone'); cFillSlots(); }
+function cFillSlots(){ rebuildLocSelects_(C_PICKER_IDS); }
 
-// 從選單查詢那個位置目前登記了什麼，再進紀錄畫面——不用像查詢貨架那樣先看
-// 結果列表再點進去，省一步。
-//
 // 實測抓到的真實情況：格位底下不一定是乾淨的數字「層」，有些區習慣寫成
 // 「架上」「架下」這種文字後綴（例如「M3架下」），這種寫法後端 parseLocToken_
 // 根本抓不到「層」這個數字，query時指定 level 只會查到空的。一開始寫死要求
 // 「格位＋層都要選」，然後自己組字串當目標位置，結果組出「M3-1」這種地圖上
 // 根本不存在、也查無資料的假位置——凡是要「送出寫入」的目標位置，都不能靠
 // 自己猜字串組出來，一定要用查詢結果裡真的存在的字串。
-// 改法：層不強制一定要選；用查到的結果反推真正的位置字串——查到剛好一個
-// 位置就直接用；查到好幾個（同一格位底下有好幾種寫法）讓使用者自己選一個；
-// 查到零筆才視為全新儲位，退回用選單組出來的字串（並明講這是用猜的、
-// 之後如果跟現場習慣的後綴寫法不一樣要手動調整）。
+function buildLocQueryFromPicker_(zoneId, slotId, levelId, freeId){
+  const zoneRaw = document.getElementById(zoneId).value;
+  if(zoneRaw === '__free__'){
+    const free = String(document.getElementById(freeId).value||'').trim();
+    if(!free) return {error:'請輸入臨時儲位名稱'};
+    return {body: {zone: free, textZone: true}, fallback: free};
+  }
+  const isText = zoneRaw.indexOf('__t__') === 0;
+  if(isText){
+    const loc = zoneRaw.slice(5);
+    return {body: {zone: loc, textZone: true}, fallback: loc};
+  }
+  const slot = document.getElementById(slotId).value;
+  if(!slot) return {error:'至少要選格位——需要對到單一明確的位置。'};
+  const level = document.getElementById(levelId).value;
+  const z = locZoneInfo(zoneRaw);
+  const fallback = zoneRaw + locPadSlot(z, parseInt(slot, 10)) + (level ? '-' + level : '');
+  return {body: {zone: zoneRaw, slot: slot, level: level}, fallback: fallback};
+}
+
+// 送出查詢，依「查到幾種位置寫法」分類回傳，不在這裡決定下一步——
+// 「紀錄」查到後要開始掃描，「清空」查到後要列清單讓人確認，兩邊接下來的
+// 動作不一樣，交給呼叫端自己處理分類結果。
+async function resolveLocationQuery_(query){
+  if(query.error) return {ok:false, error: query.error};
+  if(!hasBackend()) return {ok:false, error:'需要連線才能用'};
+  let res;
+  try{ res = await apiPost('listLocationContents', query.body); }
+  catch(err){ return {ok:false, error: '查詢失敗：' + (err.message||'')}; }
+  if(!res || !res.ok) return {ok:false, error: (res && res.error) || '查詢失敗'};
+  return {ok:true, res: res, found: res.locations.map(function(x){ return x.location; }), fallback: query.fallback};
+}
+
+// 從選單查詢那個位置目前登記了什麼，再進紀錄畫面——不用像查詢貨架那樣先看
+// 結果列表再點進去，省一步。層不強制一定要選；用查到的結果反推真正的位置
+// 字串——查到剛好一個位置就直接用；查到好幾個（同一格位底下有好幾種寫法）
+// 讓使用者自己選一個；查到零筆才視為全新儲位，退回用選單組出來的字串
+// （並明講這是用猜的、之後如果跟現場習慣的後綴寫法不一樣要手動調整）。
 async function startRecordFromPicker(){
   const errBox = document.getElementById('recordLocPickError');
   errBox.style.display = 'none';
-  const zoneRaw = document.getElementById('rZone').value;
-  const isText = zoneRaw.indexOf('__t__') === 0;
-  let body, fallbackLoc;
-  if(isText){
-    fallbackLoc = zoneRaw.slice(5);
-    body = {zone: fallbackLoc, textZone: true};
-  }else{
-    const slot = document.getElementById('rSlot').value;
-    const level = document.getElementById('rLevel').value;
-    if(!slot){
-      errBox.textContent = '至少要選格位——紀錄功能需要對到單一明確的位置。';
-      errBox.style.display = '';
-      return;
-    }
-    const z = locZoneInfo(zoneRaw);
-    fallbackLoc = zoneRaw + locPadSlot(z, parseInt(slot, 10)) + (level ? '-' + level : '');
-    body = {zone: zoneRaw, slot: slot, level: level};
-  }
-  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位商品紀錄要連上後端才能用',1800); return; }
+  const query = buildLocQueryFromPicker_('rZone', 'rSlot', 'rLevel', 'rFreeInput');
+  if(query.error){ errBox.textContent = query.error; errBox.style.display = ''; return; }
   const doneBusy = withBusy(document.getElementById('rStart'));
-  let res;
-  try{ res = await apiPost('listLocationContents', body); }
-  catch(err){ doneBusy(); errBox.textContent = '查詢失敗：' + (err.message||''); errBox.style.display = ''; return; }
+  const result = await resolveLocationQuery_(query);
   doneBusy();
-  if(!res || !res.ok){ errBox.textContent = (res && res.error) || '查詢失敗'; errBox.style.display = ''; return; }
-  shelfResult = res;
+  if(!result.ok){ errBox.textContent = result.error; errBox.style.display = ''; return; }
+  shelfResult = result.res;
 
-  const found = res.locations.map(function(x){ return x.location; });
-  if(found.length === 1){
+  if(result.found.length === 1){
     document.getElementById('recordLocPickMask').classList.remove('show');
-    startLocAudit(found[0]);
-  }else if(found.length > 1){
+    startLocAudit(result.found[0]);
+  }else if(result.found.length > 1){
     // 這個格位底下有好幾種既有寫法（例如同一格但層的標法不一致），
     // 不能替使用者亂猜是哪一個，列出來讓他自己選。
-    errBox.innerHTML = '這個格位底下有 ' + found.length + ' 種現有位置寫法，請選一個：<br>' +
-      found.map(function(loc){
+    errBox.innerHTML = '這個格位底下有 ' + result.found.length + ' 種現有位置寫法，請選一個：<br>' +
+      result.found.map(function(loc){
         const safe = String(loc).replace(/'/g, "\\'");
         return '<button class="btn gray sm" style="margin:4px 4px 0 0;" onclick="' +
           "document.getElementById('recordLocPickMask').classList.remove('show');startLocAudit('" + safe + "')" +
@@ -2929,9 +2991,119 @@ async function startRecordFromPicker(){
     // 地圖上完全沒有東西在這個位置，視為全新儲位——用選單組出來的字串當
     // 起點，但明講這是猜的，跟現場既有的後綴寫法（架上/架下之類）可能對不上。
     document.getElementById('recordLocPickMask').classList.remove('show');
-    startLocAudit(fallbackLoc);
-    flash('ok', '這是全新的位置：' + fallbackLoc,
+    startLocAudit(result.fallback);
+    flash('ok', '這是全新的位置：' + result.fallback,
       '地圖上目前沒有任何商品登記在這裡。如果現場其他同格位的東西有加「架上／架下」之類的習慣寫法，紀錄完成後麻煩到「儲位異動」手動調整一次，跟既有寫法對齊。', 4200);
+  }
+}
+
+async function startClearFromPicker(){
+  const errBox = document.getElementById('clearLocPickError');
+  errBox.style.display = 'none';
+  const query = buildLocQueryFromPicker_('cZone', 'cSlot', 'cLevel', 'cFreeInput');
+  if(query.error){ errBox.textContent = query.error; errBox.style.display = ''; return; }
+  const doneBusy = withBusy(document.getElementById('cQuery'));
+  const result = await resolveLocationQuery_(query);
+  doneBusy();
+  if(!result.ok){ errBox.textContent = result.error; errBox.style.display = ''; return; }
+  shelfResult = result.res;
+
+  if(result.found.length === 1){
+    document.getElementById('clearLocPickMask').classList.remove('show');
+    startClearForLocation(result.found[0]);
+  }else if(result.found.length > 1){
+    errBox.innerHTML = '這個格位底下有 ' + result.found.length + ' 種現有位置寫法，請選一個：<br>' +
+      result.found.map(function(loc){
+        const safe = String(loc).replace(/'/g, "\\'");
+        return '<button class="btn gray sm" style="margin:4px 4px 0 0;" onclick="' +
+          "document.getElementById('clearLocPickMask').classList.remove('show');startClearForLocation('" + safe + "')" +
+          '">' + escapeHtml(loc) + '</button>';
+      }).join('');
+    errBox.style.display = '';
+  }else{
+    errBox.textContent = '目前沒有任何商品登記在這個位置，不需要清空。';
+    errBox.style.display = '';
+  }
+}
+
+let clearLocTarget = '';
+let clearLocItems = [];
+function startClearForLocation(loc){
+  clearLocTarget = loc;
+  clearLocItems = ((shelfResult && shelfResult.items) || []).filter(function(it){ return it.matched === loc; });
+  document.getElementById('clearLocLabel').textContent = loc;
+  renderClearLocResult();
+  document.getElementById('clearLocMask').classList.add('show');
+}
+
+// 跟後端 mode:'remove' 的安全鎖對齊：alsoAt 是「這個品號除了這個儲位以外
+// 還登記在哪裡」，空陣列代表這個儲位是它唯一的存放點——後端會擋掉這種
+// 移除（reason:'last_one'，不能讓商品變成沒有儲位），所以確認畫面要先標出來，
+// 不能等送出失敗才讓人知道。
+function renderClearLocResult(){
+  const box = document.getElementById('clearLocResult');
+  if(!clearLocItems.length){
+    box.innerHTML = '<p class="hint">這個位置目前沒有登記任何商品。</p>';
+    return;
+  }
+  const atRisk = clearLocItems.filter(function(it){ return !it.alsoAt.length; }).length;
+  let html = '<p class="hint">目前登記在這裡的商品共 ' + clearLocItems.length + ' 件：</p>';
+  if(atRisk){
+    html += '<p class="hint" style="color:var(--danger);">其中 ' + atRisk + ' 件的唯一儲位就是這裡，清空會被系統擋下（避免商品變成沒有儲位），下面用紅字標出來——這幾件要用「儲位異動」手動移到別的位置，不能直接清空。</p>';
+  }
+  html += '<div style="max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:8px;">' +
+    clearLocItems.map(function(it){
+      const risky = !it.alsoAt.length;
+      return '<div style="padding:6px 8px;border-bottom:1px solid var(--border);' + (risky ? 'color:var(--danger);' : '') + '">' +
+        escapeHtml(it.sku) + ' ' + escapeHtml(it.baseName || '') +
+        (risky ? '　⚠️ 唯一儲位' : '') + '</div>';
+    }).join('') + '</div>';
+  box.innerHTML = html;
+}
+
+async function confirmClearLoc(){
+  if(!clearLocItems.length){
+    document.getElementById('clearLocMask').classList.remove('show');
+    return;
+  }
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','清空儲位要連上後端才能用',1800); return; }
+  const staffObj = staff.find(function(s){ return s.id === document.getElementById('locStaffSelect').value; });
+  if(!staffObj){ errorBeep(); flash('err','請先選擇人員','儲位那頁上方要選一個人員才能送出',1800); return; }
+  const doneBusy = withBusy(document.getElementById('clearLocConfirm'));
+  let res;
+  try{
+    res = await apiPost('changeLocationBatch', {
+      skus: clearLocItems.map(function(it){ return it.sku; }),
+      toLocation: clearLocTarget, mode: 'remove', kind: '盤點調整',
+      staffId: staffObj.id, staffName: staffObj.name,
+      note: '清空儲位：' + clearLocTarget
+    });
+  }catch(err){
+    doneBusy();
+    errorBeep(); flash('err','送出失敗', err.message||'', 2200);
+    return;
+  }
+  doneBusy();
+  const results = (res && res.results) || [];
+  const okList = results.filter(function(r){ return r.ok; });
+  const blocked = results.filter(function(r){ return !r.ok && r.reason === 'last_one'; });
+  const otherFail = results.filter(function(r){ return !r.ok && r.reason !== 'last_one'; });
+
+  if(!okList.length && !blocked.length && !otherFail.length){
+    errorBeep(); flash('err','清空失敗','沒有收到後端回應', 2400); return;
+  }
+  document.getElementById('clearLocMask').classList.remove('show');
+  shelfResult = null;
+  let msg = '清掉了 ' + okList.length + ' 件';
+  const parts = [];
+  if(blocked.length) parts.push(blocked.length + ' 件是唯一儲位，被擋下，要用「儲位異動」手動處理');
+  if(otherFail.length) parts.push(otherFail.length + ' 件失敗（可能剛好被別人異動），需要重查');
+  if(okList.length && !blocked.length && !otherFail.length){
+    okBeep();
+    flash('ok', clearLocTarget + ' 已清空', msg, 3000);
+  }else{
+    errorBeep();
+    flash('err', clearLocTarget + ' 部分清空', msg + (parts.length ? '；' + parts.join('；') : ''), 4600);
   }
 }
 
@@ -4957,6 +5129,28 @@ document.getElementById('rClose').addEventListener('click', function(){
 });
 document.getElementById('recordLocPickMask').addEventListener('click', function(e){
   if(e.target === document.getElementById('recordLocPickMask')) document.getElementById('recordLocPickMask').classList.remove('show');
+});
+document.getElementById('btnClearLoc').addEventListener('click', async function(){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','清空儲位要連上後端才能用',1800); return; }
+  await loadLocVocab();
+  cFillZones();
+  document.getElementById('clearLocPickError').style.display = 'none';
+  document.getElementById('clearLocPickMask').classList.add('show');
+});
+document.getElementById('cZone').addEventListener('change', cFillSlots);
+document.getElementById('cQuery').addEventListener('click', startClearFromPicker);
+document.getElementById('cClose').addEventListener('click', function(){
+  document.getElementById('clearLocPickMask').classList.remove('show');
+});
+document.getElementById('clearLocPickMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('clearLocPickMask')) document.getElementById('clearLocPickMask').classList.remove('show');
+});
+document.getElementById('clearLocCancel').addEventListener('click', function(){
+  document.getElementById('clearLocMask').classList.remove('show');
+});
+document.getElementById('clearLocConfirm').addEventListener('click', confirmClearLoc);
+document.getElementById('clearLocMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('clearLocMask')) document.getElementById('clearLocMask').classList.remove('show');
 });
 wireScanInput(document.getElementById('auditScanInput'), auditScan);
 document.getElementById('auditFinish').addEventListener('click', finishLocAudit);
