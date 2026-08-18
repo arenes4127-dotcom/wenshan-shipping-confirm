@@ -392,6 +392,23 @@
     </div>
   </div>
 
+  <div class="confirm-mask" id="recordLocPickMask">
+    <div class="confirm-box" style="max-width:520px;">
+      <h3>紀錄儲位商品</h3>
+      <p class="hint" style="margin-top:0;">至少選到格位（層可以先不選），系統會自己找出這個位置目前真正的名稱，直接開始掃描登記。</p>
+      <div class="row" style="gap:8px;align-items:flex-end;">
+        <label class="field" style="flex:1.2;margin-bottom:0;"><span>區</span><select id="rZone"></select></label>
+        <label class="field" style="flex:1;margin-bottom:0;" id="rSlotField"><span>格位</span><select id="rSlot"></select></label>
+        <label class="field" style="flex:1;margin-bottom:0;" id="rLevelField"><span>層</span><select id="rLevel"></select></label>
+      </div>
+      <p id="recordLocPickError" class="hint" style="color:var(--danger);margin-top:8px;display:none;"></p>
+      <div class="row" style="margin-top:12px;gap:8px;">
+        <button class="btn gray" id="rClose">取消</button>
+        <button class="btn block" id="rStart">開始紀錄</button>
+      </div>
+    </div>
+  </div>
+
   <div class="confirm-mask" id="locAuditMask">
     <div class="confirm-box" style="max-width:520px;">
       <h3>紀錄儲位商品：<span class="loc-badge" id="auditLocLabel" style="font-size:16px;"></span></h3>
@@ -730,6 +747,7 @@
           </div>
         </label>
         <button class="btn gray block" id="btnShelfQuery">🔍 查詢貨架上有哪些商品</button>
+        <button class="btn gray block" id="btnRecordLoc" style="margin-top:8px;">📋 紀錄儲位商品</button>
       </div>
 
       <div class="card" id="locBatchBox" style="display:none;">
@@ -2811,6 +2829,112 @@ function qFillSlots(){
     }).join('');
 }
 
+// 「紀錄儲位商品」自己的區/格位/層選單，跟上面查詢貨架用的 qZone/qSlot/qLevel
+// 是分開的兩組（各自對應不同的彈窗，不能共用同一組id）——這裡刻意不留「全部」
+// 選項，因為紀錄一定要對到單一明確的位置，不像查詢可以查整格、整區。
+function rFillZones(){
+  const sel = document.getElementById('rZone');
+  const lists = locZoneList();
+  let html = '';
+  if(lists.shelf.length){
+    html += '<optgroup label="貨架區（照走動順序）">' + lists.shelf.map(function(z){
+      return '<option value="' + escapeHtml(z.code) + '">' + escapeHtml(z.code) + '區</option>';
+    }).join('') + '</optgroup>';
+  }
+  if(lists.text.length){
+    html += '<optgroup label="其他區域">' + lists.text.map(function(t){
+      return '<option value="__t__' + escapeHtml(t.code) + '">' + escapeHtml(t.code) + '</option>';
+    }).join('') + '</optgroup>';
+  }
+  sel.innerHTML = html;
+  rFillSlots();
+}
+
+function rFillSlots(){
+  const zone = document.getElementById('rZone').value;
+  const isText = zone.indexOf('__t__') === 0;
+  document.getElementById('rSlotField').style.display = isText ? 'none' : '';
+  document.getElementById('rLevelField').style.display = isText ? 'none' : '';
+  if(isText) return;
+  const z = locZoneInfo(zone);
+  document.getElementById('rSlot').innerHTML = '<option value="">請選格位</option>' +
+    ((z && z.slots) || []).map(function(n){
+      return '<option value="' + n + '">' + locPadSlot(z, n) + '</option>';
+    }).join('');
+  document.getElementById('rLevel').innerHTML = '<option value="">不分層（含所有層）</option>' +
+    ((z && z.levels) || []).map(function(n){
+      return '<option value="' + n + '">第 ' + n + ' 層</option>';
+    }).join('');
+}
+
+// 從選單查詢那個位置目前登記了什麼，再進紀錄畫面——不用像查詢貨架那樣先看
+// 結果列表再點進去，省一步。
+//
+// 實測抓到的真實情況：格位底下不一定是乾淨的數字「層」，有些區習慣寫成
+// 「架上」「架下」這種文字後綴（例如「M3架下」），這種寫法後端 parseLocToken_
+// 根本抓不到「層」這個數字，query時指定 level 只會查到空的。一開始寫死要求
+// 「格位＋層都要選」，然後自己組字串當目標位置，結果組出「M3-1」這種地圖上
+// 根本不存在、也查無資料的假位置——凡是要「送出寫入」的目標位置，都不能靠
+// 自己猜字串組出來，一定要用查詢結果裡真的存在的字串。
+// 改法：層不強制一定要選；用查到的結果反推真正的位置字串——查到剛好一個
+// 位置就直接用；查到好幾個（同一格位底下有好幾種寫法）讓使用者自己選一個；
+// 查到零筆才視為全新儲位，退回用選單組出來的字串（並明講這是用猜的、
+// 之後如果跟現場習慣的後綴寫法不一樣要手動調整）。
+async function startRecordFromPicker(){
+  const errBox = document.getElementById('recordLocPickError');
+  errBox.style.display = 'none';
+  const zoneRaw = document.getElementById('rZone').value;
+  const isText = zoneRaw.indexOf('__t__') === 0;
+  let body, fallbackLoc;
+  if(isText){
+    fallbackLoc = zoneRaw.slice(5);
+    body = {zone: fallbackLoc, textZone: true};
+  }else{
+    const slot = document.getElementById('rSlot').value;
+    const level = document.getElementById('rLevel').value;
+    if(!slot){
+      errBox.textContent = '至少要選格位——紀錄功能需要對到單一明確的位置。';
+      errBox.style.display = '';
+      return;
+    }
+    const z = locZoneInfo(zoneRaw);
+    fallbackLoc = zoneRaw + locPadSlot(z, parseInt(slot, 10)) + (level ? '-' + level : '');
+    body = {zone: zoneRaw, slot: slot, level: level};
+  }
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位商品紀錄要連上後端才能用',1800); return; }
+  const doneBusy = withBusy(document.getElementById('rStart'));
+  let res;
+  try{ res = await apiPost('listLocationContents', body); }
+  catch(err){ doneBusy(); errBox.textContent = '查詢失敗：' + (err.message||''); errBox.style.display = ''; return; }
+  doneBusy();
+  if(!res || !res.ok){ errBox.textContent = (res && res.error) || '查詢失敗'; errBox.style.display = ''; return; }
+  shelfResult = res;
+
+  const found = res.locations.map(function(x){ return x.location; });
+  if(found.length === 1){
+    document.getElementById('recordLocPickMask').classList.remove('show');
+    startLocAudit(found[0]);
+  }else if(found.length > 1){
+    // 這個格位底下有好幾種既有寫法（例如同一格但層的標法不一致），
+    // 不能替使用者亂猜是哪一個，列出來讓他自己選。
+    errBox.innerHTML = '這個格位底下有 ' + found.length + ' 種現有位置寫法，請選一個：<br>' +
+      found.map(function(loc){
+        const safe = String(loc).replace(/'/g, "\\'");
+        return '<button class="btn gray sm" style="margin:4px 4px 0 0;" onclick="' +
+          "document.getElementById('recordLocPickMask').classList.remove('show');startLocAudit('" + safe + "')" +
+          '">' + escapeHtml(loc) + '</button>';
+      }).join('');
+    errBox.style.display = '';
+  }else{
+    // 地圖上完全沒有東西在這個位置，視為全新儲位——用選單組出來的字串當
+    // 起點，但明講這是猜的，跟現場既有的後綴寫法（架上/架下之類）可能對不上。
+    document.getElementById('recordLocPickMask').classList.remove('show');
+    startLocAudit(fallbackLoc);
+    flash('ok', '這是全新的位置：' + fallbackLoc,
+      '地圖上目前沒有任何商品登記在這裡。如果現場其他同格位的東西有加「架上／架下」之類的習慣寫法，紀錄完成後麻煩到「儲位異動」手動調整一次，跟既有寫法對齊。', 4200);
+  }
+}
+
 async function runShelfQuery(){
   const zoneRaw = document.getElementById('qZone').value;
   if(!zoneRaw) return;
@@ -4818,6 +4942,21 @@ document.getElementById('qClose').addEventListener('click', function(){
 });
 document.getElementById('shelfMask').addEventListener('click', function(e){
   if(e.target === document.getElementById('shelfMask')) document.getElementById('shelfMask').classList.remove('show');
+});
+document.getElementById('btnRecordLoc').addEventListener('click', async function(){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位商品紀錄要連上後端才能用',1800); return; }
+  await loadLocVocab();
+  rFillZones();
+  document.getElementById('recordLocPickError').style.display = 'none';
+  document.getElementById('recordLocPickMask').classList.add('show');
+});
+document.getElementById('rZone').addEventListener('change', rFillSlots);
+document.getElementById('rStart').addEventListener('click', startRecordFromPicker);
+document.getElementById('rClose').addEventListener('click', function(){
+  document.getElementById('recordLocPickMask').classList.remove('show');
+});
+document.getElementById('recordLocPickMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('recordLocPickMask')) document.getElementById('recordLocPickMask').classList.remove('show');
 });
 wireScanInput(document.getElementById('auditScanInput'), auditScan);
 document.getElementById('auditFinish').addEventListener('click', finishLocAudit);

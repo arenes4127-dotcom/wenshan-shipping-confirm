@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-18.156';
+const BACKEND_VERSION = '2026-08-18.157';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -233,6 +233,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   releaseOrderClaimNow_: (arg) => releaseOrderClaimNow_(arg && arg.orderNo),
   debugShoeSkuPatterns_: () => debugShoeSkuPatterns_(),
   debugTestRowSelection_: () => debugTestRowSelection_(),
+  odmCheckTarget_: () => odmCheckTarget_(),
+  odmAppendRows_: (arg) => odmAppendRows_(arg && arg.rows),
   diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
   peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
@@ -6813,4 +6815,44 @@ function setupImportedMirrorSheets(){
   );
 
   Logger.log('已建立「文山出貨V2」「條碼轉品號」鏡像分頁，請打開這兩個分頁手動完成一次性授權（如果有跳出提示的話）。');
+}
+
+// ================= ODM(174330525)商品資料匯入 =================
+// 2026-08-18：使用者提供蝦皮賣場174330525(ODM，賣Flower Mountain/Snow Peak/KEEN等
+// 戶外品牌)的批量匯出檔(sales_info+media_info)，整理成跟「商品儲位對照」試算表
+// 一樣的13欄格式後，要附加到那份表（跟這個Code.gs所在的「文山出貨確認系統-後端」
+// 是完全不同的試算表，這裡只是借用同一個已經部署好的Apps Script執行身份來寫入）。
+// 這不是本專案的核心功能，純粹是重用已有的部署管道，不用另外幫使用者設定一次
+// 新的Apps Script專案。
+const ODM_TARGET_SHEET_ID = '1DeqU2CnmM1XL-J3IudjDzc8OmMuv7Bqz';
+const ODM_EXPECTED_HEADER = ['賣場ID','賣場名稱','商品ID','商品名稱','商品選項ID','商品規格名稱','選項序號','選項名稱','選項圖片','第二階規格','商品選項貨號','價格','對應方式'];
+// 這幾欄是純數字但一定要當文字存，不然Google Sheets會自動轉成科學記號
+// （之前在「文山地圖」那邊真的踩過這個坑，SKU 3204E204 被存成 3.204e+207）。
+const ODM_TEXT_COLS = [1, 3, 5, 11];   // 賣場ID/商品ID/商品選項ID/商品選項貨號（1-indexed）
+
+function odmCheckTarget_(){
+  const ss = openSheetMemo_(ODM_TARGET_SHEET_ID);
+  const sh = ss.getSheets()[0];
+  const header = sh.getRange(1, 1, 1, ODM_EXPECTED_HEADER.length).getValues()[0];
+  const headerOk = JSON.stringify(header) === JSON.stringify(ODM_EXPECTED_HEADER);
+  return {ok:true, sheetName: sh.getName(), lastRow: sh.getLastRow(), headerOk: headerOk, header: header};
+}
+
+// rows: 二維陣列，每列13欄，順序照 ODM_EXPECTED_HEADER。分批呼叫（前端一次送幾千列），
+// 每次呼叫都附加在當下的最後一列之後，不會覆蓋既有資料。
+function odmAppendRows_(rows){
+  if(!Array.isArray(rows) || !rows.length) return {ok:false, error:'沒有資料'};
+  const ss = openSheetMemo_(ODM_TARGET_SHEET_ID);
+  const sh = ss.getSheets()[0];
+  const header = sh.getRange(1, 1, 1, ODM_EXPECTED_HEADER.length).getValues()[0];
+  if(JSON.stringify(header) !== JSON.stringify(ODM_EXPECTED_HEADER)){
+    return {ok:false, error:'目標表頭跟預期不符，中止寫入（怕欄位對錯位置）：' + JSON.stringify(header)};
+  }
+  const startRow = sh.getLastRow() + 1;
+  const nCols = ODM_EXPECTED_HEADER.length;
+  ODM_TEXT_COLS.forEach(function(c){
+    sh.getRange(startRow, c, rows.length, 1).setNumberFormat('@');
+  });
+  sh.getRange(startRow, 1, rows.length, nCols).setValues(rows);
+  return {ok:true, wroteRows: rows.length, startRow: startRow, newLastRow: sh.getLastRow()};
 }
