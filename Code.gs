@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-17.150';
+const BACKEND_VERSION = '2026-08-18.156';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -231,6 +231,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   timeGetState_: () => timeGetState_(),
   timeLookupLocations_: (arg) => timeLookupLocations_(arg),
   releaseOrderClaimNow_: (arg) => releaseOrderClaimNow_(arg && arg.orderNo),
+  debugShoeSkuPatterns_: () => debugShoeSkuPatterns_(),
+  debugTestRowSelection_: () => debugTestRowSelection_(),
   diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
   peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
@@ -3306,9 +3308,93 @@ function listLocationContents(body){
 // 實測兩者併用，57% 的品號掃一次就能帶出同伴，平均一群 10.2 個。
 const SHOPEE_MAP_TAB = '蝦皮商品儲位對照';
 const SHOPEE_COL = {productId:2, sku:11};
-const SIZE_SUFFIX_RE = /(2XL|3XL|4XL|XXL|XS|S|M|L|XL)$/;
+// 2026-08-18 實測抓570筆品名含「鞋」的品號才發現：原本只認XS/S/M/L/XL這種
+// 服飾字母尺碼，鞋類常見的數字尺碼完全沒涵蓋到，鞋子彼此永遠配對不到同款。
+// 實測到兩種鞋碼寫法都是「字母色碼＋數字尺碼」直接接在品號尾端，沒有分隔符號：
+//   3碼＝尺碼×10補零（065＝6.5、080＝8.0、115＝11.5，實測570筆裡220筆這樣寫）
+//   2碼＝整數尺碼（35、44，實測81筆這樣寫，肉眼核對過品名裡的35-36/44都對得上）
+// (?<!\d) 這個負向後顧是刻意的：只吃「前面不是數字」的2~3碼數字，也就是一段
+// 「獨立、頭尾分明」的數字尺碼，不會去咬到更長數字序列的尾巴（例如品號本身
+// 是一長串流水號、剛好尾端3碼是某個不相干的編碼，這種不該被誤判成尺碼）。
+// 代價：極少數鞋碼是直接接在另一串數字後面、沒有字母色碼隔開的（例如
+// "...602115"，115其實是11.5號，但602跟115之間沒有字母），這種因為抓不到
+// 「數字尺碼從哪裡開始」的邊界，還是不會被歸到同一款——沒辦法安全處理，
+// 寧可漏抓也不要抓錯（抓錯會把兩個不相干的品號誤判成同款，後果更嚴重）。
+const SIZE_SUFFIX_RE = /(2XL|3XL|4XL|XXL|XS|S|M|L|XL|(?<!\d)\d{2,3})$/;
 
 function skuFamilyKey_(sku){ return String(sku||'').trim().replace(SIZE_SUFFIX_RE, ''); }
+
+// 暫時性診斷用：查證testLocationChange_挑選測試列的邏輯到底選中了哪一列、
+// 為什麼備註過濾條件沒有把系統備註排除掉。用完可以刪掉，不是常駐功能。
+function debugTestRowSelection_(){
+  const sh = getLocMapSheet_();
+  const lastRow = sh.getLastRow();
+  const data = sh.getRange(2, 1, lastRow - 1, LOCMAP_COL.note).getValues();
+  const candidates = [];
+  for(let i = 0; i < data.length && candidates.length < 5; i++){
+    const noteVal = String(data[i][LOCMAP_COL.note-1]||'').trim();
+    const sku = String(data[i][LOCMAP_COL.sku-1]||'').trim();
+    const loc = String(data[i][LOCMAP_COL.location-1]||'').trim();
+    if(sku && loc && noteVal){
+      candidates.push({row: i+2, sku: sku, noteVal: noteVal,
+        startsWithPrefix: noteVal.indexOf(LOC_NOTE_PREFIX) === 0,
+        indexOfPrefix: noteVal.indexOf(LOC_NOTE_PREFIX),
+        passesFilter: noteVal.indexOf(LOC_NOTE_PREFIX) !== 0});
+    }
+  }
+  return {ok:true, LOC_NOTE_PREFIX: LOC_NOTE_PREFIX, first5CandidatesWithNote: candidates};
+}
+
+// 暫時性診斷用：查證使用者反映「鞋類同尺碼沒有一起載入」——抽樣品名含「鞋」的
+// 品號，看實際SKU尾端長什麼樣子，SIZE_SUFFIX_RE目前只認XS/S/M/L/XL這種字母尺寸，
+// 鞋子常見的數字尺碼（38/39/40...）完全沒涵蓋到。用完可以刪掉，不是常駐功能。
+function debugShoeSkuPatterns_(){
+  const dst = getLocMapSheet_();
+  const last = dst.getLastRow();
+  const vals = dst.getRange(2, 1, last - 1, LOCMAP_COL.name).getValues();
+  const shoes = [];
+  vals.forEach(function(r){
+    const sku = String(r[LOCMAP_COL.sku - 1]||'').trim();
+    const name = String(r[LOCMAP_COL.name - 1]||'').trim();
+    if(!sku || !name) return;
+    if(name.indexOf('鞋') < 0) return;
+    shoes.push({sku: sku, name: name.slice(0, 40)});
+  });
+  // 依「去掉最後3碼」概略分堆，方便肉眼看同一款底下的SKU規律
+  const byPrefix = {};
+  shoes.forEach(function(s){
+    const p = s.sku.slice(0, -3);
+    (byPrefix[p] = byPrefix[p] || []).push(s.sku);
+  });
+  const groups = Object.keys(byPrefix).filter(function(p){ return byPrefix[p].length >= 2; })
+    .slice(0, 15).map(function(p){ return {prefix: p, skus: byPrefix[p]}; });
+
+  // 統計全部570筆的「尾端連續數字長度」分佈，不要只看抽樣的30筆就下結論——
+  // 要知道是不是全部都是3碼、還是也有2碼/4碼的情況，才能決定regex要涵蓋多寬。
+  const trailingDigitLenCount = {};
+  const trailingDigitValues = {};   // 長度3碼的情況，實際數值分佈長怎樣（驗證是不是size*10）
+  shoes.forEach(function(s){
+    const m = s.sku.match(/(\d+)$/);
+    const len = m ? m[1].length : 0;
+    trailingDigitLenCount[len] = (trailingDigitLenCount[len] || 0) + 1;
+    if(len === 3){
+      const v = parseInt(m[1], 10);
+      trailingDigitValues[v] = (trailingDigitValues[v] || 0) + 1;
+    }
+  });
+  const valueList = Object.keys(trailingDigitValues).map(Number).sort(function(a,b){ return a-b; });
+
+  // 長度2碼的樣本另外抓出來肉眼核對是不是真的是尺碼（怕是別的意思的兩碼數字）
+  const len2Samples = shoes.filter(function(s){
+    const m = s.sku.match(/(\d+)$/);
+    return m && m[1].length === 2;
+  }).slice(0, 20);
+
+  return {ok:true, totalShoeSkus: shoes.length, sample: shoes.slice(0, 30), multiSkuPrefixGroups: groups,
+          trailingDigitLenCount: trailingDigitLenCount,
+          len3ValueRange: valueList.length ? {min: valueList[0], max: valueList[valueList.length-1], distinctValues: valueList.length} : null,
+          len2Samples: len2Samples};
+}
 
 function findSiblingSkus(body){
   const sku = String((body && body.sku) || '').trim();
@@ -4057,12 +4143,19 @@ function testLocationChange_(){
   const lastRow = sh.getLastRow();
   const data = sh.getRange(2, 1, lastRow - 1, LOCMAP_COL.note).getValues();
 
-  // 主測試列：要有儲位、而且備註欄有人寫過字——備註保留是最需要驗的行為
+  // 主測試列：要有儲位、而且備註欄有「人」寫過字——備註保留是最需要驗的行為。
+  // 2026-08-18 抓到的真實bug：原本只檢查備註欄「非空白」，這張表是正式在用的
+  // 共用資料，隨時有人真的在做儲位異動，系統寫的備註（開頭是LOC_NOTE_PREFIX
+  // 「儲位異動：」）本來就非空白——選到那種列，這支測試會把系統自己寫的備註
+  // 誤判成「人工備註」，然後斷言它「被保留」，而mergeLocNote_其實正確地把
+  // 舊的系統備註蓋掉了（這是設計如此，只保留人寫的部分），於是測試就假警報。
+  // 改成明確排除開頭是LOC_NOTE_PREFIX的列，才是測試自己講的「人寫過字」。
   let idx = -1;
   for(let i = 0; i < data.length; i++){
+    const noteVal = String(data[i][LOCMAP_COL.note-1]||'').trim();
     if(String(data[i][LOCMAP_COL.sku-1]||'').trim()
        && String(data[i][LOCMAP_COL.location-1]||'').trim()
-       && String(data[i][LOCMAP_COL.note-1]||'').trim()){ idx = i; break; }
+       && noteVal && noteVal.indexOf(LOC_NOTE_PREFIX) !== 0){ idx = i; break; }
   }
   if(idx < 0) return {全部通過:false, 明細: steps.concat(['\u274c 找不到適合的測試列'])};
 
