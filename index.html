@@ -3331,6 +3331,9 @@ async function finishLocAudit(){
   flash('ok', auditTarget + ' 紀錄完成', '新增了 ' + res.okCount + ' 個品號的儲位登記'
     + (res.failCount ? '（' + res.failCount + ' 個失敗，可能剛好被別人異動）' : ''), 3000);
   shelfResult = null;   // 資料已經變了，關掉的查詢結果不能再用，下次重開要重查
+  loadLocVocab(true);   // 這次可能新增了一個地圖上原本沒有的儲位字串（例如新的臨時儲位），
+                         // 強制刷新選單快取，不用等後端6小時TTL自然過期才看得到。不等它跑完，
+                         // 不影響這裡的操作結束。
 }
 
 // ================= 調撥驗收 =================
