@@ -63,6 +63,13 @@
   .btn.sm{padding:7px 12px;font-size:12px;border-radius:8px;}
   .btn.block{width:100%;}
   .btn[disabled]{opacity:.4;pointer-events:none;}
+  /* 統一的「處理中」轉圈：加在按鈕文字後面，不覆蓋原本內容，圖示按鈕也能用。
+     跟withBusy()搭配——單一地方定義視覺樣式，之後所有等待中的按鈕長得一致。 */
+  .btn.is-busy{pointer-events:none;opacity:.75;}
+  .btn.is-busy::after{content:'';display:inline-block;width:13px;height:13px;margin-left:7px;
+    vertical-align:-2px;border:2px solid rgba(255,255,255,.35);border-top-color:currentColor;
+    border-radius:50%;animation:btn-spin .6s linear infinite;}
+  @keyframes btn-spin{to{transform:rotate(360deg);}}
 
   /* ---- big scan inputs ---- */
   .scan-input{width:100%;font-size:26px;padding:20px;text-align:center;letter-spacing:.5px;border-radius:var(--radius);
@@ -387,8 +394,8 @@
 
   <div class="confirm-mask" id="locAuditMask">
     <div class="confirm-box" style="max-width:520px;">
-      <h3>盤點儲位：<span class="loc-badge" id="auditLocLabel" style="font-size:16px;"></span></h3>
-      <p class="hint" style="margin-top:0;">把這個位置上實際擺著的商品一件一件掃過，掃到但地圖上還沒登記在這個儲位的，按「完成盤點」時會自動幫它加上這個儲位（不會動到它原本其他的存放點）。</p>
+      <h3>紀錄儲位商品：<span class="loc-badge" id="auditLocLabel" style="font-size:16px;"></span></h3>
+      <p class="hint" style="margin-top:0;">把這個位置上實際擺著的商品一件一件掃過，掃到但地圖上還沒登記在這個儲位的，按「紀錄完成」時會自動幫它加上這個儲位（不會動到它原本其他的存放點）。</p>
       <div class="scan-row">
         <input id="auditScanInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
         <button type="button" class="btn-camera" onclick="openCameraScan(auditScan)" title="用相機掃描">📷</button>
@@ -396,7 +403,7 @@
       <div id="auditResult"></div>
       <div class="row" style="margin-top:12px;gap:8px;">
         <button class="btn gray" id="auditCancel">取消</button>
-        <button class="btn green" id="auditFinish" style="flex:1;">完成盤點</button>
+        <button class="btn green" id="auditFinish" style="flex:1;">紀錄完成</button>
       </div>
     </div>
   </div>
@@ -1279,6 +1286,10 @@ async function gotoView(name){
   }
   if(name==='transfer'){
     renderStaffSelects();
+    // 切頁當下畫面可能還停留在上次的舊清單（或是空的），資料回來前先講清楚
+    // 「正在讀」，不要讓人以為這個倉庫真的沒有待驗收品項。
+    const pendingBox = document.getElementById('transferPendingList');
+    if(pendingBox && !pendingBox.innerHTML) pendingBox.innerHTML = '<p class="hint">載入中…</p>';
     loadTransferPending();
     setTimeout(function(){ const el = document.getElementById('transferScanInput'); if(el) el.focus(); }, 40);
   }
@@ -1319,6 +1330,23 @@ function flash(kind, big, sub, ms){
   document.getElementById('flashSub').textContent = sub||'';
   clearTimeout(flash._t);
   flash._t = setTimeout(()=>{ el.className='flash'; }, ms||900);
+}
+
+// 統一的「等待中」狀態工具。之前每個呼叫apiPost的地方要不要顯示等待狀態、
+// 顯示成什麼樣子，完全看那個地方的作者當下有沒有想到，結果非常不一致——
+// 有的地方會disable按鈕、有的地方會秀「查詢中…」文字、大部分地方什麼都沒有，
+// 使用者分不清楚是「還在處理」還是「沒反應」。統一成一個helper，往後新加的
+// 呼叫點只要包這一層就會自動有一致的行為，不用每次重新想。
+// 用法：const done = withBusy(btnEl); try{ await apiPost(...); } finally { done(); }
+function withBusy(el){
+  if(!el) return function(){};
+  const prevDisabled = el.disabled;
+  el.disabled = true;
+  el.classList.add('is-busy');
+  return function(){
+    el.disabled = prevDisabled;
+    el.classList.remove('is-busy');
+  };
 }
 
 // ============================================================
@@ -1741,6 +1769,10 @@ document.getElementById('homeBtnSync').addEventListener('click', ()=>{ gotoView(
 async function syncOrders(){
   const msg = document.getElementById('syncMsg');
   msg.className='msg'; msg.textContent = '同步中…';
+  // 首頁跟訂單資料頁各有一顆觸發按鈕，兩顆都鎖起來——不管是從哪顆點進來的，
+  // 另一顆同時存在DOM裡，不鎖住的話還是能被點到、觸發第二次重疊的同步。
+  const doneBusy1 = withBusy(document.getElementById('btnSync'));
+  const doneBusy2 = withBusy(document.getElementById('homeBtnSync'));
   try{
     const url = toExportCsvUrl(settings.sheetUrl);
     if(!url) throw new Error('設定頁的試算表連結看起來無效，請到設定頁確認');
@@ -1820,18 +1852,19 @@ async function syncOrders(){
   }catch(err){
     msg.className='msg err';
     msg.textContent = `同步失敗：${err.message}（請確認試算表分享設定為「知道連結的任何人」可檢視，且此裝置有網路連線）`;
-  }
+  }finally{ doneBusy1(); doneBusy2(); }
 }
 
 // ============================================================
 // 指定出貨Excel匯入已出貨紀錄
 // ============================================================
-document.getElementById('btnImportShipmentSheet').addEventListener('click', async ()=>{
+document.getElementById('btnImportShipmentSheet').addEventListener('click', async (e)=>{
   const msg = document.getElementById('shipmentSheetMsg');
   const raw = document.getElementById('inputShipmentSheetUrl').value;
   const sheetId = extractSheetId(raw);
   if(!sheetId){ msg.className='msg err'; msg.textContent = '看不出這是有效的 Google 試算表連結或ID。'; return; }
   msg.className='msg'; msg.textContent = '讀取中…';
+  const doneBusy = withBusy(e.currentTarget);
   try{
     const res = await fetch(`https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv`);
     if(!res.ok) throw new Error('HTTP ' + res.status);
@@ -1890,16 +1923,18 @@ document.getElementById('btnImportShipmentSheet').addEventListener('click', asyn
   }catch(err){
     msg.className='msg err';
     msg.textContent = `匯入失敗：${err.message}`;
-  }
+  }finally{ doneBusy(); }
 });
 
 // ============================================================
 // 手動CSV匯入
 // ============================================================
-document.getElementById('btnImport').addEventListener('click', async ()=>{
+document.getElementById('btnImport').addEventListener('click', async (e)=>{
   const parsed = parseSimpleCsv(document.getElementById('csvInput').value);
   const n = Object.keys(parsed).length;
   const msg = document.getElementById('importMsg');
+  msg.className = 'msg'; msg.textContent = '匯入中…';
+  const doneBusy = withBusy(e.currentTarget);
   try{
     const {added, updated, skippedShipped} = await mergeOrders(parsed);
     msg.className = n>0 ? 'msg ok' : 'msg err';
@@ -1909,7 +1944,7 @@ document.getElementById('btnImport').addEventListener('click', async ()=>{
   }catch(err){
     msg.className = 'msg err';
     msg.textContent = `匯入失敗：${err.message}`;
-  }
+  }finally{ doneBusy(); }
   renderPending(); renderHome();
 });
 document.getElementById('btnLoadSample').addEventListener('click', ()=>{
@@ -2679,13 +2714,14 @@ async function locSubmit(){
   // 而不是默默在主檔生出一列。
   if(items.some(function(x){ return x.isNew; })) payload.createIfMissing = true;
   let res;
+  const doneBusy = withBusy(document.getElementById('btnLocSubmit'));
   try{
     res = items.length === 1
       ? await apiPost('changeLocation', Object.assign({sku: items[0].sku}, payload))
       : await apiPost('changeLocationBatch', Object.assign({skus: items.map(function(x){ return x.sku; })}, payload));
   }catch(err){
     errorBeep(); flash('err','變更失敗，儲位沒有被改動', err.message||'', 3000); return;
-  }
+  }finally{ doneBusy(); }
 
   // 單筆跟批次的回應格式不同，統一成同一組結果再處理
   const results = (res && res.results) ? res.results
@@ -2785,9 +2821,11 @@ async function runShelfQuery(){
        level: document.getElementById('qLevel').value};
   const box = document.getElementById('qResult');
   box.innerHTML = '<p class="hint">查詢中…</p>';
+  const doneBusy = withBusy(document.getElementById('qRun'));
   let res;
   try{ res = await apiPost('listLocationContents', body); }
   catch(err){ box.innerHTML = '<p class="hint" style="color:var(--danger);">查詢失敗：' + escapeHtml(err.message||'') + '</p>'; return; }
+  finally{ doneBusy(); }
   if(!res || !res.ok){
     box.innerHTML = '<p class="hint" style="color:var(--danger);">' + escapeHtml((res && res.error) || '查詢失敗') + '</p>';
     return;
@@ -2827,7 +2865,7 @@ function renderShelfResult(){
       '<span class="loc-badge">' + escapeHtml(loc) + '</span>' +
       '<span class="hint">' + list.length + ' 個品號</span>' +
       '<button class="btn gray sm" onclick="addShelfGroupToBatch(\'' + escapeHtml(safe) + '\')">整格加入異動清單</button>' +
-      '<button class="btn gray sm" onclick="startLocAudit(\'' + escapeHtml(safe) + '\')">📋 盤點這個儲位</button>' +
+      '<button class="btn gray sm" onclick="startLocAudit(\'' + escapeHtml(safe) + '\')">📋 紀錄這個儲位的商品</button>' +
       '</div>';
     html += list.map(function(it){
       const zero = !it.stockWs && !it.stockMain;
@@ -2867,15 +2905,18 @@ function addShelfGroupToBatch(loc){
   renderLocBatch();
 }
 
-// ================= 儲位盤點（選定一個儲位，掃現場實際有的東西比對） =================
+// ================= 儲位商品品項紀錄（選定一個儲位，掃現場實際有的東西比對） =================
+// 注意：這不是完整的「儲位盤點系統」（那個以後才會做），這裡只負責「掃描比對＋
+// 自動補登記」這一件事，取名跟文案都刻意避開「盤點」兩個字，避免以後盤點系統
+// 上線時名字互相混淆。
 // 跟上面「整格加入異動清單」不一樣：那個是「地圖說這裡有什麼→我要搬去哪」，
 // 這裡反過來是「現場實際擺什麼→跟地圖記錄的比對，缺登記的自動補上」。
 // 只補（mode:'add'），不會因為現場沒掃到某個品號就把它從這個儲位移除——
-// 盤點當下漏掃很正常，不能因為漏掃就誤判成「東西不見了」而動了資料。
-let auditTarget = '';       // 正在盤點的儲位字串，例如 "K09-1"
+// 掃描當下漏掃很正常，不能因為漏掃就誤判成「東西不見了」而動了資料。
+let auditTarget = '';       // 正在紀錄的儲位字串，例如 "K09-1"
 let auditExisting = {};     // 地圖上原本就登記在這個儲位的品號 {sku: item}
 let auditConfirmed = {};    // 掃到、且地圖上本來就有登記的品號（核對一致）
-let auditNew = {};          // 掃到、但地圖上這個儲位還沒登記的品號（完成盤點時會新增）
+let auditNew = {};          // 掃到、但地圖上這個儲位還沒登記的品號（紀錄完成時會新增）
 
 function startLocAudit(loc){
   if(!shelfResult) return;
@@ -2895,13 +2936,13 @@ function startLocAudit(loc){
 async function auditScan(code){
   const raw = String(code||'').trim();
   if(!raw) return;
-  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位盤點要連上後端才能用',1800); return; }
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位商品紀錄要連上後端才能用',1800); return; }
   const cands = [raw].concat(barcodeMap[raw] || []);
   const alreadyScanned = cands.some(function(k){ return auditConfirmed[k] || auditNew[k]; });
   if(alreadyScanned){ errorBeep(); flash('err','這件剛剛掃過了', raw, 1400); return; }
 
   // 先看地圖上原本記錄的資料裡有沒有——這個不用等後端，反應更快，
-  // 而且盤點時「本來就在這裡」是最常見的情況。
+  // 而且「本來就在這裡」是最常見的情況。
   const hitExisting = cands.filter(function(k){ return auditExisting[k]; });
   if(hitExisting.length){
     hitExisting.forEach(function(k){ auditConfirmed[k] = auditExisting[k]; });
@@ -2912,8 +2953,12 @@ async function auditScan(code){
   }
 
   let res;
+  const input = document.getElementById('auditScanInput');
+  input.disabled = true;
+  input.placeholder = '查詢中…';
   try{ res = await apiPost('lookupLocations', {skus: cands}); }
   catch(err){ errorBeep(); flash('err','查詢失敗', err.message||'', 1800); return; }
+  finally{ input.disabled = false; input.placeholder = '請掃描商品條碼'; }
   const found = (res && res.found) || [];
   const fresh = (res && res.newItems) || [];
   const rows = found.concat(fresh);
@@ -2941,7 +2986,7 @@ function renderAuditUi(){
     + (newList.length ? '，另外掃到 <b style="color:var(--accent);">' + newList.length + '</b> 件地圖上還沒登記在這裡' : '')
     + '。</div>';
   if(newList.length){
-    html += '<div class="q-group"><div class="head"><span class="hint">完成盤點時會幫這些加上「' + escapeHtml(auditTarget) + '」</span></div>';
+    html += '<div class="q-group"><div class="head"><span class="hint">紀錄完成時會幫這些加上「' + escapeHtml(auditTarget) + '」</span></div>';
     html += newList.map(function(it){
       return '<div class="q-item">' + thumbHtml(it.sku, it.baseName) +
         '<div class="t"><b>' + escapeHtml(it.sku) + '</b>' +
@@ -2959,10 +3004,10 @@ async function finishLocAudit(){
   const skus = Object.keys(auditNew);
   if(!skus.length){
     document.getElementById('locAuditMask').classList.remove('show');
-    flash('ok','盤點完成','跟地圖記錄的一致，沒有需要新增的品號',2200);
+    flash('ok','紀錄完成','跟地圖記錄的一致，沒有需要新增的品號',2200);
     return;
   }
-  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位盤點要連上後端才能用',1800); return; }
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','儲位商品紀錄要連上後端才能用',1800); return; }
   const staffObj = staff.find(function(s){ return s.id === document.getElementById('locStaffSelect').value; });
   if(!staffObj){ errorBeep(); flash('err','請先選擇人員','儲位那頁上方要選一個人員才能送出',1800); return; }
   const btn = document.getElementById('auditFinish');
@@ -2972,7 +3017,7 @@ async function finishLocAudit(){
     res = await apiPost('changeLocationBatch', {
       skus: skus, toLocation: auditTarget, mode: 'add', kind: '盤點調整',
       createIfMissing: true, staffId: staffObj.id, staffName: staffObj.name,
-      note: '儲位盤點：現場掃到，地圖上原本沒登記在這個儲位'
+      note: '儲位商品紀錄：現場掃到，地圖上原本沒登記在這個儲位'
     });
   }catch(err){
     btn.disabled = false;
@@ -2987,7 +3032,7 @@ async function finishLocAudit(){
   }
   okBeep();
   document.getElementById('locAuditMask').classList.remove('show');
-  flash('ok', auditTarget + ' 盤點完成', '新增了 ' + res.okCount + ' 個品號的儲位登記'
+  flash('ok', auditTarget + ' 紀錄完成', '新增了 ' + res.okCount + ' 個品號的儲位登記'
     + (res.failCount ? '（' + res.failCount + ' 個失敗，可能剛好被別人異動）' : ''), 3000);
   shelfResult = null;   // 資料已經變了，關掉的查詢結果不能再用，下次重開要重查
 }
@@ -3068,8 +3113,8 @@ function transferRowHtml(it, isDone){
     (isDone ? '' :
       '<div class="tr-actions">' +
         '<button class="btn gray sm" ' + (it.scannedQty > 0 ? '' : 'disabled') +
-          ' onclick="transferUndo(\'' + safeSku + '\')">撤銷上一筆</button>' +
-        '<button class="btn gray sm" onclick="transferClose(' + it.row + ',\'' + safeSku + '\')">放棄</button>' +
+          ' onclick="transferUndo(this,\'' + safeSku + '\')">撤銷上一筆</button>' +
+        '<button class="btn gray sm" onclick="transferClose(this,' + it.row + ',\'' + safeSku + '\')">放棄</button>' +
       '</div>') +
   '</div>';
 }
@@ -3135,18 +3180,19 @@ async function transferScan(code){
   flash('ok', r.baseName || r.sku, '已掃 ' + r.scannedQty + ' / ' + r.qty, 1400);
 }
 
-async function transferUndo(sku){
+async function transferUndo(btn, sku){
   const row = transferLastRow[sku];
   if(!row){ errorBeep(); flash('err', '這個品號沒有可撤銷的紀錄', '重新整理頁面後撤銷紀錄會清空，只能撤銷這次開啟後自己掃的', 2600); return; }
   const staffObj = transferStaff();
   if(!staffObj){ errorBeep(); flash('err', '請先選擇驗收人員', '', 1600); return; }
   let res;
+  const doneBusy = withBusy(btn);
   try{
     res = await apiPost('scanTransferBatch', {ops: [{
       sku: sku, undo: true, matchedRow: row, staffId: staffObj.id, staffName: staffObj.name,
       time: new Date().toLocaleString('zh-TW')
     }]});
-  }catch(err){ errorBeep(); flash('err', '撤銷失敗', err.message || '', 2200); return; }
+  }catch(err){ errorBeep(); flash('err', '撤銷失敗', err.message || '', 2200); return; }finally{ doneBusy(); }
   const r = (res && res.results && res.results[0]) || null;
   if(!r || !r.ok){
     errorBeep();
@@ -3161,7 +3207,7 @@ async function transferUndo(sku){
   flash('ok', '已撤銷', sku, 1400);
 }
 
-async function transferClose(row, sku){
+async function transferClose(btn, row, sku){
   const staffObj = transferStaff();
   if(!staffObj){ errorBeep(); flash('err', '請先選擇驗收人員', '', 1600); return; }
   const it = transferPending.find(function(x){ return x.row === row; });
@@ -3178,8 +3224,9 @@ async function transferClose(row, sku){
   });
   if(!ok) return;
   let res;
+  const doneBusy = withBusy(btn);
   try{ res = await apiPost('closeTransferItem', {row: row, staffId: staffObj.id, staffName: staffObj.name, reason: '現場人工放棄'}); }
-  catch(err){ errorBeep(); flash('err', '放棄失敗', err.message || '', 2200); return; }
+  catch(err){ errorBeep(); flash('err', '放棄失敗', err.message || '', 2200); return; }finally{ doneBusy(); }
   if(!res || !res.ok){ errorBeep(); flash('err', '放棄失敗', (res && res.error) || '', 2600); return; }
   okBeep();
   transferPending = transferPending.filter(function(x){ return x.row !== row; });
@@ -4527,27 +4574,37 @@ document.getElementById('btnLoadBarcodeMap').addEventListener('click', async ()=
     el.textContent = `載入失敗：${err.message}`;
   }
 });
-document.getElementById('btnSaveSettings').addEventListener('click', async ()=>{
+document.getElementById('btnSaveSettings').addEventListener('click', async (e)=>{
   settings.sheetUrl = document.getElementById('settingSheetUrl').value.trim();
   settings.handledStatus = document.getElementById('settingHandledStatus').value;
   settings.backendUrl = document.getElementById('settingBackendUrl').value.trim();
   settings.barcodeSheetUrl = document.getElementById('settingBarcodeUrl').value.trim();
-  saveJSON(LS.settings, settings);
+  saveJSON(LS.settings, settings);   // 本機存檔是同步的，這一步當下就真的完成了
   const msg = document.getElementById('settingsMsg');
-  msg.className = 'msg ok';
-  msg.textContent = '設定已儲存。';
+  const doneBusy = withBusy(e.currentTarget);
+  // 原本這裡「設定已儲存」訊息在refreshFromBackend()送出前就先顯示了——本機存檔
+  // 確實當下就完成沒錯，但畫面看起來像整個流程都結束了，背景其實還在用新設定
+  // 重新連線，連線失敗時使用者不會知道發生過這件事。改成分兩階段講清楚。
   if(hasBackend()){
-    try{ await refreshFromBackend(); renderPending(); renderLog(); renderStaffList(); renderStaffSelects(); renderHome(); }
-    catch(err){ /* setConnStatus 已顯示錯誤，這裡不用再彈訊息 */ }
+    msg.className = 'msg'; msg.textContent = '設定已儲存，正在用新設定重新連線…';
+    try{
+      await refreshFromBackend(); renderPending(); renderLog(); renderStaffList(); renderStaffSelects(); renderHome();
+      msg.className = 'msg ok'; msg.textContent = '設定已儲存，重新連線成功。';
+    }catch(err){
+      msg.className = 'msg ok'; msg.textContent = '設定已儲存，但重新連線失敗（' + (err.message||'') + '），請確認網址是否正確。';
+    }
   } else {
     setConnStatus('', '單機模式');
+    msg.className = 'msg ok'; msg.textContent = '設定已儲存。';
   }
+  doneBusy();
 });
-document.getElementById('btnTestBackend').addEventListener('click', async ()=>{
+document.getElementById('btnTestBackend').addEventListener('click', async (e)=>{
   const url = document.getElementById('settingBackendUrl').value.trim();
   const msg = document.getElementById('settingsMsg');
   if(!url){ msg.className='msg err'; msg.textContent='請先輸入後端網址。'; return; }
   msg.className='msg'; msg.textContent='測試中…';
+  const doneBusy = withBusy(e.currentTarget);
   try{
     const res = await fetch(url, {method:'GET'});
     const data = await res.json();
@@ -4557,7 +4614,7 @@ document.getElementById('btnTestBackend').addEventListener('click', async ()=>{
   }catch(err){
     msg.className='msg err';
     msg.textContent = `連線失敗：${err.message}`;
-  }
+  }finally{ doneBusy(); }
 });
 document.getElementById('btnResetAll').addEventListener('click', ()=>{
   if(!confirm('確定要清除本機所有資料（訂單、出貨紀錄、人員、設定）？此動作無法復原。')) return;
@@ -4707,8 +4764,9 @@ if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就
   const el = document.getElementById(id);
   if(el) el.addEventListener(el.type==='checkbox'?'change':'input', renderPickList);
 });
-document.getElementById('btnPickRefresh').addEventListener('click', ()=>{
-  refreshFromBackend(true).then(()=>renderPickList());
+document.getElementById('btnPickRefresh').addEventListener('click', (e)=>{
+  const doneBusy = withBusy(e.currentTarget);
+  refreshFromBackend(true).then(()=>renderPickList()).finally(doneBusy);
 });
 document.getElementById('btnModeSingle').addEventListener('click', ()=>setPickMode('single'));
 document.getElementById('btnModeBatch').addEventListener('click', ()=>setPickMode('batch'));
