@@ -3129,6 +3129,11 @@ function formatPriceNum_(p){
   const n = Number(p);
   return isNaN(n) ? String(p||'') : n.toLocaleString('zh-TW');
 }
+// 賣場後台商品編輯頁——2026-08-20跟使用者要了一個真實網址核對過才用，
+// 不要憑印象改這個格式（之前查文件都查不到，唯一可信的來源是實測網址）。
+function shopeeSellerEditUrl_(itemId){
+  return 'https://seller.shopee.tw/portal/product/' + encodeURIComponent(itemId) + '?pageEntry=product_list';
+}
 function renderPriceQueryResult_(updatedAt){
   const box = document.getElementById('priceQueryResult');
   if(!priceQueryList.length){ box.innerHTML = ''; return; }
@@ -3142,8 +3147,10 @@ function renderPriceQueryResult_(updatedAt){
       '<div><b>' + escapeHtml(r.sku) + '</b>　<span class="tag">' + escapeHtml(r.shopName) + '</span></div>' +
       '<div class="hint" style="margin:2px 0;">' + escapeHtml(r.itemName) +
       (r.specName ? '（' + escapeHtml(r.specName) + '）' : '') + '</div>' +
+      '<div class="row" style="align-items:baseline;gap:10px;">' +
       '<div style="font-size:18px;font-weight:700;">NT$ ' + formatPriceNum_(r.price) + '</div>' +
-      '</div>';
+      (r.itemId ? '<a href="' + shopeeSellerEditUrl_(r.itemId) + '" target="_blank" rel="noopener" class="btn gray sm">前往賣場後台看即時價格 ↗</a>' : '') +
+      '</div></div>';
   }).join('') + '</div>';
   box.innerHTML = html;
 }
