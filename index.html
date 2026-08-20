@@ -3138,6 +3138,9 @@ function formatPriceNum_(p){
 function shopeeProductPageUrl_(shopId, itemId){
   return 'https://shopee.tw/product/' + encodeURIComponent(shopId) + '/' + encodeURIComponent(itemId);
 }
+// 一個貨號可能同時掛在好幾個賣場上架賣（同一批貨、共用倉）——實測「貨號對應
+// 選項」表裡36%的貨號都不只一個賣場，所以一次掃描結果要用matches陣列列出全部，
+// 不能只顯示第一個，不然等於幫使用者選了一個賣場而不自知。
 function renderPriceQueryResult_(updatedAt){
   const box = document.getElementById('priceQueryResult');
   if(!priceQueryList.length){ box.innerHTML = ''; return; }
@@ -3147,14 +3150,20 @@ function renderPriceQueryResult_(updatedAt){
       return '<div style="padding:8px;border-bottom:1px solid var(--border);color:var(--danger);">' +
         escapeHtml(r.sku) + '　查無這個貨號的售價資料</div>';
     }
+    const matchesHtml = r.matches.map(function(m){
+      return '<div style="padding:6px 0;">' +
+        '<div><span class="tag">' + escapeHtml(m.shopName) + '</span></div>' +
+        '<div class="hint" style="margin:2px 0;">' + escapeHtml(m.itemName) +
+        (m.specName ? '（' + escapeHtml(m.specName) + '）' : '') + '</div>' +
+        '<div class="row" style="align-items:baseline;gap:10px;">' +
+        '<div style="font-size:18px;font-weight:700;">NT$ ' + formatPriceNum_(m.price) + '</div>' +
+        (m.itemId ? '<a href="' + shopeeProductPageUrl_(m.shopId, m.itemId) + '" target="_blank" rel="noopener" class="btn gray sm">查看蝦皮商城即時售價 ↗</a>' : '') +
+        '</div></div>';
+    }).join('<div style="border-top:1px dashed var(--border);margin:4px 0;"></div>');
     return '<div style="padding:8px;border-bottom:1px solid var(--border);">' +
-      '<div><b>' + escapeHtml(r.sku) + '</b>　<span class="tag">' + escapeHtml(r.shopName) + '</span></div>' +
-      '<div class="hint" style="margin:2px 0;">' + escapeHtml(r.itemName) +
-      (r.specName ? '（' + escapeHtml(r.specName) + '）' : '') + '</div>' +
-      '<div class="row" style="align-items:baseline;gap:10px;">' +
-      '<div style="font-size:18px;font-weight:700;">NT$ ' + formatPriceNum_(r.price) + '</div>' +
-      (r.itemId ? '<a href="' + shopeeProductPageUrl_(r.shopId, r.itemId) + '" target="_blank" rel="noopener" class="btn gray sm">查看蝦皮商城即時售價 ↗</a>' : '') +
-      '</div></div>';
+      '<div><b>' + escapeHtml(r.sku) + '</b>' +
+      (r.matches.length > 1 ? '　<span class="hint">同時在 ' + r.matches.length + ' 個賣場上架</span>' : '') +
+      '</div>' + matchesHtml + '</div>';
   }).join('') + '</div>';
   box.innerHTML = html;
 }
