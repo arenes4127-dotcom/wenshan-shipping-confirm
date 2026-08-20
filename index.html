@@ -445,6 +445,21 @@
     </div>
   </div>
 
+  <div class="confirm-mask" id="priceQueryMask">
+    <div class="confirm-box" style="max-width:520px;">
+      <h3>查詢售價</h3>
+      <p class="hint" style="margin-top:0;">從「貨號對應選項」表讀最後一次匯出時登記的售價，<b>不是即時抓蝦皮</b>——資料新舊看你多久重新匯出一次，下面會標示資料最後更新時間。</p>
+      <div class="scan-row">
+        <input id="priceSkuInput" class="scan-input" type="text" placeholder="請掃描或輸入商品條碼／貨號" autocomplete="off">
+        <button type="button" class="btn-camera" onclick="openCameraScan(priceScan)" title="用相機掃描">📷</button>
+      </div>
+      <div id="priceQueryResult"></div>
+      <div class="row" style="margin-top:12px;">
+        <button class="btn gray block" id="priceQueryClose">關閉</button>
+      </div>
+    </div>
+  </div>
+
   <div class="confirm-mask" id="locAuditMask">
     <div class="confirm-box" style="max-width:520px;">
       <h3>紀錄儲位商品：<span class="loc-badge" id="auditLocLabel" style="font-size:16px;"></span></h3>
@@ -785,6 +800,7 @@
         <button class="btn gray block" id="btnShelfQuery">🔍 查詢貨架上有哪些商品</button>
         <button class="btn gray block" id="btnRecordLoc" style="margin-top:8px;">📋 紀錄儲位商品</button>
         <button class="btn gray block" id="btnClearLoc" style="margin-top:8px;">🧹 清空儲位</button>
+        <button class="btn gray block" id="btnPriceQuery" style="margin-top:8px;">💰 查詢售價</button>
       </div>
 
       <div class="card" id="locBatchBox" style="display:none;">
@@ -3107,6 +3123,61 @@ async function confirmClearLoc(){
   }
 }
 
+// ---- 查詢售價（讀「貨號對應選項」既有的價格欄，不是即時抓蝦皮，見Code.gs註解）----
+let priceQueryList = [];   // 累積這次開啟期間掃過的查詢結果，最新的排最上面，方便連續掃比較
+function formatPriceNum_(p){
+  const n = Number(p);
+  return isNaN(n) ? String(p||'') : n.toLocaleString('zh-TW');
+}
+function renderPriceQueryResult_(updatedAt){
+  const box = document.getElementById('priceQueryResult');
+  if(!priceQueryList.length){ box.innerHTML = ''; return; }
+  let html = updatedAt ? '<p class="hint">資料最後更新於：' + escapeHtml(updatedAt) + '</p>' : '';
+  html += '<div style="max-height:320px;overflow:auto;">' + priceQueryList.map(function(r){
+    if(!r.ok){
+      return '<div style="padding:8px;border-bottom:1px solid var(--border);color:var(--danger);">' +
+        escapeHtml(r.sku) + '　查無這個貨號的售價資料</div>';
+    }
+    return '<div style="padding:8px;border-bottom:1px solid var(--border);">' +
+      '<div><b>' + escapeHtml(r.sku) + '</b>　<span class="tag">' + escapeHtml(r.shopName) + '</span></div>' +
+      '<div class="hint" style="margin:2px 0;">' + escapeHtml(r.itemName) +
+      (r.specName ? '（' + escapeHtml(r.specName) + '）' : '') + '</div>' +
+      '<div style="font-size:18px;font-weight:700;">NT$ ' + formatPriceNum_(r.price) + '</div>' +
+      '</div>';
+  }).join('') + '</div>';
+  box.innerHTML = html;
+}
+
+async function priceScan(code){
+  const raw = String(code||'').trim();
+  if(!raw) return;
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','查詢售價要連上後端才能用',1800); return; }
+  const cands = [raw].concat(barcodeMap[raw] || []);
+  const el = document.getElementById('priceSkuInput');
+  if(el) el.disabled = true;
+  let res;
+  try{ res = await apiPost('getShopeePriceInfo', {skus: cands}); }
+  catch(err){
+    if(el){ el.disabled = false; el.focus(); }
+    errorBeep(); flash('err','查詢失敗', err.message||'', 2200);
+    return;
+  }
+  if(el){ el.disabled = false; el.focus(); }
+  if(!res || !res.ok){
+    errorBeep(); flash('err','查詢失敗', (res && res.error)||'', 2200);
+    return;
+  }
+  const hit = cands.map(function(k){ return res.results[k]; }).find(function(r){ return r && r.ok; });
+  if(hit){
+    okBeep();
+    priceQueryList.unshift(hit);
+  }else{
+    errorBeep();
+    priceQueryList.unshift({ok:false, sku: raw});
+  }
+  renderPriceQueryResult_(res.updatedAt);
+}
+
 async function runShelfQuery(){
   const zoneRaw = document.getElementById('qZone').value;
   if(!zoneRaw) return;
@@ -5154,6 +5225,20 @@ document.getElementById('clearLocCancel').addEventListener('click', function(){
 document.getElementById('clearLocConfirm').addEventListener('click', confirmClearLoc);
 document.getElementById('clearLocMask').addEventListener('click', function(e){
   if(e.target === document.getElementById('clearLocMask')) document.getElementById('clearLocMask').classList.remove('show');
+});
+document.getElementById('btnPriceQuery').addEventListener('click', function(){
+  priceQueryList = [];
+  document.getElementById('priceQueryResult').innerHTML = '';
+  document.getElementById('priceSkuInput').value = '';
+  document.getElementById('priceQueryMask').classList.add('show');
+  setTimeout(function(){ document.getElementById('priceSkuInput').focus(); }, 40);
+});
+wireScanInput(document.getElementById('priceSkuInput'), priceScan);
+document.getElementById('priceQueryClose').addEventListener('click', function(){
+  document.getElementById('priceQueryMask').classList.remove('show');
+});
+document.getElementById('priceQueryMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('priceQueryMask')) document.getElementById('priceQueryMask').classList.remove('show');
 });
 wireScanInput(document.getElementById('auditScanInput'), auditScan);
 document.getElementById('auditFinish').addEventListener('click', finishLocAudit);
