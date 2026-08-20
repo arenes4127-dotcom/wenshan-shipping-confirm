@@ -3129,10 +3129,14 @@ function formatPriceNum_(p){
   const n = Number(p);
   return isNaN(n) ? String(p||'') : n.toLocaleString('zh-TW');
 }
-// 賣場後台商品編輯頁——2026-08-20跟使用者要了一個真實網址核對過才用，
-// 不要憑印象改這個格式（之前查文件都查不到，唯一可信的來源是實測網址）。
-function shopeeSellerEditUrl_(itemId){
-  return 'https://seller.shopee.tw/portal/product/' + encodeURIComponent(itemId) + '?pageEntry=product_list';
+// 原本連去賣場後台的編輯頁（seller.shopee.tw/portal/product/...），使用者反映
+// 風險太高——那個頁面可以直接改價格/庫存，倉庫裝置共用、螢幕小，容易手滑按到
+// 儲存。改連蝦皮商城的公開商品頁（顧客看到的那個），純顯示不能改，而且這才是
+// 真正「即時售價」——顧客當下看到的就是這個價格。shopee.tw/product/{shopid}/{itemid}
+// 是蝦皮多年沒變過的公開商品頁網址格式（跟賣場後台那個內部路徑不同，不需要另外
+// 跟使用者要真實連結核對）。
+function shopeeProductPageUrl_(shopId, itemId){
+  return 'https://shopee.tw/product/' + encodeURIComponent(shopId) + '/' + encodeURIComponent(itemId);
 }
 function renderPriceQueryResult_(updatedAt){
   const box = document.getElementById('priceQueryResult');
@@ -3149,7 +3153,7 @@ function renderPriceQueryResult_(updatedAt){
       (r.specName ? '（' + escapeHtml(r.specName) + '）' : '') + '</div>' +
       '<div class="row" style="align-items:baseline;gap:10px;">' +
       '<div style="font-size:18px;font-weight:700;">NT$ ' + formatPriceNum_(r.price) + '</div>' +
-      (r.itemId ? '<a href="' + shopeeSellerEditUrl_(r.itemId) + '" target="_blank" rel="noopener" class="btn gray sm">前往賣場後台看即時價格 ↗</a>' : '') +
+      (r.itemId ? '<a href="' + shopeeProductPageUrl_(r.shopId, r.itemId) + '" target="_blank" rel="noopener" class="btn gray sm">查看蝦皮商城即時售價 ↗</a>' : '') +
       '</div></div>';
   }).join('') + '</div>';
   box.innerHTML = html;
