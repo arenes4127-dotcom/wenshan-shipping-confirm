@@ -3161,6 +3161,8 @@ function renderPriceQueryResult_(updatedAt){
         '<div style="color:var(--danger);">' + escapeHtml(r.sku) + '　查無蝦皮賣場售價資料</div>' +
         erpPriceLine_(r.erp) + '</div>';
     }
+    // 賣場價格底下不重複貼ERP價格——兩個數字擠在一起容易看混，賣場那邊只留
+    // 「查看即時售價」連結，ERP價格統一放在SKU區塊最上面一行就好。
     const matchesHtml = r.matches.map(function(m){
       return '<div style="padding:6px 0;">' +
         '<div><span class="tag">' + escapeHtml(m.shopName) + '</span></div>' +
