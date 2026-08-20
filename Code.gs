@@ -151,6 +151,7 @@ function doPost(e){
       case 'getLocationVocab': result = getLocationVocab(body); break;
       case 'findSiblingSkus': result = findSiblingSkus(body); break;
       case 'listLocationContents': result = listLocationContents(body); break;
+      case 'getShopeePriceInfo': result = getShopeePriceInfo_(body); break;
       case 'getTransferPending': result = getTransferPending(); break;
       case 'scanTransferBatch': result = scanTransferBatch(body.ops || []); break;
       case 'closeTransferItem': result = closeTransferItem(body); break;
@@ -233,6 +234,10 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   releaseOrderClaimNow_: (arg) => releaseOrderClaimNow_(arg && arg.orderNo),
   debugShoeSkuPatterns_: () => debugShoeSkuPatterns_(),
   debugTestRowSelection_: () => debugTestRowSelection_(),
+  debugRecentLocAudit_: (arg) => debugRecentLocAudit_(arg),
+  debugSampleSpecRows_: () => debugSampleSpecRows_(),
+  debugCrossShopSkuCollisions_: () => debugCrossShopSkuCollisions_(),
+  debugErpSourceHeader_: () => debugErpSourceHeader_(),
   odmCheckTarget_: () => odmCheckTarget_(),
   odmAppendRows_: (arg) => odmAppendRows_(arg && arg.rows),
   diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
@@ -3328,6 +3333,106 @@ function skuFamilyKey_(sku){ return String(sku||'').trim().replace(SIZE_SUFFIX_R
 
 // 暫時性診斷用：查證testLocationChange_挑選測試列的邏輯到底選中了哪一列、
 // 為什麼備註過濾條件沒有把系統備註排除掉。用完可以刪掉，不是常駐功能。
+// 暫時性診斷用：查證使用者反映「昨天新增的儲位沒有出現在下拉選單」——
+// 讀「儲位異動紀錄」裡跟「紀錄儲位商品」/「清空儲位」這兩個新功能有關的列，
+// 看實際寫入的toLocation字串長什麼樣、跟目前getLocationVocab快取(force刷新後)
+// 裡的textZones/known有沒有對上。用完可以刪掉，不是常駐功能。
+function debugRecentLocAudit_(body_){
+  const logSh = getSheet(SHEET_LOCLOG, LOCLOG_HEADER);
+  const last = logSh.getLastRow();
+  if(last < 2) return {ok:true, rows: [], note:'log是空的'};
+  const start = Math.max(2, last - 3000 + 1);
+  const vals = logSh.getRange(start, 1, last - start + 1, LOCLOG_HEADER.length).getDisplayValues();
+  const noteIdx = LOCLOG_HEADER.indexOf('note');
+  const toIdx = LOCLOG_HEADER.indexOf('toLocation');
+  const timeIdx = LOCLOG_HEADER.indexOf('logTime');
+  const skuIdx = LOCLOG_HEADER.indexOf('sku');
+  const moverIdx = LOCLOG_HEADER.indexOf('moverName');
+  const dayPrefix = String((body_ && body_.day) || '2026/08/18');
+  const rows = vals.filter(function(r){
+    return String(r[timeIdx]||'').indexOf(dayPrefix) === 0;
+  }).map(function(r){
+    return {logTime: r[timeIdx], sku: r[skuIdx], toLocation: r[toIdx], mover: r[moverIdx], note: r[noteIdx]};
+  });
+
+  const cache = CacheService.getScriptCache();
+  cache.remove(LOC_VOCAB_CACHE_KEY);
+  const vocab = getLocationVocab({force:true});
+
+  return {ok:true, matchedRows: rows.length, rows: rows,
+          vocabTextZones: vocab.textZones, vocabBuiltAt: vocab.builtAt,
+          vocabKnownSample: (vocab.known||[]).slice(0, 30)};
+}
+
+// 暫時性診斷用：抓幾筆「貨號對應選項」的真實 賣場ID/商品ID/商品選項ID/價格，
+// 拿去測蝦皮公開API（item/get）能不能用這組ID查到即時售價。用完可以刪掉，不是常駐功能。
+function debugSampleSpecRows_(){
+  const src = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
+  const sh = src.getSheetByName(SPEC_IMAGE_TAB) || src.getSheets()[0];
+  const last = sh.getLastRow();
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(x){ return String(x||'').trim(); });
+  const cols = ['賣場ID','賣場名稱','商品ID','商品名稱','商品選項ID','商品規格名稱','商品選項貨號','價格'];
+  const idx = {}; cols.forEach(function(c){ idx[c] = header.indexOf(c); });
+  const vals = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
+  const samples = [];
+  const seenShops = {};
+  for(let i = 0; i < vals.length && samples.length < 20; i++){
+    const row = vals[i];
+    const shopId = String(row[idx['賣場ID']]||'').trim();
+    if(!shopId || seenShops[shopId] >= 2) continue;
+    seenShops[shopId] = (seenShops[shopId]||0) + 1;
+    const rec = {};
+    cols.forEach(function(c){ rec[c] = row[idx[c]]; });
+    samples.push(rec);
+  }
+  return {ok:true, header: header, samples: samples};
+}
+
+// 暫時性診斷用：查證使用者反映「其他賣場也可以查嗎」時測到的現象——
+// 同一個貨號字串出現在不同賣場底下（例如 3288ADCLWK01BK 同時是青森戶外跟MCED
+// 的商品選項貨號），specSkuIndex_ 是「第一個出現的贏」，這種情況會靜默漏掉
+// 其他賣場的資料。查一下這種跨賣場撞號的貨號整張表有多少筆，判斷是不是要處理。
+// 用完可以刪掉，不是常駐功能。
+function debugCrossShopSkuCollisions_(){
+  const src = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
+  const sh = src.getSheetByName(SPEC_IMAGE_TAB) || src.getSheets()[0];
+  const last = sh.getLastRow();
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(x){ return String(x||'').trim(); });
+  const iSku = header.indexOf('商品選項貨號');
+  const iShop = header.indexOf('賣場ID');
+  const iShopName = header.indexOf('賣場名稱');
+  const vals = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
+  const bySku = {};
+  vals.forEach(function(row){
+    const sku = String(row[iSku]||'').trim();
+    if(!sku) return;
+    const shop = String(row[iShop]||'').trim();
+    const shopName = String(row[iShopName]||'').trim();
+    if(!bySku[sku]) bySku[sku] = {};
+    bySku[sku][shop] = shopName;
+  });
+  const collisions = [];
+  Object.keys(bySku).forEach(function(sku){
+    const shops = Object.keys(bySku[sku]);
+    if(shops.length > 1) collisions.push({sku: sku, shops: shops.map(function(s){ return bySku[sku][s] + '(' + s + ')'; })});
+  });
+  return {ok:true, totalSkus: Object.keys(bySku).length, collisionCount: collisions.length,
+          sample: collisions.slice(0, 20)};
+}
+
+// 暫時性診斷用：使用者要求「在價格旁備註ERP」，代表要把ERP主檔（「山物地圖(快取)」，
+// 這份程式碼裡本來就把它當ERP資料源，見reason:'not_in_erp'）裡的價格也顯示出來。
+// 先看這張表的表頭有哪些欄，確認價格欄叫什麼名字、在第幾欄。用完可以刪掉，不是常駐功能。
+function debugErpSourceHeader_(){
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
+  const src = ss.getSheetByName(LOC_SYNC_TAB);
+  if(!src) return {ok:false, error:'找不到「' + LOC_SYNC_TAB + '」分頁'};
+  const width = src.getLastColumn();
+  const header = src.getRange(2, 1, 1, width).getValues()[0].map(function(x){ return String(x||'').trim(); });
+  const sample = src.getRange(LOC_SYNC_FIRST_ROW, 1, 3, width).getValues();
+  return {ok:true, header: header, sample: sample};
+}
+
 function debugTestRowSelection_(){
   const sh = getLocMapSheet_();
   const lastRow = sh.getLastRow();
@@ -4467,6 +4572,102 @@ const SPEC_IMAGE_SOURCE_ID = '1DeqU2CnmM1XL-J3IudjDzc8OmMuv7Bqz';
 const SPEC_IMAGE_TAB = '貨號對應選項';
 const PRODUCT_IMAGE_PREFIX = 'https://s-cf-tw.shopeesz.com/file/';
 const SHEET_PRODUCT_IMAGE = '商品主圖';
+
+// ---- 查詢售價（讀「貨號對應選項」既有的價格欄，不是即時抓蝦皮）----
+// 蝦皮公開API實測會被風控擋下（error 90309999），官方Open Platform Partner API
+// 申請門檻高，改成退而求其次：這張表本來就是mass_update匯出流程順便帶進來的，
+// 已經有「價格」欄，直接讀出來就好，用檔案最後修改時間標示「這是什麼時候的價格」，
+// 不假裝是即時的。
+// 這張表是多賣場共用倉的品號主檔，同一個貨號實測有36%（14778/41328）會同時
+// 出現在不只一個賣場底下（同一批貨掛在青森戶外／MCED／XLAND／秀山莊／ODM
+// 裡的好幾個賣場上架賣）——第一版用「第一個出現的贏」建索引，會靜默漏掉其他
+// 賣場的價格，使用者問「其他賣場也可以查嗎」時實測抓到這個問題。索引改成
+// 「一個貨號對應一串列號」，回傳時把同一個貨號在所有賣場的價格都列出來。
+const SPEC_SKU_INDEX_CACHE_TTL_SEC = 300;
+const SPEC_SKU_INDEX_CACHE_SHARDS = 15;
+function specSkuIndexCacheGet_(){ return shardedCacheGet_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS); }
+function specSkuIndexCacheSet_(idx){ shardedCacheSet_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS, idx, SPEC_SKU_INDEX_CACHE_TTL_SEC); }
+
+function specSkuIndex_(sh, skuCol){
+  try{
+    const cached = specSkuIndexCacheGet_();
+    if(cached) return cached;
+  }catch(err){ /* 快取讀失敗就當沒快取，往下重新掃描 */ }
+  const last = sh.getLastRow();
+  const idx = {};
+  if(last >= 2){
+    const skus = sh.getRange(2, skuCol, last - 1, 1).getValues();
+    for(let i = 0; i < skus.length; i++){
+      const k = String(skus[i][0]||'').trim();
+      if(!k) continue;
+      (idx[k] = idx[k] || []).push(i + 2);
+    }
+  }
+  try{ specSkuIndexCacheSet_(idx); }catch(err){ /* 存快取失敗不影響這次結果 */ }
+  return idx;
+}
+
+function getShopeePriceInfo_(body){
+  const skus = ((body && body.skus) || []).map(function(x){ return String(x||'').trim(); })
+                                          .filter(function(x){ return x; });
+  if(!skus.length) return {ok:false, error:'請提供至少一個貨號'};
+
+  const src = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
+  const sh = src.getSheetByName(SPEC_IMAGE_TAB) || src.getSheets()[0];
+  if(!sh) return {ok:false, error:'找不到「' + SPEC_IMAGE_TAB + '」分頁'};
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+                    .map(function(x){ return String(x||'').trim(); });
+  const cols = ['賣場ID','賣場名稱','商品ID','商品名稱','商品選項ID','商品規格名稱','選項名稱','第二階規格','商品選項貨號','價格'];
+  const idx = {}; cols.forEach(function(c){ idx[c] = header.indexOf(c); });
+  if(idx['商品選項貨號'] < 0 || idx['價格'] < 0){
+    return {ok:false, error:'來源表欄位跟預期不符（缺 商品選項貨號／價格）'};
+  }
+  const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1);
+
+  const results = {};
+  skus.forEach(function(sku){
+    const rows = skuIndex[sku];
+    if(!rows || !rows.length){ results[sku] = {ok:false, sku: sku, reason:'not_found'}; return; }
+    const matches = rows.map(function(row){
+      const vals = sh.getRange(row, 1, 1, sh.getLastColumn()).getValues()[0];
+      const get = function(c){ return idx[c] >= 0 ? String(vals[idx[c]]||'').trim() : ''; };
+      return {shopId: get('賣場ID'), shopName: get('賣場名稱'),
+        itemId: get('商品ID'), itemName: get('商品名稱'),
+        modelId: get('商品選項ID'),
+        specName: get('商品規格名稱'),   // 蝦皮原始的「顏色,容量」逗號組合字串，本身就是完整的規格描述
+        optionName: get('選項名稱'), price: get('價格')};
+    });
+    results[sku] = {ok:true, sku: sku, matches: matches};
+  });
+
+  // 使用者要求「在價格旁備註ERP」——「山物地圖(快取)」除了庫存，還有自己的
+  // 「定價」「特惠價」兩欄（程式裡本來就把這張表當ERP資料源，見changeLocationBatch
+  // 的 reason:'not_in_erp'）。這是跟蝦皮賣場實際掛的售價完全獨立的另一份價格，
+  // 兩者放在一起才看得出賣場價格是不是忘了跟著ERP調整。不論這個貨號有沒有查到
+  // 蝦皮賣場資料都附上，貨號還沒上架蝦皮但ERP已經有定價的情況也看得到。
+  try{
+    const erpSs = openSheetMemo_(LOCMAP_SOURCE_ID);
+    const erpSrc = erpSs.getSheetByName(LOC_SYNC_TAB);
+    if(erpSrc){
+      const erpIdx = srcSkuIndex_(erpSrc);
+      skus.forEach(function(sku){
+        if(!results[sku]) return;
+        const row = erpIdx[sku];
+        if(!row) return;
+        const v = erpSrc.getRange(row, 1, 1, 14).getValues()[0];
+        results[sku].erp = {listPrice: String(v[12]||'').trim(), specialPrice: String(v[13]||'').trim()};
+      });
+    }
+  }catch(err){ /* ERP價格查不到就跳過，不影響蝦皮賣場售價這邊的結果 */ }
+
+  let updatedAt = '';
+  try{
+    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    updatedAt = Utilities.formatDate(DriveApp.getFileById(SPEC_IMAGE_SOURCE_ID).getLastUpdated(), tz, 'yyyy/MM/dd HH:mm');
+  }catch(err){ /* 拿不到最後修改時間就不顯示，不影響查價本身 */ }
+
+  return {ok:true, results: results, updatedAt: updatedAt};
+}
 
 // 來源是一份原生的 Google 試算表（實測 openById 開得起來），所以直接用 SpreadsheetApp 讀，
 // 不要走 CSV。第一版是抓 export?format=csv 回來自己逐字元解析，6MB 的字串在 Apps Script 裡

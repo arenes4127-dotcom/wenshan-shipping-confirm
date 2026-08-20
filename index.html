@@ -3141,14 +3141,25 @@ function shopeeProductPageUrl_(shopId, itemId){
 // 一個貨號可能同時掛在好幾個賣場上架賣（同一批貨、共用倉）——實測「貨號對應
 // 選項」表裡36%的貨號都不只一個賣場，所以一次掃描結果要用matches陣列列出全部，
 // 不能只顯示第一個，不然等於幫使用者選了一個賣場而不自知。
+// ERP主檔(山物地圖(快取))自己的「定價」「特惠價」，跟蝦皮賣場實際掛的售價是
+// 兩份獨立資料——用灰底tag清楚標「ERP」，不會跟賣場售價混在一起看。
+function erpPriceLine_(erp){
+  if(!erp || (!erp.listPrice && !erp.specialPrice)) return '';
+  const parts = [];
+  if(erp.listPrice) parts.push('定價 NT$ ' + formatPriceNum_(erp.listPrice));
+  if(erp.specialPrice) parts.push('特惠價 NT$ ' + formatPriceNum_(erp.specialPrice));
+  return '<div style="margin:4px 0;"><span class="tag">ERP</span> ' +
+    parts.join('　／　') + '</div>';
+}
 function renderPriceQueryResult_(updatedAt){
   const box = document.getElementById('priceQueryResult');
   if(!priceQueryList.length){ box.innerHTML = ''; return; }
   let html = updatedAt ? '<p class="hint">資料最後更新於：' + escapeHtml(updatedAt) + '</p>' : '';
   html += '<div style="max-height:320px;overflow:auto;">' + priceQueryList.map(function(r){
     if(!r.ok){
-      return '<div style="padding:8px;border-bottom:1px solid var(--border);color:var(--danger);">' +
-        escapeHtml(r.sku) + '　查無這個貨號的售價資料</div>';
+      return '<div style="padding:8px;border-bottom:1px solid var(--border);">' +
+        '<div style="color:var(--danger);">' + escapeHtml(r.sku) + '　查無蝦皮賣場售價資料</div>' +
+        erpPriceLine_(r.erp) + '</div>';
     }
     const matchesHtml = r.matches.map(function(m){
       return '<div style="padding:6px 0;">' +
@@ -3163,7 +3174,7 @@ function renderPriceQueryResult_(updatedAt){
     return '<div style="padding:8px;border-bottom:1px solid var(--border);">' +
       '<div><b>' + escapeHtml(r.sku) + '</b>' +
       (r.matches.length > 1 ? '　<span class="hint">同時在 ' + r.matches.length + ' 個賣場上架</span>' : '') +
-      '</div>' + matchesHtml + '</div>';
+      '</div>' + erpPriceLine_(r.erp) + matchesHtml + '</div>';
   }).join('') + '</div>';
   box.innerHTML = html;
 }
@@ -3192,8 +3203,11 @@ async function priceScan(code){
     okBeep();
     priceQueryList.unshift(hit);
   }else{
+    // 蝦皮賣場售價沒找到，但候選字串裡可能還是有ERP價格(.erp)——不能整包丟掉
+    // 重新捏一個乾淨的{ok:false,sku}，那樣ERP資料會跟著憑空消失。
     errorBeep();
-    priceQueryList.unshift({ok:false, sku: raw});
+    const missed = cands.map(function(k){ return res.results[k]; }).find(function(r){ return r; });
+    priceQueryList.unshift(Object.assign({ok:false, sku: raw}, missed ? {erp: missed.erp} : {}));
   }
   renderPriceQueryResult_(res.updatedAt);
 }
