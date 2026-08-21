@@ -240,6 +240,8 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupTransferStageSheet_: () => setupTransferStageSheet_(),
   testTransferFlow_: () => testTransferFlow_(),
   timeScanTransferBatch12_: () => timeScanTransferBatch12_(),
+  setupShopeeUpdateStageSheet_: () => setupShopeeUpdateStageSheet_(),
+  testShopeeUpdateStage_: () => testShopeeUpdateStage_(),
   debugTransferHeaders_: () => debugTransferHeaders_(),
   debugLocLogHeaders_: () => debugLocLogHeaders_(),
   verifyArchiveResult_: () => verifyArchiveResult_(),
@@ -4714,6 +4716,7 @@ const SPEC_SKU_INDEX_CACHE_TTL_SEC = 300;
 const SPEC_SKU_INDEX_CACHE_SHARDS = 15;
 function specSkuIndexCacheGet_(){ return shardedCacheGet_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS); }
 function specSkuIndexCacheSet_(idx){ shardedCacheSet_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS, idx, SPEC_SKU_INDEX_CACHE_TTL_SEC); }
+function specSkuIndexCacheClear_(){ shardedCacheClear_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS); }
 
 function specSkuIndex_(sh, skuCol){
   try{
@@ -5657,6 +5660,28 @@ function onEdit(e){
       catch(err){ msg = '❌ 匯入失敗：' + err; }
       sh.getRange('E2').setValue(false);
       sh.getRange('F2').setValue(msg);
+      return;
+    }
+    if(sh.getName() === SHEET_SHOPEE_STAGE){
+      if(e.range.getA1Notation() !== 'E5') return;
+      if(e.range.getValue() !== true) return;
+      const shopName = String(sh.getRange('B5').getValue() || '').trim();
+      const shop = SHOPEE_SHOPS.find(function(s){ return s.name === shopName; });
+      let msg;
+      if(!shop){
+        msg = '❌ 請先選擇賣場';
+      }else{
+        try{
+          const res = importShopeeUpdateStage_(shop.id, shop.name);
+          msg = res.ok
+            ? ('✅ ' + res.賣場 + '：解析' + res.解析列數 + '列，更新' + res.更新 + '筆、新增' + res.新增
+               + '筆、圖片更新' + res.圖片有更新到 + '筆'
+               + (res.缺貨號略過 ? '（' + res.缺貨號略過 + '列兩個貨號欄都空白已略過）' : ''))
+            : ('❌ ' + res.error);
+        }catch(err){ msg = '❌ 匯入失敗：' + err; }
+      }
+      sh.getRange('E5').setValue(false);
+      sh.getRange('A7').setValue('結果：' + msg);
       return;
     }
     if(sh.getName() !== SHEET_AMEND) return;
@@ -7240,4 +7265,403 @@ function odmAppendRows_(rows){
   });
   sh.getRange(startRow, 1, rows.length, nCols).setValues(rows);
   return {ok:true, wroteRows: rows.length, startRow: startRow, newLastRow: sh.getLastRow()};
+}
+
+// ================= 蝦皮資料更新（每週例行，跟ODM那次一次性匯入不同）=================
+// 使用者反映蝦皮賣場每週都有商品上架/規格/圖片異動（現場曾經反映「有些款式上錯
+// 顏色」），問「蝦皮的資料要放在哪裡」——之前每次都要我手動寫Python腳本轉檔，
+// 這次做成跟「調撥單匯入」同一套「貼上→勾選→自動處理」的暫存分頁，不用再每週
+// 找我處理。跟ODM那次不一樣：ODM是一次性全新賣場、全部都是新增列；這裡是既有
+// 賣場的例行更新，同一個貨號可能已經在表裡，要「找到就更新、找不到才新增」，
+// 不能整批盲目附加（會讓同一個貨號在表裡出現好幾列）。
+//
+// 拆成三個分頁：①控制面板（選賣場、勾選確認、看結果）②貼sales_info的地方
+// ③貼media_info的地方（選填，沒有圖片異動可以留空）。用三個分頁而不是一個分頁
+// 裡分兩個區塊，是因為這兩份原始檔案動輒上千列，如果擠在同一分頁的不同列範圍，
+// 使用者貼資料時很容易貼到蓋掉另一塊，各自獨立分頁最安全。
+const SHEET_SHOPEE_STAGE = '蝦皮資料更新';
+const SHEET_SHOPEE_STAGE_SALES = '蝦皮資料更新-銷售資料';
+const SHEET_SHOPEE_STAGE_MEDIA = '蝦皮資料更新-圖片資料';
+// 賣場清單跟[[reference_shopee_shop_ids]]記的一致，這裡另外存一份給下拉選單用
+// （下拉選單要顯示中文名稱給人選，實際比對用ID）。
+const SHOPEE_SHOPS = [
+  {id:'875898924', name:'秀山莊'}, {id:'1451255398', name:'XLAND'},
+  {id:'198785670', name:'青森戶外'}, {id:'820820755', name:'MCED'}, {id:'174330525', name:'ODM'}
+];
+
+function setupShopeeUpdateStageSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 全範圍的breakApart/clearDataValidations/removeCheckboxes只在分頁「本來就存在」
+  // （可能殘留上一次跑的合併儲存格/下拉選單/勾選框）才需要做——全新插入的分頁
+  // 本來就是空的，這些防呆清除都是純浪費。第一版沒有分這兩種情況，三個分頁
+  // 全部都做一次全範圍清除，實測在正式環境連續觸發兩次「試算表服務逾時」，
+  // 拆開後續才確認是這幾個全範圍操作疊加起來太貴。
+  let ctrl = ss.getSheetByName(SHEET_SHOPEE_STAGE);
+  const ctrlIsNew = !ctrl;
+  if(!ctrl) ctrl = ss.insertSheet(SHEET_SHOPEE_STAGE);
+  if(!ctrlIsNew){
+    ctrl.getRange(1, 1, ctrl.getMaxRows(), ctrl.getMaxColumns()).breakApart();
+    ctrl.clearNotes();
+    ctrl.getRange(1, 1, ctrl.getMaxRows(), ctrl.getMaxColumns()).clearDataValidations();
+    try{ ctrl.getRange(1, 1, ctrl.getMaxRows(), ctrl.getMaxColumns()).removeCheckboxes(); }catch(e){}
+  }
+  ctrl.clear();
+
+  ctrl.getRange('A1:H1').merge();
+  ctrl.getRange('A1').setValue('🛍️ 蝦皮資料更新（每週例行，同一賣場的商品規格/價格/圖片異動）')
+    .setFontSize(14).setFontWeight('bold').setBackground('#e8f0fe');
+
+  ctrl.getRange('A3').setValue([
+    '① 選好下面的「賣場」。',
+    '② 把 ERP 匯出的 mass_update_sales_info 資料整塊貼到「' + SHEET_SHOPEE_STAGE_SALES + '」分頁（要含表頭，貼在A1開始，原始檔案前面的說明列不用先刪掉，程式會自己找表頭在哪一列）。',
+    '③ 這次如果有圖片異動，把 mass_update_media_info 資料整塊貼到「' + SHEET_SHOPEE_STAGE_MEDIA + '」分頁（同樣含表頭，貼在A1開始）；沒有圖片異動可以留空，只更新價格/規格。',
+    '④ 回到這裡勾選「確認匯入」送出。找得到的貨號會更新，找不到的會新增，不會刪除表裡其他既有的列。',
+    '⑤ 送出後兩個貼上分頁會自動清空，可以貼下一個賣場的資料。'
+  ].join('\n')).setFontSize(10.5).setFontColor('#444').setWrap(true).setVerticalAlignment('top');
+  ctrl.setRowHeight(3, 130);
+
+  ctrl.getRange('A5').setValue('賣場').setFontWeight('bold');
+  ctrl.getRange('B5').setDataValidation(SpreadsheetApp.newDataValidation()
+    .requireValueInList(SHOPEE_SHOPS.map(function(s){ return s.name; }), true)
+    .setAllowInvalid(false).setHelpText('請選擇這次更新的賣場').build());
+  ctrl.getRange('D5').setValue('確認匯入').setFontWeight('bold');
+  ctrl.getRange('E5').insertCheckboxes().setValue(false);
+  ctrl.getRange('F5:H5').merge();
+  ctrl.getRange('F5').setValue('← 兩邊都貼好、賣場選好後勾這一格').setFontColor('#666666');
+
+  ctrl.getRange('A7:H7').merge();
+  ctrl.getRange('A7').setValue('結果：').setFontWeight('bold').setVerticalAlignment('top').setWrap(true);
+  ctrl.setRowHeight(7, 60);
+
+  [90, 110, 90, 90, 90, 90, 90, 200].forEach(function(w, i){ ctrl.setColumnWidth(i + 1, w); });
+  ctrl.setFrozenRows(3);
+
+  [SHEET_SHOPEE_STAGE_SALES, SHEET_SHOPEE_STAGE_MEDIA].forEach(function(name){
+    let sh = ss.getSheetByName(name);
+    const isNew = !sh;
+    if(!sh) sh = ss.insertSheet(name);
+    if(!isNew){
+      sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
+      sh.clearNotes();
+    }
+    sh.clear();
+  });
+
+  return {ok:true, 分頁: [SHEET_SHOPEE_STAGE, SHEET_SHOPEE_STAGE_SALES, SHEET_SHOPEE_STAGE_MEDIA]};
+}
+
+// 掃前幾列找表頭在哪一列——蝦皮原始匯出檔前面固定會有幾列英文/中文欄位說明
+// （跟填寫規則），不是資料本身，實測列數不保證每次一樣，所以不寫死「第幾列」，
+// 改成找「哪一列同時包含這些必要欄位名稱」，那一列才是真表頭，之後才是資料。
+function findShopeeHeaderRow_(sh, requiredLabels, maxScan){
+  const lastRow = Math.min(sh.getLastRow(), maxScan || 15);
+  const lastCol = sh.getLastColumn();
+  if(lastRow < 1 || lastCol < 1) return -1;
+  const vals = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
+  for(let r = 0; r < vals.length; r++){
+    const rowSet = {};
+    vals[r].forEach(function(c){ rowSet[String(c||'').trim()] = true; });
+    if(requiredLabels.every(function(lbl){ return rowSet[lbl]; })) return r + 1;
+  }
+  return -1;
+}
+
+// sales_info 解析：跟ODM匯入用同一套規則（見[[project_odm_shopee_import]]）——
+// 商品選項貨號優先、空的才退回主商品貨號；商品規格名稱用逗號切開判斷對應方式；
+// 選項序號＝同一個商品ID內「選項名稱」第一次出現的順序。
+function parseShopeeSalesInfo_(sh){
+  const required = ['商品ID', '商品選項ID', '商品規格名稱', '價格'];
+  const headerRow = findShopeeHeaderRow_(sh, required);
+  if(headerRow < 0) return {ok:false, error:'「' + SHEET_SHOPEE_STAGE_SALES + '」找不到表頭列（需要：' + required.join('／') + '），確認有貼上資料且含表頭'};
+  const lastRow = sh.getLastRow();
+  if(lastRow <= headerRow) return {ok:false, error:'「' + SHEET_SHOPEE_STAGE_SALES + '」表頭下面沒有資料列'};
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0].map(function(x){ return String(x||'').trim(); });
+  const idx = {};
+  ['商品ID','商品名稱','商品選項ID','商品規格名稱','主商品貨號','商品選項貨號','價格'].forEach(function(h){
+    idx[h] = headers.indexOf(h);
+  });
+  if(idx['商品選項貨號'] < 0 && idx['主商品貨號'] < 0){
+    return {ok:false, error:'「' + SHEET_SHOPEE_STAGE_SALES + '」找不到「商品選項貨號」也找不到「主商品貨號」，至少要有一個'};
+  }
+  const values = sh.getRange(headerRow + 1, 1, lastRow - headerRow, lastCol).getValues();
+  const get = function(row, h){ return idx[h] >= 0 ? row[idx[h]] : ''; };
+
+  // 選項序號：同一商品ID底下，選項名稱第一次出現的順序
+  const seqCounter = {};   // productId -> {optionName -> seq}
+  const nextSeq = {};      // productId -> 下一個可用序號
+
+  const records = [];
+  let noSku = 0;
+  values.forEach(function(row){
+    const productId = String(get(row,'商品ID')||'').trim();
+    if(!productId) return;
+    const variationSku = String(get(row,'商品選項貨號')||'').trim();
+    const parentSku = String(get(row,'主商品貨號')||'').trim();
+    const sku = variationSku || parentSku;
+    if(!sku){ noSku++; return; }
+    const specRaw = String(get(row,'商品規格名稱')||'').trim();
+    const segs = specRaw ? specRaw.split(',').map(function(s){ return s.trim(); }) : [];
+    let optionName = '', secondTier = '', matchType = '無規格(單一SKU)';
+    if(segs.length === 1){ optionName = segs[0]; matchType = '完全相符'; }
+    else if(segs.length >= 2){ optionName = segs[0]; secondTier = segs.slice(1).join(','); matchType = '第一階相符'; }
+
+    if(!seqCounter[productId]) seqCounter[productId] = {};
+    if(!nextSeq[productId]) nextSeq[productId] = 1;
+    if(optionName && !seqCounter[productId][optionName]){
+      seqCounter[productId][optionName] = nextSeq[productId]++;
+    }
+    const seq = optionName ? seqCounter[productId][optionName] : nextSeq[productId];
+
+    records.push({
+      sku: sku, itemId: productId, itemName: String(get(row,'商品名稱')||'').trim(),
+      modelId: String(get(row,'商品選項ID')||'').trim(), specName: specRaw,
+      seq: seq, optionName: optionName, secondTier: secondTier,
+      price: get(row,'價格'), matchType: matchType
+    });
+  });
+  return {ok:true, records: records, noSku: noSku, totalRows: values.length};
+}
+
+// media_info 解析：欄位是 option_N_for_variation_1（選項名稱，通常是顏色）／
+// option_image_N_for_variation_1（該選項的圖）成對出現，N最多到98，用regex
+// 動態找這些欄位在第幾欄，不寫死欄位位置（每個賣場實際用到的N不一樣多）。
+function parseShopeeMediaInfo_(sh){
+  const lastRow = sh.getLastRow();
+  if(lastRow < 1) return {ok:true, byProduct: {}};   // 沒貼資料就當作這次沒有圖片異動，不是錯誤
+  const required = ['商品ID'];
+  const headerRow = findShopeeHeaderRow_(sh, required);
+  if(headerRow < 0) return {ok:true, byProduct: {}};   // 貼了東西但找不到表頭列，同樣當沒有圖片異動，不因此擋掉價格/規格的更新
+  const lastCol = sh.getLastColumn();
+  if(lastRow <= headerRow) return {ok:true, byProduct: {}};
+  const headers = sh.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0].map(function(x){ return String(x||'').trim(); });
+  const idProductCol = headers.indexOf('商品ID');
+  if(idProductCol < 0) return {ok:true, byProduct: {}};
+
+  const pairCols = [];   // [{nameCol, imgCol}]
+  const nameRe = /^option_(\d+)_for_variation_1$/;
+  headers.forEach(function(h, c){
+    const m = nameRe.exec(h);
+    if(!m) return;
+    const imgCol = headers.indexOf('option_image_' + m[1] + '_for_variation_1');
+    if(imgCol >= 0) pairCols.push({nameCol: c, imgCol: imgCol});
+  });
+  if(!pairCols.length) return {ok:true, byProduct: {}};
+
+  const values = sh.getRange(headerRow + 1, 1, lastRow - headerRow, lastCol).getValues();
+  const byProduct = {};   // productId -> {optionName -> imageUrl}
+  values.forEach(function(row){
+    const productId = String(row[idProductCol]||'').trim();
+    if(!productId) return;
+    const map = byProduct[productId] || (byProduct[productId] = {});
+    pairCols.forEach(function(p){
+      const name = String(row[p.nameCol]||'').trim();
+      const img = String(row[p.imgCol]||'').trim();
+      if(name && img && !map[name]) map[name] = img;
+    });
+  });
+  return {ok:true, byProduct: byProduct};
+}
+
+// 主流程：解析兩個暫存分頁，跟目標表（貨號對應選項）合併——同一個賣場+同一個
+// 商品選項貨號已經有列就更新，沒有就新增。圖片欄只在media_info有給新值時才覆蓋，
+// 沒給就保留目標表原本的圖，不會因為這次沒貼圖片異動就把舊圖清空。
+function importShopeeUpdateStage_(shopId, shopName){
+  const salesSh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SHOPEE_STAGE_SALES);
+  const mediaSh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SHOPEE_STAGE_MEDIA);
+  if(!salesSh) return {ok:false, error:'找不到「' + SHEET_SHOPEE_STAGE_SALES + '」分頁'};
+
+  const salesRes = parseShopeeSalesInfo_(salesSh);
+  if(!salesRes.ok) return salesRes;
+  const mediaRes = mediaSh ? parseShopeeMediaInfo_(mediaSh) : {ok:true, byProduct:{}};
+
+  const target = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
+  const sh = target.getSheetByName(SPEC_IMAGE_TAB) || target.getSheets()[0];
+  if(!sh) return {ok:false, error:'找不到目標「' + SPEC_IMAGE_TAB + '」分頁'};
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(x){ return String(x||'').trim(); });
+  if(JSON.stringify(header) !== JSON.stringify(ODM_EXPECTED_HEADER)){
+    return {ok:false, error:'目標表頭跟預期不符，中止寫入（怕欄位對錯位置）：' + JSON.stringify(header)};
+  }
+  const idx = {}; ODM_EXPECTED_HEADER.forEach(function(h, i){ idx[h] = i; });
+
+  // 用既有的specSkuIndex_（品號→列號陣列，已經有CacheService快取）取候選列，
+  // 不要自己整欄重新掃一次60k+列的「賣場ID」跟「商品選項貨號」——第一版每次
+  // 呼叫都整欄重掃兩欄，拿正式環境測試時連續觸發「試算表服務逾時」，才確認
+  // 是這個重複的全表掃描太貴（跟getShopeePriceInfo_最早那版同一類問題）。
+  // 同一個貨號可能同時掛在別的賣場（[[wenshan-shipping-app]]記過36%的貨號跨
+  // 賣場撞號），候選列裡只挑賣場ID等於這次賣場的那一列，其餘賣場的列不能動。
+  const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1);
+  const shopColNum = idx['賣場ID'] + 1;
+  const existingRowFor = function(sku){
+    const candidates = skuIndex[sku];
+    if(!candidates || !candidates.length) return 0;
+    for(let i = 0; i < candidates.length; i++){
+      const row = candidates[i];
+      const rowShop = String(sh.getRange(row, shopColNum).getValue()||'').trim();
+      if(rowShop === shopId) return row;
+    }
+    return 0;
+  };
+
+  let updated = 0, added = 0, imageUpdated = 0;
+  const appendRows = [];
+  salesRes.records.forEach(function(rec){
+    const img = (mediaRes.byProduct[rec.itemId] && mediaRes.byProduct[rec.itemId][rec.optionName]) || '';
+    const row = existingRowFor(rec.sku);
+    if(row){
+      sh.getRange(row, idx['賣場名稱']+1).setValue(shopName);
+      sh.getRange(row, idx['商品ID']+1, 1, 2).setValues([[rec.itemId, rec.itemName]]);
+      sh.getRange(row, idx['商品選項ID']+1, 1, 2).setValues([[rec.modelId, rec.specName]]);
+      sh.getRange(row, idx['選項序號']+1, 1, 2).setValues([[rec.seq, rec.optionName]]);
+      if(img){ sh.getRange(row, idx['選項圖片']+1).setValue(img); imageUpdated++; }
+      sh.getRange(row, idx['第二階規格']+1, 1, 3).setValues([[rec.secondTier, rec.sku, rec.price]]);
+      sh.getRange(row, idx['對應方式']+1).setValue(rec.matchType);
+      updated++;
+    }else{
+      const arr = new Array(ODM_EXPECTED_HEADER.length).fill('');
+      arr[idx['賣場ID']] = shopId; arr[idx['賣場名稱']] = shopName;
+      arr[idx['商品ID']] = rec.itemId; arr[idx['商品名稱']] = rec.itemName;
+      arr[idx['商品選項ID']] = rec.modelId; arr[idx['商品規格名稱']] = rec.specName;
+      arr[idx['選項序號']] = rec.seq; arr[idx['選項名稱']] = rec.optionName;
+      arr[idx['選項圖片']] = img; arr[idx['第二階規格']] = rec.secondTier;
+      arr[idx['商品選項貨號']] = rec.sku; arr[idx['價格']] = rec.price;
+      arr[idx['對應方式']] = rec.matchType;
+      appendRows.push(arr);
+      if(img) imageUpdated++;
+    }
+  });
+
+  if(appendRows.length){
+    const start = sh.getLastRow() + 1;
+    ODM_TEXT_COLS.forEach(function(c){ sh.getRange(start, c, appendRows.length, 1).setNumberFormat('@'); });
+    sh.getRange(start, 1, appendRows.length, ODM_EXPECTED_HEADER.length).setValues(appendRows);
+    added = appendRows.length;
+  }
+
+  // 新增的貨號沒進到剛剛用的specSkuIndex_快取裡；不清掉的話，查詢售價要等
+  // 最多5分鐘快取自然過期才會看到這次更新的資料。查詢售價另外還有一層
+  // 「這個貨號查過的完整結果」快取（priceResultCacheKey_），如果剛好有人在
+  // 這次更新前5分鐘內查過同一個貨號，那層快取不會因為清了索引就跟著更新，
+  // 一併把這次動到的貨號從那層快取移掉。
+  if(added || updated){
+    try{ specSkuIndexCacheClear_(); }catch(err){}
+    try{
+      const touchedKeys = salesRes.records.map(function(rec){ return priceResultCacheKey_(rec.sku); });
+      CacheService.getScriptCache().removeAll(touchedKeys);
+    }catch(err){}
+  }
+
+  // 貼上分頁清空，準備貼下一個賣場的資料
+  salesSh.clear();
+  if(mediaSh) mediaSh.clear();
+
+  return {ok:true, 賣場: shopName, 解析列數: salesRes.totalRows, 缺貨號略過: salesRes.noSku,
+          更新: updated, 新增: added, 圖片有更新到: imageUpdated};
+}
+
+// 安全測試治具，跟testTransferFlow_同一套做法：全程只用ZZ-TEST-SHOPEE開頭、
+// 真實資料不可能撞到的測試貨號，貼假的sales_info+media_info（含刻意模擬的
+// 前導說明列，驗證表頭偵測真的能跳過雜訊列），跑一次新增、再跑一次更新
+// （驗證找得到既有列會更新而不是重複新增），測完把目標表（貨號對應選項）
+// 跟兩個暫存分頁的測試資料都清乾淨。
+function testShopeeUpdateStage_(){
+  const steps = [];
+  const ck = function(c, m){ steps.push((c ? '✅ ' : '❌ ') + m); };
+  const SHOP = SHOPEE_SHOPS[0];   // 隨便借一個真實賣場ID，測試貨號不會跟真實資料撞到
+  const PID = 'ZZ9999999';
+  const SKU1 = 'ZZ-TEST-SHOPEE-1', SKU2 = 'ZZ-TEST-SHOPEE-2';
+  const IMG1 = 'https://s-cf-tw.shopeesz.com/file/zztest0000000000000000000000001';
+  const IMG2 = 'https://s-cf-tw.shopeesz.com/file/zztest0000000000000000000000002';
+
+  // 測試只需要兩個貼上分頁存在，不需要控制面板那些合併儲存格/下拉選單/勾選框
+  // （importShopeeUpdateStage_直接呼叫、不經過onEdit，控制面板長什麼樣不影響這個測試），
+  // 用輕量的方式確保分頁存在就好，不要呼叫整個setupShopeeUpdateStageSheet_。
+  const ss_ = SpreadsheetApp.getActiveSpreadsheet();
+  let salesSh = ss_.getSheetByName(SHEET_SHOPEE_STAGE_SALES);
+  if(!salesSh) salesSh = ss_.insertSheet(SHEET_SHOPEE_STAGE_SALES);
+  let mediaSh = ss_.getSheetByName(SHEET_SHOPEE_STAGE_MEDIA);
+  if(!mediaSh) mediaSh = ss_.insertSheet(SHEET_SHOPEE_STAGE_MEDIA);
+  salesSh.clear(); mediaSh.clear();
+  const target = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
+  const targetSh = target.getSheetByName(SPEC_IMAGE_TAB) || target.getSheets()[0];
+  const beforeTargetRows = targetSh.getLastRow();
+
+  const writeSales = function(price1, price2){
+    // 前兩列模擬蝦皮原始檔案的說明列（不是表頭），驗證findShopeeHeaderRow_
+    // 真的會跳過去找到下面那列表頭，不是寫死「第一列一定是表頭」。
+    salesSh.getRange(1, 1).setValue('（這是模擬的說明列，不是表頭）');
+    salesSh.getRange(2, 1).setValue('（第二列雜訊）');
+    salesSh.getRange(3, 1, 1, 6).setValues([['商品ID','商品名稱','商品選項ID','商品規格名稱','商品選項貨號','價格']]);
+    salesSh.getRange(4, 1, 2, 6).setValues([
+      [PID, 'ZZ測試商品', 'ZZ-MODEL-1', '紅色', SKU1, price1],
+      [PID, 'ZZ測試商品', 'ZZ-MODEL-2', '藍色,L', SKU2, price2]
+    ]);
+  };
+  const writeMedia = function(){
+    mediaSh.getRange(1, 1, 1, 5).setValues([['商品ID','option_1_for_variation_1','option_image_1_for_variation_1','option_2_for_variation_1','option_image_2_for_variation_1']]);
+    mediaSh.getRange(2, 1, 1, 5).setValues([[PID, '紅色', IMG1, '藍色', IMG2]]);
+  };
+
+  try{
+    // ---- 第一次：新增 ----
+    writeSales(100, 200);
+    writeMedia();
+    const r1 = importShopeeUpdateStage_(SHOP.id, SHOP.name);
+    ck(r1.ok && r1.新增 === 2 && r1.更新 === 0, '第一次匯入：新增2筆、更新0筆：' + JSON.stringify(r1));
+
+    const idx = {}; ODM_EXPECTED_HEADER.forEach(function(h, i){ idx[h] = i; });
+    const findRow = function(sku){
+      const last = targetSh.getLastRow();
+      const skus = targetSh.getRange(2, idx['商品選項貨號']+1, last-1, 1).getValues();
+      for(let i = 0; i < skus.length; i++) if(String(skus[i][0]).trim() === sku) return i + 2;
+      return -1;
+    };
+    const row1 = findRow(SKU1);
+    ck(row1 > 0, '找得到SKU1剛新增的列');
+    if(row1 > 0){
+      const v = targetSh.getRange(row1, 1, 1, ODM_EXPECTED_HEADER.length).getValues()[0];
+      ck(v[idx['對應方式']] === '完全相符' && v[idx['選項名稱']] === '紅色' && v[idx['選項圖片']] === IMG1
+         && Number(v[idx['價格']]) === 100 && Number(v[idx['選項序號']]) === 1,
+         'SKU1（單一規格「紅色」）欄位正確：' + JSON.stringify(v));
+    }
+    const row2 = findRow(SKU2);
+    ck(row2 > 0, '找得到SKU2剛新增的列');
+    if(row2 > 0){
+      const v = targetSh.getRange(row2, 1, 1, ODM_EXPECTED_HEADER.length).getValues()[0];
+      ck(v[idx['對應方式']] === '第一階相符' && v[idx['選項名稱']] === '藍色' && v[idx['第二階規格']] === 'L'
+         && v[idx['選項圖片']] === IMG2 && Number(v[idx['選項序號']]) === 2,
+         'SKU2（兩階規格「藍色,L」）欄位正確：' + JSON.stringify(v));
+    }
+
+    // ---- 第二次：同樣的貨號、價格改變、這次不貼圖片異動 ----
+    writeSales(150, 250);
+    mediaSh.clear();   // 這次沒有圖片異動，模擬使用者留空
+    const r2 = importShopeeUpdateStage_(SHOP.id, SHOP.name);
+    ck(r2.ok && r2.新增 === 0 && r2.更新 === 2, '第二次匯入（沒貼圖片異動）：更新2筆、新增0筆（找到既有列，不是重複新增）：' + JSON.stringify(r2));
+    const row1b = findRow(SKU1);
+    ck(row1b === row1, '第二次更新的是同一列，不是新增新列');
+    if(row1b > 0){
+      const v = targetSh.getRange(row1b, 1, 1, ODM_EXPECTED_HEADER.length).getValues()[0];
+      ck(Number(v[idx['價格']]) === 150, '價格已更新成150：' + v[idx['價格']]);
+      ck(v[idx['選項圖片']] === IMG1, '這次沒貼圖片異動，舊圖片沒被清空：' + v[idx['選項圖片']]);
+    }
+  }catch(err){
+    steps.push('❌ 例外：' + err);
+  }finally{
+    // 清掉目標表跟兩個暫存分頁裡的測試資料
+    const last = targetSh.getLastRow();
+    const skuCol = ODM_EXPECTED_HEADER.indexOf('商品選項貨號') + 1;
+    if(last >= 2){
+      const skus = targetSh.getRange(2, skuCol, last - 1, 1).getValues();
+      for(let r = last; r >= 2; r--){
+        const sku = String(skus[r-2][0]||'').trim();
+        if(sku === SKU1 || sku === SKU2) targetSh.deleteRow(r);
+      }
+    }
+    salesSh.clear();
+    mediaSh.clear();
+    ck(targetSh.getLastRow() === beforeTargetRows, '目標表已清乾淨、列數還原');
+  }
+  return {全部通過: steps.every(function(x){ return x.indexOf('✅') === 0; }), 明細: steps};
 }
