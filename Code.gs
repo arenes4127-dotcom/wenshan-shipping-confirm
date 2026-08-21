@@ -242,6 +242,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   timeScanTransferBatch12_: () => timeScanTransferBatch12_(),
   setupShopeeUpdateStageSheet_: () => setupShopeeUpdateStageSheet_(),
   testShopeeUpdateStage_: () => testShopeeUpdateStage_(),
+  testBackupAuditSheets_: () => testBackupAuditSheets_(),
   debugTransferHeaders_: () => debugTransferHeaders_(),
   debugLocLogHeaders_: () => debugLocLogHeaders_(),
   verifyArchiveResult_: () => verifyArchiveResult_(),
@@ -1240,12 +1241,131 @@ function backupAndClearShippingLog_(){
   }catch(err){
     Logger.log('備份檔的儀表板頁寫入失敗（不影響出貨紀錄備份）：' + err);
   }
+
+  // 使用者要求重新規劃每日備份：原本只備份「出貨紀錄」，其他需要留下來備查的資料
+  // （人員名單、調撥單、系統紀錄、揀貨紀錄、儲位異動紀錄、調撥驗收紀錄、訂單）
+  // 完全沒有備份機制——調撥單/調撥驗收紀錄尤其是真的踩過的坑：舊做法（工作區
+  // 「調撥驗收」分頁）每天20:30被範本還原清空，使用者自己留了一份手動備份，
+  // 代表這件事已經咬過人（見SHEET_TRANSFER定義處的註解）。包在try裡：這段失敗
+  // 不能連累出貨紀錄本身的備份+清空，那才是每天一定要準時完成的事。
+  try{
+    const auditResult = backupAuditSheets_(backupSs);
+    Logger.log('備查資料備份：' + JSON.stringify(auditResult));
+  }catch(err){
+    Logger.log('備查資料備份失敗（不影響出貨紀錄備份）：' + err);
+    try{ appendSysLog_('每日備查資料備份失敗', '', '', String(err)); }catch(e){}
+  }
+
   const backupFile = DriveApp.getFileById(backupSs.getId());
   folder.addFile(backupFile);
   DriveApp.getRootFolder().removeFile(backupFile); // 只留在指定資料夾，不要同時出現在雲端硬碟根目錄
 
   sh.getRange(2, 1, lastRow - 1, lastCol).clearContent(); // 只清內容，條件式格式規則不會被清掉，明天新資料一樣自動套色
   Logger.log('已備份 '+(allValues.length-1)+' 列出貨紀錄到「'+fileName+'」，並清空出貨紀錄分頁準備明天使用。');
+}
+
+// ---------------- 每日備查資料備份（2026-08-21重新規劃）----------------
+// 稽核發現：出貨紀錄有備份+清空，已出貨訂單有歸檔，但其他一樣是「留下來備查」
+// 的資料完全沒有備份機制——人員名單被整份清空重寫時沒有任何備份；調撥單/
+// 調撥驗收紀錄從來沒被備份過（雖然目前沒有排程會清掉它們，但這正是舊「調撥
+// 驗收」工作區分頁被20:30範本還原沖掉、使用者得自己手動留一份備份的同一個坑，
+// 見SHEET_TRANSFER定義處的註解）；系統紀錄/揀貨紀錄/儲位異動紀錄這三個稽核
+// 日誌雖然沒被清空，但也完全沒有另外的備份保護。
+//
+// 兩種備份策略分開處理，不能一律「整份複製」也不能一律「只複製新增列」：
+//   全量快照（人員/調撥單/訂單）：這幾份表格的「既有列」內容會被之後的操作
+//   持續修改（人員被整批取代；調撥單的scannedQty/status會隨掃描更新；訂單的
+//   status/claimedBy等欄位會一直變動），只備份「新增的列」會漏掉「舊列後來
+//   怎麼變化」，所以每天整份複製一次目前的完整狀態。
+//   累加式（系統紀錄/揀貨紀錄/儲位異動紀錄/調撥驗收紀錄）：這四份是純粹的
+//   紀錄檔，一列寫入後內容不會再被修改，只需要備份「上次備份之後新增的列」，
+//   用Script Properties記住上次備份到第幾列，不用每天把從第一天累積到現在的
+//   全部歷史重複複製一次，備份檔才不會一年比一年肥大。
+function getBackupRowMarker_(key){
+  const v = PropertiesService.getScriptProperties().getProperty('backupRowMarker_' + key);
+  return v ? Number(v) : 1;   // 預設1＝表頭那一列，代表這個key還沒備份過任何資料列
+}
+function setBackupRowMarker_(key, row){
+  PropertiesService.getScriptProperties().setProperty('backupRowMarker_' + key, String(row));
+}
+
+// 全量快照：把來源分頁目前的完整內容（含表頭）整個複製成備份檔裡的新分頁。
+function backupFullSheetInto_(backupSs, sheetName, header){
+  const sh = getSheet(sheetName, header);
+  const lastRow = sh.getLastRow();
+  const lastCol = Math.max(sh.getLastColumn(), header.length);
+  const dst = backupSs.insertSheet(sheetName);
+  if(lastRow >= 1){
+    const vals = sh.getRange(1, 1, lastRow, lastCol).getValues();
+    dst.getRange(1, 1, vals.length, lastCol).setValues(vals);
+  }
+  return {列數: Math.max(lastRow - 1, 0)};
+}
+
+// 累加式：只把「上次備份之後新增的列」複製到備份檔的新分頁，並把記號往前推進。
+// 第一次呼叫（還沒有記號）視為記號在第1列，等於這次會把目前累積的全部歷史都
+// 備份一次——這是刻意的：第一次上線這個功能時，之前累積的資料也要被涵蓋到，
+// 不能只從「今天開始」算，不然開始日之前的歷史就永遠沒有備份過。
+function backupIncrementalSheetInto_(backupSs, sheetName, header){
+  const sh = getSheet(sheetName, header);
+  const lastRow = sh.getLastRow();
+  const marker = getBackupRowMarker_(sheetName);
+  const fromRow = Math.max(marker + 1, 2);
+  if(lastRow < fromRow){
+    setBackupRowMarker_(sheetName, Math.max(lastRow, 1));
+    return {新增列數: 0};
+  }
+  const lastCol = Math.max(sh.getLastColumn(), header.length);
+  const n = lastRow - fromRow + 1;
+  const vals = sh.getRange(fromRow, 1, n, lastCol).getValues();
+  const dst = backupSs.insertSheet(sheetName);
+  dst.getRange(1, 1, 1, header.length).setValues([header]);
+  dst.getRange(2, 1, n, lastCol).setValues(vals);
+  setBackupRowMarker_(sheetName, lastRow);
+  return {新增列數: n};
+}
+
+function backupAuditSheets_(backupSs){
+  const results = {};
+  [['人員', SHEET_STAFF, STAFF_HEADER],
+   ['調撥單', SHEET_TRANSFER, TRANSFER_HEADER],
+   ['訂單', SHEET_ORDERS, ORDERS_HEADER]
+  ].forEach(function(t){
+    try{ results[t[0]] = backupFullSheetInto_(backupSs, t[1], t[2]); }
+    catch(err){ results[t[0]] = {error: String(err)}; }
+  });
+  [['系統紀錄', SHEET_SYSLOG, SYSLOG_HEADER],
+   ['揀貨紀錄', SHEET_PICKLOG, PICKLOG_HEADER],
+   ['儲位異動紀錄', SHEET_LOCLOG, LOCLOG_HEADER],
+   ['調撥驗收紀錄', SHEET_TRANSFERLOG, TRANSFERLOG_HEADER]
+  ].forEach(function(t){
+    try{ results[t[0]] = backupIncrementalSheetInto_(backupSs, t[1], t[2]); }
+    catch(err){ results[t[0]] = {error: String(err)}; }
+  });
+  return results;
+}
+
+// 安全測試：不能直接呼叫backupAndClearShippingLog_來測——那會真的清空「今天」
+// 的出貨紀錄，今天實際出貨的紀錄還沒結束就會被提早清掉，不能拿來當測試手段。
+// 改成只測backupAuditSheets_本身：建一份用完即丟的暫存試算表當備份目標（不影響
+// 「出貨紀錄」正式備份檔），對正式的來源分頁做唯讀彙整（backupFullSheetInto_/
+// backupIncrementalSheetInto_都只有讀來源、寫入目標試算表，不會動到來源分頁
+// 本身一個字）。累加式備份會推進Script Properties裡的標記，測試前後刻意存檔
+// 還原，才不會讓「今晚真正排程要跑的備份」誤以為今天的資料已經備份過而漏掉。
+function testBackupAuditSheets_(){
+  const markerKeys = ['系統紀錄', '揀貨紀錄', '儲位異動紀錄', '調撥驗收紀錄'];
+  const savedMarkers = {};
+  markerKeys.forEach(function(k){ savedMarkers[k] = getBackupRowMarker_(k); });
+
+  const testSs = SpreadsheetApp.create('TEST_backupAuditSheets_' + new Date().getTime());
+  let result;
+  try{
+    result = backupAuditSheets_(testSs);
+  }finally{
+    markerKeys.forEach(function(k){ setBackupRowMarker_(k, savedMarkers[k]); });
+    try{ DriveApp.getFileById(testSs.getId()).setTrashed(true); }catch(e){}
+  }
+  return result;
 }
 
 // ---------------- 每天的收尾維護 ----------------
