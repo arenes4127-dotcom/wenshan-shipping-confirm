@@ -944,6 +944,10 @@
           <button class="btn gray" id="btnLoadProductImages">立即載入商品主圖</button>
           <span class="tag" id="productImageStatus">尚未載入</span>
         </div>
+        <p class="hint" style="margin-top:10px;">蝦皮賣場的商品圖片對照每週一清晨會自動重新整理一次。如果現場發現圖片跟實際商品不符（例如顏色對錯），不用等到下週一，可以按這裡立即從蝦皮資料重新整理——這個動作要重新掃過所有賣場的商品資料，需要一段時間（可能十幾秒到更久），送出後請耐心等待，不要重複點擊。</p>
+        <div class="row">
+          <button class="btn gray" id="btnRefreshProductImages">🔄 立即從蝦皮重新整理商品圖片</button>
+        </div>
       </div>
 
       <div class="section-label">包貨/出貨人員</div>
@@ -4955,6 +4959,39 @@ function renderBarcodeMapStatus(){
 document.getElementById('btnLoadProductImages').addEventListener('click', async ()=>{
   settings.productImageSheetUrl = document.getElementById('settingProductImageUrl').value.trim();
   saveJSON(LS.settings, settings);
+  const el = document.getElementById('productImageStatus');
+  el.className = 'tag'; el.textContent = '載入中…';
+  try{
+    await loadProductImages();
+    renderProductImageStatus();
+    renderItemTable && current && renderItemTable();
+  }catch(err){
+    el.className = 'tag danger';
+    el.textContent = `載入失敗：${err.message}`;
+  }
+});
+
+// 「立即載入商品主圖」只是把後端「商品主圖」分頁目前的內容抓到這台裝置的本機
+// 快取——如果賣場後台本身有新圖，那張分頁要先被重新整理過，這個按鈕本身
+// 抓不到新資料。這裡另外呼叫後端重新掃一次蝦皮來源、重建那張分頁，完成後
+// 自動接著跑一次上面那個「載入」，兩步驟串起來，人不用手動點兩次。
+document.getElementById('btnRefreshProductImages').addEventListener('click', async function(){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','重新整理商品圖片要連上後端才能用',1800); return; }
+  const btn = document.getElementById('btnRefreshProductImages');
+  const doneBusy = withBusy(btn);
+  let res;
+  try{ res = await apiPost('refreshProductImages', {}); }
+  catch(err){
+    doneBusy(); errorBeep(); flash('err','重新整理失敗', err.message||'', 2600);
+    return;
+  }
+  doneBusy();
+  if(!res || !res.ok){
+    errorBeep(); flash('err','重新整理失敗', (res && res.error)||'', 2600);
+    return;
+  }
+  okBeep();
+  flash('ok', '商品圖片已重新整理', '正在把最新內容載入這台裝置…', 2000);
   const el = document.getElementById('productImageStatus');
   el.className = 'tag'; el.textContent = '載入中…';
   try{

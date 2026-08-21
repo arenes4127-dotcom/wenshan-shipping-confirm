@@ -125,11 +125,23 @@ function doGet(e){
   return respond(getState());
 }
 
+// 多人同步時，這些動作只讀不寫（不動文山地圖／訂單／出貨紀錄等共用表格，
+// 頂多寫CacheService——那是Google自己管理的服務，本來就設計成給並發存取，
+// 不需要跟其他人搶同一把鎖）。原本全部動作共用一把全域鎖，代表一個人查詢
+// 慢就會卡住別人的寫入、甚至卡住其他人的查詢——查詢售價效能優化那次事故
+// 就是因為這樣，一個慢查詢直接讓整個系統看起來斷線。這些動作跳過鎖，
+// 讓查詢彼此、以及查詢跟寫入都能並行，不用排隊等同一把鎖。
+const NO_LOCK_ACTIONS = {
+  lookupLocation: 1, lookupLocations: 1, getLocationVocab: 1, findSiblingSkus: 1,
+  listLocationContents: 1, getShopeePriceInfo: 1, getTransferPending: 1, __versioncheck__: 1
+};
+
 function doPost(e){
-  const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
+  const body = JSON.parse(e.postData.contents);
+  const needsLock = !NO_LOCK_ACTIONS[body.action];
+  const lock = needsLock ? LockService.getScriptLock() : null;
+  if(lock) lock.waitLock(10000);
   try{
-    const body = JSON.parse(e.postData.contents);
     let result;
     switch(body.action){
       case 'mergeOrders': result = mergeOrders(body.orders || {}); break;
@@ -155,6 +167,7 @@ function doPost(e){
       case 'getTransferPending': result = getTransferPending(); break;
       case 'scanTransferBatch': result = scanTransferBatch(body.ops || []); break;
       case 'closeTransferItem': result = closeTransferItem(body); break;
+      case 'refreshProductImages': result = importProductImages_(); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -166,7 +179,7 @@ function doPost(e){
   }catch(err){
     return respond({ok:false, error: String(err)});
   }finally{
-    lock.releaseLock();
+    if(lock) lock.releaseLock();
   }
 }
 
@@ -226,6 +239,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   debugTransferStageA4A5_: () => debugTransferStageA4A5_(),
   setupTransferStageSheet_: () => setupTransferStageSheet_(),
   testTransferFlow_: () => testTransferFlow_(),
+  timeScanTransferBatch12_: () => timeScanTransferBatch12_(),
   debugTransferHeaders_: () => debugTransferHeaders_(),
   debugLocLogHeaders_: () => debugLocLogHeaders_(),
   verifyArchiveResult_: () => verifyArchiveResult_(),
@@ -2072,7 +2086,7 @@ function listAutomationTriggers_(){
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
     'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_', 'releaseStaleClaims_',
-    'syncMissingLocationRowsDaily_', 'mirrorTransferScheduled_'];
+    'syncMissingLocationRowsDaily_', 'mirrorTransferScheduled_', 'importProductImages_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -2085,9 +2099,15 @@ function installAutomationTriggers_(){
   // 揀貨時才不會又看到一批「未建立」。也避開 19:30／20:30 那兩個會清資料的時段。
   ScriptApp.newTrigger('syncMissingLocationRowsDaily_').timeBased().atHour(7).nearMinute(30).everyDays(1).create();
   // 調撥驗收鏡射：掃描/匯入當下已經會盡力鏡射一次，這個排程是保險——
-  // 萬一那次鏡射剛好失敗（外部試算表暫時打不開之類），20分鐘內會自己補上，
+  // 萬一那次鏡射剛好失敗（外部試算表暫時打不開之類），15分鐘內會自己補上，
   // 不會一直卡在「上次成功鏡射」的舊畫面。
-  ScriptApp.newTrigger('mirrorTransferScheduled_').timeBased().everyMinutes(20).create();
+  // 原本寫everyMinutes(20)，但Apps Script的everyMinutes只接受1/5/10/15/30，
+  // 20是不合法的值——這行從加進來那天起，只要installAutomationTriggers_被呼叫
+  // 就會在這裡直接丟例外中斷，後面的dailyMaintenance_/hourlySync_/releaseStaleClaims_
+  // 全部沒有真的被安裝成排程，一直沒被發現（因為呼叫這支函式後不會馬上看到症狀，
+  // 是這次要加新排程重新呼叫才順著錯誤訊息抓到）。改成15，跟下面releaseStaleClaims_
+  // 同樣的檢查頻率。
+  ScriptApp.newTrigger('mirrorTransferScheduled_').timeBased().everyMinutes(15).create();
   // 已出貨訂單歸檔刻意排在 19:30，不能排在 20:30——
   // 「文山出貨 工作區」自己也有一個 20:30 的觸發器（dailyArchiveAndResetAuto），
   // 它會把「文山出貨V2」從模板還原、也就是清空當天的訂單資料。我們的歸檔要讀那份鏡像
@@ -2104,9 +2124,16 @@ function installAutomationTriggers_(){
   // 15分鐘檢查一次，最壞情況是認領後45分鐘被釋放，跟設定值差得不多。
   ScriptApp.newTrigger('releaseStaleClaims_').timeBased().everyMinutes(15).create();
 
+  // 商品主圖對照：使用者反映蝦皮商品每週都會有新品上架／規格變動，圖片對照原本
+  // 完全沒有排程、只能靠人手動叫我重跑，現場才會發現「有些款式上錯顏色」都是
+  // 舊圖沒更新到。排在週一清晨6點（早於7:30儲位補列、9:00訂單同步，離峰不影響
+  // 現場使用），一週一次跟得上資料變動的頻率；現場如果等不及排程、當下就想修正
+  // 掉錯圖，另外在「設定」頁加了「立即從蝦皮重新整理商品圖片」按鈕手動觸發同一支函式。
+  ScriptApp.newTrigger('importProductImages_').timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(6).nearMinute(0).create();
+
   Logger.log('已安裝自動排程：訂單同步(9:00/9:15/14:05/14:15) + 出貨紀錄備份(20:00)'
     +' + 每日維護：自動結案＋歸檔(19:30) + 舊核對表單與物流確認同步(每小時)'
-    +' + 認領逾時釋放(每15分鐘)，共'
+    +' + 認領逾時釋放(每15分鐘) + 商品主圖對照(每週一6:00)，共'
     +ScriptApp.getProjectTriggers().length+'個觸發器。');
 }
 
@@ -2871,13 +2898,35 @@ function scanTransferBatch(ops){
       status: vals[idx][col.status]});
   });
 
-  Object.keys(changedRows).forEach(function(key){
-    const i = Number(key), row = i + 2;
-    sh.getRange(row, col.scannedQty + 1).setValue(vals[i][col.scannedQty]);
-    sh.getRange(row, col.status + 1).setValue(vals[i][col.status]);
-    sh.getRange(row, col.doneAt + 1).setNumberFormat('@');
-    sh.getRange(row, col.doneAt + 1).setValue(vals[i][col.doneAt]);
-  });
+  // 原本每一列改動都分開打4次setValue/setNumberFormat，現場一次掃一批（例如
+  // 連續掃10件）就是40次來回，是「掃完後查核偏慢」的主因之一。vals已經是
+  // 整張表剛讀出來的權威內容（這個函式全程都在寫入鎖保護下執行，不會有其他
+  // 寫入者插進來），所以改動的列不管有沒有全部相鄰，直接用「最小列～最大列」
+  // 的範圍一次寫回scannedQty+status（兩欄相鄰，一次setValues）、doneAt（另一次），
+  // 沒改動的列寫回去的還是它原本的值，不會被覆蓋錯。範圍異常大（例如同一批
+  // 掃描剛好命中表格頭尾兩端）才退回逐列寫，避免真的很分散時反而多寫一堆無謂的儲存格。
+  const changedIdxs = Object.keys(changedRows).map(Number);
+  if(changedIdxs.length){
+    const minI = Math.min.apply(null, changedIdxs), maxI = Math.max.apply(null, changedIdxs);
+    const span = maxI - minI + 1;
+    if(span <= 500){
+      const scannedStatusBlock = [], doneAtBlock = [];
+      for(let i = minI; i <= maxI; i++){
+        scannedStatusBlock.push([vals[i][col.scannedQty], vals[i][col.status]]);
+        doneAtBlock.push([vals[i][col.doneAt]]);
+      }
+      sh.getRange(minI + 2, col.scannedQty + 1, span, 2).setValues(scannedStatusBlock);
+      sh.getRange(minI + 2, col.doneAt + 1, span, 1).setNumberFormat('@');
+      sh.getRange(minI + 2, col.doneAt + 1, span, 1).setValues(doneAtBlock);
+    }else{
+      changedIdxs.forEach(function(i){
+        const row = i + 2;
+        sh.getRange(row, col.scannedQty + 1, 1, 2).setValues([[vals[i][col.scannedQty], vals[i][col.status]]]);
+        sh.getRange(row, col.doneAt + 1).setNumberFormat('@');
+        sh.getRange(row, col.doneAt + 1).setValue(vals[i][col.doneAt]);
+      });
+    }
+  }
 
   if(logRows.length){
     const logSh = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER);
@@ -2887,7 +2936,7 @@ function scanTransferBatch(ops){
          .setValues(logRows.map(function(o){ return TRANSFERLOG_HEADER.map(function(h){ return o[h]; }); }));
   }
 
-  try{ mirrorTransferToWorkspace_(); }catch(err){}
+  try{ mirrorTransferToWorkspaceDebounced_(); }catch(err){}
   return {ok:true, results: results};
 }
 
@@ -2913,7 +2962,7 @@ function closeTransferItem(body){
   getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER).appendRow([now,
     v[colOf(TRANSFER_HEADER, 'batchId') - 1], sku, v[colOf(TRANSFER_HEADER, 'baseName') - 1],
     staffId, staffName, 'cancelled', reason]);
-  try{ mirrorTransferToWorkspace_(); }catch(err){}
+  try{ mirrorTransferToWorkspaceDebounced_(); }catch(err){}
   return {ok:true, row: row, sku: sku};
 }
 
@@ -2926,6 +2975,25 @@ const TRANSFER_WORKBOOK_ID = '1wMrjppENakDhT354VJ6-W7txoG9FSwYR2OjMzPRl2KQ';
 const TRANSFER_MIRROR_TAB = '調撥驗收';
 const TRANSFER_MIRROR_FIRST_ROW = 2;
 const TRANSFER_MIRROR_MAX_ROWS = 200;   // 該分頁公式鋪到約219列，抓200留一點餘裕
+
+// 這支函式本身很貴：開一份外部試算表＋重新整欄讀「調撥單」「調撥驗收紀錄」
+// （scanTransferBatch剛剛才讀過一次「調撥單」，這裡等於又讀一次）＋寫兩塊
+// 各200列的儲存格——原本掃描/放棄每呼叫一次就同步跑一次，現場連續掃一批
+// 就要付好幾次這個代價，是「掃完後查核偏慢」的另一個主因。這個鏡射本來就已經
+// 有20分鐘一次的排程（mirrorTransferScheduled_，見installAutomationTriggers_）
+// 當保底，不需要每一下掃描都即時同步——改成短TTL去抖動：一段時間內只有第一次
+// 呼叫真的執行，後面幾次直接跳過，讓「文山出貨 工作區」的調撥驗收分頁還是
+// 幾秒內就能看到最新掃描結果，但不會每一下都重付一次開外部檔案+大量寫入的代價。
+const TRANSFER_MIRROR_DEBOUNCE_KEY = 'transferMirrorDebounceV1';
+const TRANSFER_MIRROR_DEBOUNCE_SEC = 8;
+function mirrorTransferToWorkspaceDebounced_(){
+  const cache = CacheService.getScriptCache();
+  let recentlyMirrored = false;
+  try{ recentlyMirrored = !!cache.get(TRANSFER_MIRROR_DEBOUNCE_KEY); }catch(err){ /* 讀快取失敗就當沒去抖動過，照樣鏡射 */ }
+  if(recentlyMirrored) return {ok:true, skipped:true};
+  try{ cache.put(TRANSFER_MIRROR_DEBOUNCE_KEY, '1', TRANSFER_MIRROR_DEBOUNCE_SEC); }catch(err){ /* 存不進去不影響這次鏡射本身 */ }
+  return mirrorTransferToWorkspace_();
+}
 
 function mirrorTransferToWorkspace_(){
   const ss = openSheetMemo_(TRANSFER_WORKBOOK_ID);
@@ -3215,6 +3283,57 @@ function testTransferFlow_(){
   return {全部通過: steps.every(function(x){ return x.indexOf('✅') === 0; }), 明細: steps};
 }
 
+// 暫時性診斷用：使用者問「12筆資料反應時間大約是多少」，跟testTransferFlow_
+// 同一套安全做法——全程只用ZZ-TEST-TIME開頭、真實資料不可能撞到的測試品號，
+// 匯入12件（各應收1件）進「調撥單」，模擬現場一次連續掃一批12件（一次
+// scanTransferBatch呼叫帶12個op，這才是真實使用情境——現場是連續掃完一批才
+// 送出，不是掃一件送一次），只計時這一次呼叫本身，測完把後端測試列跟外部
+// 工作區的鏡射都沖乾淨。用完可以刪掉，不是常駐功能。
+function timeScanTransferBatch12_(){
+  const N = 12;
+  const dst = getSheet(SHEET_TRANSFER, TRANSFER_HEADER);
+  const logSh = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER);
+  const beforeRows = dst.getLastRow();
+  const beforeLog = logSh.getLastRow();
+  const batchId = 'TR-TIME-TEST';
+  const now = nowStamp_();
+  const skus = [];
+  for(let i = 1; i <= N; i++) skus.push('ZZ-TEST-TIME-' + i);
+
+  let result = {ok:false};
+  try{
+    const rows = skus.map(function(sku){
+      return {batchId: batchId, sku: sku, baseName:'計時測試商品', spec:'', qty:1, unit:'', reason:'',
+        price:'', priceTotal:'', extraNote:'', scannedQty:0, status:'open',
+        importedAt: now, importedBy:'計時測試', doneAt:''};
+    });
+    const start = dst.getLastRow() + 1;
+    dst.getRange(start, colOf(TRANSFER_HEADER,'batchId'), rows.length, 1).setNumberFormat('@');
+    dst.getRange(start, colOf(TRANSFER_HEADER,'sku'), rows.length, 1).setNumberFormat('@');
+    dst.getRange(start, colOf(TRANSFER_HEADER,'importedAt'), rows.length, 1).setNumberFormat('@');
+    dst.getRange(start, 1, rows.length, TRANSFER_HEADER.length)
+       .setValues(rows.map(function(o){ return TRANSFER_HEADER.map(function(h){ return o[h]; }); }));
+
+    const ops = skus.map(function(sku){ return {sku: sku, staffId:'T', staffName:'計時測試'}; });
+    const t0 = Date.now();
+    const res = scanTransferBatch(ops);
+    const elapsedMs = Date.now() - t0;
+
+    result = {ok:true, elapsedMs: elapsedMs, itemsScanned: N,
+      allMatched: res.ok && res.results.every(function(r){ return r.ok; }),
+      allDone: res.ok && res.results.every(function(r){ return r.status === 'done'; })};
+  }catch(err){
+    result = {ok:false, error: String(err)};
+  }finally{
+    const last = dst.getLastRow();
+    for(let r = last; r > beforeRows; r--) dst.deleteRow(r);
+    const lastLog = logSh.getLastRow();
+    for(let r = lastLog; r > beforeLog; r--) logSh.deleteRow(r);
+    try{ mirrorTransferToWorkspace_(); }catch(err){}
+  }
+  return result;
+}
+
 // ---- 貨架商品查詢 ----
 // 「A04-3 上面到底有什麼」現在只能開試算表用眼睛找。盤點、找空位、
 // 查「這格說有貨但架上沒有」都需要反過來查：給位置，列出商品。
@@ -3432,6 +3551,14 @@ function debugErpSourceHeader_(){
   const sample = src.getRange(LOC_SYNC_FIRST_ROW, 1, 3, width).getValues();
   return {ok:true, header: header, sample: sample};
 }
+
+// timeShopeePriceInfo_ 已移除：這個診斷函式在正式環境測試時（呼叫兩次
+// getShopeePriceInfo_，且剛好遇到 specSkuIndex_/srcSkuIndex_ 快取同時過期）
+// 觸發了異常長時間卡住，佔用全域 LockService 鎖，導致正式環境短暫連不上
+// （__versioncheck__ 也一起被卡住）。原因還沒完全查清楚（懷疑是短時間內對
+// 同一份外部試算表打太多次API觸發了節流），為了不再冒風險已經整個移除，
+// 不要重寫一個行為類似（在一次執行內重複呼叫會碰大量試算表讀取的函式）的
+// 診斷函式，之後要測效能請只呼叫一次、間隔久一點、且不要連續重試。
 
 function debugTestRowSelection_(){
   const sh = getLocMapSheet_();
@@ -4607,66 +4734,123 @@ function specSkuIndex_(sh, skuCol){
   return idx;
 }
 
+// 「資料最後更新於」的時間戳每次都要另外打一次Drive API才查得到（~400ms），
+// 但這個值變動很少（只有重新匯出mass_update時才會變），加短TTL快取，跟其他
+// 資料源同一套做法。
+// 補充（第二次嘗試）：第一次拿掉了「整包查詢結果依品號快取」這個優化，因為
+// 拿正式環境測試時遇到長時間卡住；後來用「執行項目」頁面直接看到當下同時有
+// 好幾個doPost在跑、連doGet都要6秒多，判斷是那次測試方式本身的問題（同一次
+// 執行內連續呼叫兩次getShopeePriceInfo_，等於卡lock的時間直接翻倍）加上短時間
+// 內對同兩份外部試算表打太多次API造成的暫時性變慢，不是這個快取邏輯本身的
+// bug（重新檢查過，沒有無限迴圈或明顯錯誤）。這次重新加回來，但測試方式改成
+// 一次只送一個請求、間隔久一點，不再一次執行內重複呼叫。
+const PRICE_RESULT_CACHE_TTL_SEC = 300;
+function priceResultCacheKey_(sku){ return 'priceInfoV1_' + sku; }
+function priceResultCacheGetMany_(skus){
+  const cache = CacheService.getScriptCache();
+  const keys = skus.map(priceResultCacheKey_);
+  const vals = cache.getAll(keys);
+  const out = {};
+  skus.forEach(function(sku){
+    const raw = vals[priceResultCacheKey_(sku)];
+    if(raw === undefined) return;
+    try{ out[sku] = JSON.parse(raw); }catch(err){ /* 壞掉的快取值當沒中，往下重新查 */ }
+  });
+  return out;
+}
+function priceResultCacheSetMany_(map){
+  const keys = Object.keys(map);
+  if(!keys.length) return;
+  const cache = CacheService.getScriptCache();
+  const payload = {};
+  keys.forEach(function(sku){ payload[priceResultCacheKey_(sku)] = JSON.stringify(map[sku]); });
+  try{ cache.putAll(payload, PRICE_RESULT_CACHE_TTL_SEC); }catch(err){ /* 存不進去就算了，不影響這次查詢結果 */ }
+}
+
+const SPEC_UPDATED_AT_CACHE_KEY = 'specUpdatedAtV1';
+const SPEC_UPDATED_AT_CACHE_TTL_SEC = 300;
+function getSpecUpdatedAtCached_(){
+  const cache = CacheService.getScriptCache();
+  try{
+    const hit = cache.get(SPEC_UPDATED_AT_CACHE_KEY);
+    if(hit) return hit;
+  }catch(err){ /* 讀快取失敗就當沒快取 */ }
+  let updatedAt = '';
+  try{
+    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    updatedAt = Utilities.formatDate(DriveApp.getFileById(SPEC_IMAGE_SOURCE_ID).getLastUpdated(), tz, 'yyyy/MM/dd HH:mm');
+    if(updatedAt) cache.put(SPEC_UPDATED_AT_CACHE_KEY, updatedAt, SPEC_UPDATED_AT_CACHE_TTL_SEC);
+  }catch(err){ /* 拿不到最後修改時間就不顯示，不影響查價本身 */ }
+  return updatedAt;
+}
+
 function getShopeePriceInfo_(body){
   const skus = ((body && body.skus) || []).map(function(x){ return String(x||'').trim(); })
                                           .filter(function(x){ return x; });
   if(!skus.length) return {ok:false, error:'請提供至少一個貨號'};
 
-  const src = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
-  const sh = src.getSheetByName(SPEC_IMAGE_TAB) || src.getSheets()[0];
-  if(!sh) return {ok:false, error:'找不到「' + SPEC_IMAGE_TAB + '」分頁'};
-  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
-                    .map(function(x){ return String(x||'').trim(); });
-  const cols = ['賣場ID','賣場名稱','商品ID','商品名稱','商品選項ID','商品規格名稱','選項名稱','第二階規格','商品選項貨號','價格'];
-  const idx = {}; cols.forEach(function(c){ idx[c] = header.indexOf(c); });
-  if(idx['商品選項貨號'] < 0 || idx['價格'] < 0){
-    return {ok:false, error:'來源表欄位跟預期不符（缺 商品選項貨號／價格）'};
-  }
-  const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1);
-
   const results = {};
-  skus.forEach(function(sku){
-    const rows = skuIndex[sku];
-    if(!rows || !rows.length){ results[sku] = {ok:false, sku: sku, reason:'not_found'}; return; }
-    const matches = rows.map(function(row){
-      const vals = sh.getRange(row, 1, 1, sh.getLastColumn()).getValues()[0];
-      const get = function(c){ return idx[c] >= 0 ? String(vals[idx[c]]||'').trim() : ''; };
-      return {shopId: get('賣場ID'), shopName: get('賣場名稱'),
-        itemId: get('商品ID'), itemName: get('商品名稱'),
-        modelId: get('商品選項ID'),
-        specName: get('商品規格名稱'),   // 蝦皮原始的「顏色,容量」逗號組合字串，本身就是完整的規格描述
-        optionName: get('選項名稱'), price: get('價格')};
-    });
-    results[sku] = {ok:true, sku: sku, matches: matches};
+  const cachedResults = priceResultCacheGetMany_(skus);
+  const missing = skus.filter(function(sku){
+    if(cachedResults[sku] === undefined) return true;
+    results[sku] = cachedResults[sku];
+    return false;
   });
 
-  // 使用者要求「在價格旁備註ERP」——「山物地圖(快取)」除了庫存，還有自己的
-  // 「定價」「特惠價」兩欄（程式裡本來就把這張表當ERP資料源，見changeLocationBatch
-  // 的 reason:'not_in_erp'）。這是跟蝦皮賣場實際掛的售價完全獨立的另一份價格，
-  // 兩者放在一起才看得出賣場價格是不是忘了跟著ERP調整。不論這個貨號有沒有查到
-  // 蝦皮賣場資料都附上，貨號還沒上架蝦皮但ERP已經有定價的情況也看得到。
-  try{
-    const erpSs = openSheetMemo_(LOCMAP_SOURCE_ID);
-    const erpSrc = erpSs.getSheetByName(LOC_SYNC_TAB);
-    if(erpSrc){
-      const erpIdx = srcSkuIndex_(erpSrc);
-      skus.forEach(function(sku){
-        if(!results[sku]) return;
-        const row = erpIdx[sku];
-        if(!row) return;
-        const v = erpSrc.getRange(row, 1, 1, 14).getValues()[0];
-        results[sku].erp = {listPrice: String(v[12]||'').trim(), specialPrice: String(v[13]||'').trim()};
-      });
+  if(missing.length){
+    const toCache = {};
+    const src = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
+    const sh = src.getSheetByName(SPEC_IMAGE_TAB) || src.getSheets()[0];
+    if(!sh) return {ok:false, error:'找不到「' + SPEC_IMAGE_TAB + '」分頁'};
+    const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+                      .map(function(x){ return String(x||'').trim(); });
+    const cols = ['賣場ID','賣場名稱','商品ID','商品名稱','商品選項ID','商品規格名稱','選項名稱','第二階規格','商品選項貨號','價格'];
+    const idx = {}; cols.forEach(function(c){ idx[c] = header.indexOf(c); });
+    if(idx['商品選項貨號'] < 0 || idx['價格'] < 0){
+      return {ok:false, error:'來源表欄位跟預期不符（缺 商品選項貨號／價格）'};
     }
-  }catch(err){ /* ERP價格查不到就跳過，不影響蝦皮賣場售價這邊的結果 */ }
+    const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1);
 
-  let updatedAt = '';
-  try{
-    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
-    updatedAt = Utilities.formatDate(DriveApp.getFileById(SPEC_IMAGE_SOURCE_ID).getLastUpdated(), tz, 'yyyy/MM/dd HH:mm');
-  }catch(err){ /* 拿不到最後修改時間就不顯示，不影響查價本身 */ }
+    missing.forEach(function(sku){
+      const rows = skuIndex[sku];
+      if(!rows || !rows.length){ results[sku] = {ok:false, sku: sku, reason:'not_found'}; return; }
+      const matches = rows.map(function(row){
+        const vals = sh.getRange(row, 1, 1, sh.getLastColumn()).getValues()[0];
+        const get = function(c){ return idx[c] >= 0 ? String(vals[idx[c]]||'').trim() : ''; };
+        return {shopId: get('賣場ID'), shopName: get('賣場名稱'),
+          itemId: get('商品ID'), itemName: get('商品名稱'),
+          modelId: get('商品選項ID'),
+          specName: get('商品規格名稱'),   // 蝦皮原始的「顏色,容量」逗號組合字串，本身就是完整的規格描述
+          optionName: get('選項名稱'), price: get('價格')};
+      });
+      results[sku] = {ok:true, sku: sku, matches: matches};
+    });
 
-  return {ok:true, results: results, updatedAt: updatedAt};
+    // 使用者要求「在價格旁備註ERP」——「山物地圖(快取)」除了庫存，還有自己的
+    // 「定價」「特惠價」兩欄（程式裡本來就把這張表當ERP資料源，見changeLocationBatch
+    // 的 reason:'not_in_erp'）。這是跟蝦皮賣場實際掛的售價完全獨立的另一份價格，
+    // 兩者放在一起才看得出賣場價格是不是忘了跟著ERP調整。不論這個貨號有沒有查到
+    // 蝦皮賣場資料都附上，貨號還沒上架蝦皮但ERP已經有定價的情況也看得到。
+    try{
+      const erpSs = openSheetMemo_(LOCMAP_SOURCE_ID);
+      const erpSrc = erpSs.getSheetByName(LOC_SYNC_TAB);
+      if(erpSrc){
+        const erpIdx = srcSkuIndex_(erpSrc);
+        missing.forEach(function(sku){
+          if(!results[sku]) return;
+          const row = erpIdx[sku];
+          if(!row) return;
+          const v = erpSrc.getRange(row, 1, 1, 14).getValues()[0];
+          results[sku].erp = {listPrice: String(v[12]||'').trim(), specialPrice: String(v[13]||'').trim()};
+        });
+      }
+    }catch(err){ /* ERP價格查不到就跳過，不影響蝦皮賣場售價這邊的結果 */ }
+
+    missing.forEach(function(sku){ if(results[sku]) toCache[sku] = results[sku]; });
+    priceResultCacheSetMany_(toCache);
+  }
+
+  return {ok:true, results: results, updatedAt: getSpecUpdatedAtCached_()};
 }
 
 // 來源是一份原生的 Google 試算表（實測 openById 開得起來），所以直接用 SpreadsheetApp 讀，
