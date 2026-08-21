@@ -1822,7 +1822,11 @@ async function mergeOrders(parsed){
   if(hasBackend()){
     const result = await apiPost('mergeOrders', {orders: parsed});
     await refreshFromBackend(true); // 拉回權威資料，確保跟其他人看到的一致
-    return result;
+    // 後端正常回應理論上一定帶這三個數字，但曾經實際看過同步完成訊息顯示
+    // 「新增undefined／更新undefined」——沒有查到確切成因（不是後端拋例外，
+    // 那種情況rawApiPost會直接丟例外變成「同步失敗」，不會走到這裡），保守
+    // 起見還是不要讓畫面直接顯示undefined給人看，缺欄位就當0。
+    return {added: result.added || 0, updated: result.updated || 0, skippedShipped: result.skippedShipped || 0};
   }
   let added=0, updated=0, skippedShipped=0;
   Object.values(parsed).forEach(o=>{
