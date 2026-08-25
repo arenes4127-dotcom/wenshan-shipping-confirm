@@ -3499,7 +3499,11 @@ function renderTransferLists(){
     const list = transferPending.slice().sort(function(a, b){
       return transferSortKey_(a) < transferSortKey_(b) ? -1 : 1;
     });
-    pendingBox.innerHTML = list.map(transferRowHtml).join('');
+    // 不能直接 list.map(transferRowHtml)——Array.map會把陣列索引當第二個參數傳進去，
+    // 落到 transferRowHtml(it, isDone) 的 isDone，導致清單裡奇數位置(index 1,3,5...)
+    // 的待驗收品項被誤判成isDone=true，整排動作按鈕（含撤銷/放棄）都不會出現。
+    // 這是這次加「✓確認1件」按鈕測試時才發現的既有bug，一併修掉。
+    pendingBox.innerHTML = list.map(function(it){ return transferRowHtml(it); }).join('');
   }
 
   if(!transferDone.length){
@@ -3526,6 +3530,13 @@ function transferRowHtml(it, isDone){
     '</div>' +
     (isDone ? '' :
       '<div class="tr-actions">' +
+        // 使用者反映無條碼商品沒辦法掃，只能複製貨號貼到掃描欄，體驗很差——
+        // 出貨/揀貨那幾個畫面本來就有「點卡片確認」這個模式(參考renderTransferSection
+        // 的togglePick)，這裡補一顆等效的按鈕，直接重用transferScan()同一套邏輯
+        // （resolve→scanTransferBatch→更新畫面），不是另外寫一套。已經收滿的品項
+        // 停用，避免手滑多按一次把已經對好的數字搞亂。
+        '<button class="btn sm" ' + (left <= 0 ? 'disabled' : '') +
+          ' onclick="transferConfirmClick(this,\'' + safeSku + '\')">✓ 確認1件</button>' +
         '<button class="btn gray sm" ' + (it.scannedQty > 0 ? '' : 'disabled') +
           ' onclick="transferUndo(this,\'' + safeSku + '\')">撤銷上一筆</button>' +
         '<button class="btn gray sm" onclick="transferClose(this,' + it.row + ',\'' + safeSku + '\')">放棄</button>' +
@@ -3592,6 +3603,14 @@ async function transferScan(code){
   transferLastRow[r.sku] = r.row;
   transferApplyResult_(r);
   flash('ok', r.baseName || r.sku, '已掃 ' + r.scannedQty + ' / ' + r.qty, 1400);
+}
+
+// 待驗收卡片上的「✓ 確認1件」按鈕——沒有條碼、不方便掃描/複製貼上的品項，
+// 直接點按鈕當作掃到這個品號一次，跟transferScan(sku)是同一套邏輯，只是觸發方式不同。
+async function transferConfirmClick(btn, sku){
+  const doneBusy = withBusy(btn);
+  try{ await transferScan(sku); }
+  finally{ doneBusy(); }
 }
 
 async function transferUndo(btn, sku){
