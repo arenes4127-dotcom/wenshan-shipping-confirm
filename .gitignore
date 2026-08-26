@@ -2,3 +2,6 @@
 .clasprc.json
 # 語法檢查用的暫存檔
 Code_check.js
+# build-site.sh 產出的靜態網站目錄，由 CI／Cloudflare 每次重新產生，不進 git
+dist/
+node_modules/

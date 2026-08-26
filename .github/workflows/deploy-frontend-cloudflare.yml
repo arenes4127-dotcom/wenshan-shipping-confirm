@@ -1,0 +1,81 @@
+# 前端 index.html → Cloudflare Pages（走 GitHub Actions 直接上傳的那條路）。
+#
+# 前端有兩條互斥的雲端部署路線，擇一即可，不要兩條同時開：
+#
+#  (A) Cloudflare 官方 Git 整合 —— 建議先試這條，不用任何 secret、不用這支 workflow。
+#      在 Cloudflare dashboard → Workers & Pages → 你的 Pages 專案 → Settings → Builds：
+#          Git repository:     arenes4127-dotcom/wenshan-shipping-confirm
+#          Production branch:  master
+#          Build command:      sh build-site.sh
+#          Build output dir:   dist
+#      設好之後，push 到 master 就由 Cloudflare 自己建置發佈，這支 workflow 請保持停用。
+#
+#  (B) 這支 workflow —— 由 GitHub Actions 建置好再直接上傳給 Cloudflare。
+#      適合 Cloudflare 那邊不想接 Git、或想讓建置環境跟後端部署一致的情況。
+#      需要兩個 repo secret：
+#          CLOUDFLARE_API_TOKEN   Cloudflare → My Profile → API Tokens，
+#                                 用「Edit Cloudflare Workers」範本，或自訂權限
+#                                 Account → Cloudflare Pages → Edit
+#          CLOUDFLARE_ACCOUNT_ID  Cloudflare dashboard 右側欄的 Account ID
+#      沒設這兩個 secret 的話，這支 workflow 會直接略過（不會紅字失敗），
+#      所以就算你選了 (A)，留著它也不會吵人。
+
+name: 部署前端（Cloudflare Pages）
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - index.html
+      - zbar-wasm.min.js
+      - zbar.wasm
+      - barcode-detector-polyfill.min.js
+      - build-site.sh
+      - .github/workflows/deploy-frontend-cloudflare.yml
+
+concurrency:
+  group: deploy-frontend-cloudflare
+  cancel-in-progress: true
+
+env:
+  # Cloudflare Pages 的專案名稱，就是 <專案名>.pages.dev 前面那段。
+  CF_PROJECT: mogu-erp
+  # 上傳時要標成哪個分支。這個值必須跟 Cloudflare Pages 專案設定裡的
+  # 「Production branch」一模一樣，否則每次上傳都只會產生 preview 部署，
+  # 正式網址 https://<專案名>.pages.dev 永遠停在舊版而且不會報錯。
+  CF_PRODUCTION_BRANCH: master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # secrets 沒辦法在 job 層的 if 判斷，所以用第一步做開關：沒設定就整支略過。
+      - name: 檢查 Cloudflare 設定
+        id: guard
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ACCOUNT_ID" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::尚未設定 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID，略過 Cloudflare 部署。若你用的是 Cloudflare 官方 Git 整合，這是正常的，可以無視。"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 建置靜態網站
+        if: steps.guard.outputs.ready == 'true'
+        run: sh build-site.sh
+
+      - name: 上傳到 Cloudflare Pages
+        if: steps.guard.outputs.ready == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=${{ env.CF_PROJECT }} --branch=${{ env.CF_PRODUCTION_BRANCH }}

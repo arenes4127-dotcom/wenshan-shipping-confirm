@@ -11,14 +11,15 @@
 
 | 層 | 檔案 | 部署在哪 | 網址／ID |
 |---|---|---|---|
-| 前端 APP | `index.html`（單檔，含所有 CSS/JS） | GitHub Pages | https://arenes4127-dotcom.github.io/wenshan-shipping-confirm/ |
+| 前端 APP | `index.html`（單檔，含所有 CSS/JS） | GitHub Pages ＋ Cloudflare Pages | https://arenes4127-dotcom.github.io/wenshan-shipping-confirm/ ／ https://mogu-erp.pages.dev/ |
 | 後端 API | `Code.gs` | Google Apps Script（Web App） | scriptId `1KIDgqKPeVzveXky1f_6yXBjVsMvFWNMAPrhbxR67AOntEQaIZ9fmPuDD` |
 | 資料 | —— | Google 試算表 | 見下方「相關試算表」 |
 
 前端是**純靜態網頁**，不經過 Apps Script 的 `HtmlService`；它用 `fetch` 打後端的 `/exec`。
 所以 `index.html` 不會、也不應該被 clasp 推到 Apps Script 專案裡（`.claspignore` 用白名單擋掉了）。
 
-正式後端網址（deployment ID 寫死在 `deploy.sh`，**不可以換**，換掉全倉庫裝置會同時連不上）：
+正式後端網址（deployment ID 寫死在 `deploy.sh`、`deploy.ps1` 與 `.github/workflows/deploy-backend.yml`，
+**不可以換**，換掉全倉庫裝置會同時連不上）：
 
 ```
 https://script.google.com/macros/s/AKfycbxdzii_g-Dv59KDLIiWa2B7adWyv_JuLoBQBfP42INKYv7L6kOFtN7vseYFwHsa1RJG/exec
@@ -41,20 +42,124 @@ https://script.google.com/macros/s/AKfycbxdzii_g-Dv59KDLIiWa2B7adWyv_JuLoBQBfP42
 |---|---|---|
 | `Code.gs` | 後端全部程式碼（約 8,000 行） | ✅ |
 | `appsscript.json` | Apps Script 資訊清單（時區 Asia/Taipei、V8、Web App 設定） | ✅ |
-| `index.html` | 前端 APP 單檔 | ❌（走 GitHub Pages） |
+| `index.html` | 前端 APP 單檔 | ❌（走 GitHub Pages／Cloudflare Pages） |
 | `zbar-wasm.min.js` / `zbar.wasm` | 條碼掃描引擎 | ❌ |
 | `barcode-detector-polyfill.min.js` | 舊瀏覽器的 BarcodeDetector 補丁 | ❌ |
-| `deploy.sh` | 一鍵部署後端（Git Bash） | ❌ |
-| `deploy.ps1` | 一鍵部署後端（PowerShell，內容等價） | ❌ |
+| `.github/workflows/deploy-backend.yml` | **雲端**一鍵部署後端（GitHub Actions，平常用這個） | ❌ |
+| `.github/workflows/deploy-frontend-cloudflare.yml` | 前端上傳 Cloudflare Pages（沒設 secret 就自動略過） | ❌ |
+| `build-site.sh` | 把要對外的四個前端檔案挑進 `dist/`，給靜態託管用 | ❌ |
+| `deploy.sh` | 本機備援：一鍵部署後端（Git Bash） | ❌ |
+| `deploy.ps1` | 本機備援：一鍵部署後端（PowerShell，內容等價） | ❌ |
 | `.clasp.json` | scriptId 設定 | ❌ |
 | `.claspignore` | 白名單，只放行 `Code.gs` + `appsscript.json` | ❌ |
 
 **不在 repo 裡的東西**：只有 `.clasprc.json`（clasp 的 Google 登入憑證）。
 它本來就存在使用者家目錄，而且是機密，`.gitignore` 另外再擋一層。還原後跑一次 `clasp login` 就有了。
+雲端部署則是把同一份內容存成 GitHub secret `CLASPRC_JSON`（見 3-1）。
 
 ---
 
-## 三、還原本機開發環境（Windows）
+## 三、部署（雲端，平常就用這個）
+
+**部署已經不需要桌面那台 Windows 了。** 前後端都在雲端跑，用手機開 GitHub 網頁按一下就能部署；
+桌面資料夾不見、電腦重灌、人在倉庫現場，都不影響。本機那套（第四節）留著當備援。
+
+### 3-1 只要設定一次：後端部署憑證
+
+GitHub Actions 要代替你執行 clasp，就得有 Google 的登入憑證。這是**唯一需要人先做一次**的事：
+
+1. 在有裝 clasp 的電腦上，找到 `C:\Users\<你>\.clasprc.json`（Mac/Linux 是 `~/.clasprc.json`）。
+   沒有的話，任何一台電腦跑 `npm i -g @google/clasp@3` 再 `clasp login`，就會產生一份。
+2. 用記事本打開，**整個檔案內容**複製起來。
+3. GitHub repo → **Settings → Secrets and variables → Actions → New repository secret**
+   - Name：`CLASPRC_JSON`
+   - Secret：剛剛複製的內容，原封不動貼上
+4. 存檔。之後就不用再碰這一步了。
+
+> 這個檔案等於 Google 帳號的通行證，只能放進 GitHub Secrets（加密、不會出現在 log 裡），
+> 絕對不能 commit 進 repo。`.gitignore` 已經先擋了一層。
+
+憑證失效的徵兆：workflow 在 `clasp push` 那步報 401／invalid_grant。重跑一次 `clasp login`
+拿到新的 `.clasprc.json`，把 secret 更新掉即可。
+
+### 3-2 後端（`Code.gs`）
+
+改完 `Code.gs`，**記得一起把第 24 行的 `BACKEND_VERSION` 改掉**（目前 `2026-08-26.158`），
+然後兩種方式擇一：
+
+- **push 到 `master`** —— `Code.gs` 或 `appsscript.json` 有變動就自動部署。
+- **手動觸發** —— GitHub repo → **Actions → 「部署後端（Apps Script）」→ Run workflow**，
+  可以填「這次改了什麼」，那段文字會寫進 Apps Script 的部署說明。手機上也能按。
+
+workflow（`.github/workflows/deploy-backend.yml`）做的事跟舊的 `deploy.ps1` 一字不差：
+
+1. `node --check` 先擋語法錯誤，不讓壞程式上正式環境
+2. `clasp show-file-status`＋`clasp push -f`（`.claspignore` 白名單，只推 `Code.gs` 與 `appsscript.json`）
+3. `clasp update-deployment <既有的 DEPLOYMENT_ID>` —— **用既有 ID 更新**，不是建新的
+4. 反覆戳 `doPost` 的 `__versioncheck__`，直到回報的版本號等於 `Code.gs` 裡的 `BACKEND_VERSION`
+
+第 4 步不能省。實際踩過好幾次：`doGet` 已經回報新版本了，`doPost`（執行函式的入口）還在跑舊程式碼，
+而且完全沒有錯誤訊息。
+
+比舊腳本多做的一件事：**部署前先記下線上版本**。如果你忘了改 `BACKEND_VERSION`，
+第 4 步的條件在推之前就已經成立、會立刻「通過」但什麼都沒驗證到——這種情況現在會在
+workflow 摘要頁亮黃字警告，而不是給你一個假的綠燈。
+
+部署失敗最常見的原因是 Apps Script 專案版本數達到 200 上限（這個專案踩過）。
+workflow 會直接把處理方式印在錯誤訊息裡：開 Apps Script 編輯器 → 部署 → 管理部署作業，
+手動刪掉幾個舊版本再重跑一次。
+
+### 3-3 前端（`index.html`）
+
+前端本來就是雲端部署，push 到 `master` 就好：
+
+```bash
+git add index.html && git commit -m "..." && git push
+```
+
+目前有兩個對外入口，兩個都會自己更新，可以並存：
+
+| 入口 | 網址 | 怎麼更新 |
+|---|---|---|
+| GitHub Pages | https://arenes4127-dotcom.github.io/wenshan-shipping-confirm/ | push 到 `master`，GitHub 自己發佈整個 repo 根目錄 |
+| Cloudflare Pages | https://mogu-erp.pages.dev/ | 見下方兩條路擇一 |
+
+**Cloudflare Pages 有兩條路，擇一，不要兩條同時開：**
+
+- **(A) Cloudflare 官方 Git 整合（建議）** —— 不用任何 secret、不用 GitHub Actions。
+  Cloudflare dashboard → Workers & Pages → 專案 → Settings → Builds：
+
+  | 欄位 | 值 |
+  |---|---|
+  | Git repository | `arenes4127-dotcom/wenshan-shipping-confirm` |
+  | Production branch | `master` |
+  | Build command | `sh build-site.sh` |
+  | Build output directory | `dist` |
+
+  設好之後 push 到 `master`，Cloudflare 自己建置發佈。
+
+- **(B) 從 GitHub Actions 直接上傳** —— 設兩個 repo secret：`CLOUDFLARE_API_TOKEN`
+  （Cloudflare → My Profile → API Tokens，用「Edit Cloudflare Workers」範本）與
+  `CLOUDFLARE_ACCOUNT_ID`（dashboard 右側欄）。設好就會自動生效；
+  **沒設的話這支 workflow 會直接略過、不會紅字失敗**，所以選了 (A) 也可以留著它。
+  workflow 裡的 `CF_PRODUCTION_BRANCH` 必須跟 Cloudflare 專案設定的 Production branch
+  一模一樣，不然每次都只會產生 preview 部署，正式網址永遠停在舊版而且不會報錯。
+
+`build-site.sh` 的作用是把該對外的四個檔案挑進 `dist/`：`index.html`、`zbar-wasm.min.js`、
+`barcode-detector-polyfill.min.js`、`zbar.wasm`。這四個綁在一起不能只挑一個——`index.html`
+用相對路徑動態載入後兩者（iOS Safari 沒有原生 BarcodeDetector 時的掃碼備援），
+`zbar-wasm.min.js` 又會去抓同目錄的 `zbar.wasm`；少一個 iPhone 就掃不出條碼，而且是靜悄悄地壞掉。
+用白名單也順便讓網站根目錄不會多出 `Code.gs`、部署腳本這些跟前端無關的東西
+（這個 repo 是公開的，Code.gs 本來就看得到，所以這不是保密，只是乾淨）。
+
+改完記得把新的 `index.html` 也丟一份到 Drive 的「文山核對」資料夾——那是網路連不到
+GitHub／Cloudflare 時的備援入口。
+
+---
+
+## 四、還原本機開發環境（Windows，備援用）
+
+平常不需要做這一段。要在本機開發、或雲端整個掛掉時才用。
 
 ### 1. 把專案抓回來
 
@@ -74,63 +179,38 @@ cd 秀山莊_出貨確認APP
 
 ```powershell
 # Node.js LTS: https://nodejs.org
-npm install -g @google/clasp
+npm install -g @google/clasp@3
 clasp login          # 會開瀏覽器，用擁有那份試算表的 Google 帳號登入
 ```
 
-`clasp login` 成功後 `.clasprc.json` 會寫到 `C:\Users\user\.clasprc.json`——這一步就是還原唯一缺的那塊。
+`clasp login` 成功後 `.clasprc.json` 會寫到 `C:\Users\user\.clasprc.json`。
+**順手把這個檔案的內容存成 GitHub secret `CLASPRC_JSON`**（見 3-1）——雲端部署就靠它。
 
 ### 3. 確認接得上
 
 ```bash
-clasp status         # 應該列出 Code.gs 與 appsscript.json 兩個 tracked 檔案
+clasp show-file-status   # 舊版是 clasp status，應列出 Code.gs 與 appsscript.json 兩個檔案
 ```
 
 想確認遠端 Apps Script 上的程式碼跟本機一致，可以 `clasp pull` 到別的暫存資料夾比對，
 **不要**直接在專案資料夾 `clasp pull`——那會用遠端覆蓋本機。
 
----
+### 4. 本機部署腳本
 
-## 四、部署
-
-### 後端（Code.gs）
-
-兩份腳本擇一，做的事完全一樣：
+`deploy.ps1`（PowerShell）與 `deploy.sh`（Git Bash）做的事完全一樣，也跟雲端 workflow 一樣：
 
 ```powershell
-# PowerShell（不用裝 Git Bash，右鍵「用 PowerShell 執行」也可以）
 .\deploy.ps1 "這次改了什麼"
-
 # 被執行原則擋下來的話
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1 "這次改了什麼"
 ```
 
 ```bash
-# Git Bash
 sh deploy.sh "這次改了什麼"
 ```
 
-兩者都會依序做四件事：
-
-1. `node --check` 先擋語法錯誤，不讓壞程式上正式環境
-2. `clasp push -f`
-3. `clasp update-deployment <既有的 DEPLOYMENT_ID>`——**用既有 ID 更新**，不是建新的
-4. 反覆戳 `doPost` 的 `__versioncheck__`，直到回報的版本號等於 `Code.gs` 裡的 `BACKEND_VERSION` 才算完成
-
-第 4 步不能省。實際踩過好幾次：`doGet` 已經回報新版本了，`doPost`（執行函式的入口）還在跑舊程式碼，
-而且完全沒有錯誤訊息。
-
-改 `Code.gs` 時記得順手把第 24 行的 `BACKEND_VERSION`（目前 `2026-08-18.157`）改掉，否則第 4 步永遠等不到。
-
-### 前端（index.html）
-
-推上 `master`，GitHub Pages 自己會更新：
-
-```bash
-git add index.html && git commit -m "..." && git push
-```
-
-改完記得把新的 `index.html` 也丟一份到 Drive 的「文山核對」資料夾——那是網路連不到 GitHub 時的備援入口。
+三份要一起維護：改了部署流程，`deploy.ps1`、`deploy.sh`、
+`.github/workflows/deploy-backend.yml` 三邊都要同步。
 
 ---
 
@@ -160,7 +240,8 @@ git add index.html && git commit -m "..." && git push
 
 ## 六、備份策略（避免再次整包不見）
 
-1. **GitHub 是唯一真實來源**，改完就 commit + push，不要只存在本機
+1. **GitHub 是唯一真實來源**，改完就 commit + push，不要只存在本機。
+   部署也全部由 GitHub／Cloudflare 跑（第三節），本機那台不見了不影響上線
 2. Apps Script 端也有一份（`clasp pull` 隨時取得），但沒有歷史
 3. `index.html` 在 Drive「文山核對」資料夾有備援副本
 4. 後端試算表本身有每日備份排程（`Code.gs` 裡的每日歸檔）
