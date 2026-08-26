@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-18.157';
+const BACKEND_VERSION = '2026-08-26.158';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -399,6 +399,16 @@ function markSystemSheetsWithNotes_(){
   return {ok:true, 已加附註: done, 分頁不存在略過: missing};
 }
 
+// 表頭對齊原本是「每次呼叫都無條件寫回去」——那是一次真正的儲存格寫入，不是免費的。
+// 掃一件調撥就會經過 getSheet 四次（調撥單、調撥驗收紀錄，鏡射時又各一次），
+// 等於四次沒必要的寫入，而且會把整份試算表推進待flush狀態，回應前得等它寫完。
+// 改成兩層：
+//   1. 同一次執行內，同一張分頁只檢查一次（_headerOk_ memo）。跟 _ssMemo_ 同樣道理——
+//      Apps Script 每次 doGet/doPost 都是全新的全域作用域，不會殘留到下一次呼叫，
+//      所以這裡不需要擔心「表頭被改壞了但快取說已經檢查過」這種跨請求的問題。
+//   2. 真的讀回來比對，只有對不上才寫。讀一列的成本遠低於寫一列。
+// 自我修復的效果完全沒有變：表頭被手動改壞，下一次請求的第一次 getSheet 還是會修好。
+const _headerOk_ = {};
 function getSheet(name, header){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(name);
@@ -413,9 +423,14 @@ function getSheet(name, header){
     // 新建立的分頁如果是系統維護清單裡的一員，當下就把警語附上，不用等回填函式。
     const note = systemSheetNotesMap_()[name];
     if(note) sh.getRange(1, 1).setNote(note);
-  } else {
-    // 不管是剛建立、沿用舊分頁、或標題被手動改過，都強制對齊成目前這套中文標題
-    sh.getRange(1, 1, 1, displayHeader.length).setValues([displayHeader]);
+    _headerOk_[name] = true;
+  } else if(!_headerOk_[name]){
+    // 不管是沿用舊分頁、或標題被手動改過，都強制對齊成目前這套中文標題——但先比對，
+    // 一樣就不用寫（正常情況下每次請求都是一樣的，等於完全不用付這個寫入成本）
+    const cur = sh.getRange(1, 1, 1, displayHeader.length).getValues()[0];
+    const same = displayHeader.every(function(h, i){ return String(cur[i]) === String(h); });
+    if(!same) sh.getRange(1, 1, 1, displayHeader.length).setValues([displayHeader]);
+    _headerOk_[name] = true;
   }
   return sh;
 }
@@ -2977,7 +2992,11 @@ function scanTransferBatch(ops){
     return bestIdx;
   }
 
+  // 大部分掃描都只是「已掃+1、還沒收滿」，完全沒動到 doneAt 那一欄。原本不管有沒有動
+  // 都要多付「整段setNumberFormat + 整段setValues」兩次範圍寫入，這裡記一下真的有沒有
+  // 動過，沒動過就整組跳過。
   const changedRows = {}, logRows = [], results = [];
+  let doneAtTouched = false;
   ops.forEach(function(op){
     const sku = String(op.sku || '').trim();
     if(!sku) return;
@@ -2990,6 +3009,7 @@ function scanTransferBatch(ops){
       vals[idx][col.scannedQty] = scanned - 1;
       vals[idx][col.status] = 'open';
       vals[idx][col.doneAt] = '';
+      doneAtTouched = true;
       changedRows[idx] = true;
       logRows.push({logTime: time, batchId: vals[idx][col.batchId], sku: sku,
         baseName: vals[idx][col.baseName], checkerId: op.staffId || '', checkerName: op.staffName || '',
@@ -3010,7 +3030,7 @@ function scanTransferBatch(ops){
     const done = newScanned >= qty;
     vals[idx][col.scannedQty] = newScanned;
     vals[idx][col.status] = done ? 'done' : 'open';
-    if(done) vals[idx][col.doneAt] = time;
+    if(done){ vals[idx][col.doneAt] = time; doneAtTouched = true; }
     changedRows[idx] = true;
     logRows.push({logTime: time, batchId: vals[idx][col.batchId], sku: sku,
       baseName: vals[idx][col.baseName], checkerId: op.staffId || '', checkerName: op.staffName || '',
@@ -3038,14 +3058,18 @@ function scanTransferBatch(ops){
         doneAtBlock.push([vals[i][col.doneAt]]);
       }
       sh.getRange(minI + 2, col.scannedQty + 1, span, 2).setValues(scannedStatusBlock);
-      sh.getRange(minI + 2, col.doneAt + 1, span, 1).setNumberFormat('@');
-      sh.getRange(minI + 2, col.doneAt + 1, span, 1).setValues(doneAtBlock);
+      if(doneAtTouched){
+        sh.getRange(minI + 2, col.doneAt + 1, span, 1).setNumberFormat('@');
+        sh.getRange(minI + 2, col.doneAt + 1, span, 1).setValues(doneAtBlock);
+      }
     }else{
       changedIdxs.forEach(function(i){
         const row = i + 2;
         sh.getRange(row, col.scannedQty + 1, 1, 2).setValues([[vals[i][col.scannedQty], vals[i][col.status]]]);
-        sh.getRange(row, col.doneAt + 1).setNumberFormat('@');
-        sh.getRange(row, col.doneAt + 1).setValue(vals[i][col.doneAt]);
+        if(doneAtTouched){
+          sh.getRange(row, col.doneAt + 1).setNumberFormat('@');
+          sh.getRange(row, col.doneAt + 1).setValue(vals[i][col.doneAt]);
+        }
       });
     }
   }
@@ -3058,7 +3082,15 @@ function scanTransferBatch(ops){
          .setValues(logRows.map(function(o){ return TRANSFERLOG_HEADER.map(function(h){ return o[h]; }); }));
   }
 
-  try{ mirrorTransferToWorkspaceDebounced_(); }catch(err){}
+  // vals 就是這個函式一開始整張讀出來、而且已經套用完這批改動的權威內容，跟鏡射函式
+  // 自己再 readRows 一次會得到的東西一模一樣（差別只在物件包裝）。整張表重讀一次是
+  // 開檔+整欄讀取，直接把手上這份轉成同樣格式傳過去，鏡射就不用再讀第二次。
+  const mirrorRows = vals.map(function(r, i){
+    const o = {_row: i + 2};
+    TRANSFER_HEADER.forEach(function(h, idx){ o[h] = r[idx]; });
+    return o;
+  });
+  try{ mirrorTransferToWorkspaceDebounced_(mirrorRows); }catch(err){}
   return {ok:true, results: results};
 }
 
@@ -3108,23 +3140,25 @@ const TRANSFER_MIRROR_MAX_ROWS = 200;   // 該分頁公式鋪到約219列，抓2
 // 幾秒內就能看到最新掃描結果，但不會每一下都重付一次開外部檔案+大量寫入的代價。
 const TRANSFER_MIRROR_DEBOUNCE_KEY = 'transferMirrorDebounceV1';
 const TRANSFER_MIRROR_DEBOUNCE_SEC = 8;
-function mirrorTransferToWorkspaceDebounced_(){
+function mirrorTransferToWorkspaceDebounced_(rowsOverride){
   const cache = CacheService.getScriptCache();
   let recentlyMirrored = false;
   try{ recentlyMirrored = !!cache.get(TRANSFER_MIRROR_DEBOUNCE_KEY); }catch(err){ /* 讀快取失敗就當沒去抖動過，照樣鏡射 */ }
   if(recentlyMirrored) return {ok:true, skipped:true};
   try{ cache.put(TRANSFER_MIRROR_DEBOUNCE_KEY, '1', TRANSFER_MIRROR_DEBOUNCE_SEC); }catch(err){ /* 存不進去不影響這次鏡射本身 */ }
-  return mirrorTransferToWorkspace_();
+  return mirrorTransferToWorkspace_(rowsOverride);
 }
 
-function mirrorTransferToWorkspace_(){
+// rowsOverride：呼叫端剛剛才整張讀過「調撥單」的話直接把那份傳進來，省掉重讀一次。
+// 沒傳（排程、手動觸發）就照舊自己讀。
+function mirrorTransferToWorkspace_(rowsOverride){
   const ss = openSheetMemo_(TRANSFER_WORKBOOK_ID);
   const sh = ss.getSheetByName(TRANSFER_MIRROR_TAB);
   if(!sh) return {ok:false, error:'找不到「' + TRANSFER_MIRROR_TAB + '」分頁'};
 
   const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
   const today = Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd');
-  const rows = readRows(SHEET_TRANSFER, TRANSFER_HEADER);
+  const rows = rowsOverride || readRows(SHEET_TRANSFER, TRANSFER_HEADER);
   // 只鏡射「還在處理」或「今天完成」的——那個分頁本來就每天20:30被清空重來，
   // 鏡射太久以前完成的批次進去，會讓人誤以為是今天發生的事。
   const visible = rows.filter(function(r){
@@ -3142,10 +3176,20 @@ function mirrorTransferToWorkspace_(){
     itemBlock.push(r ? [r.sku, r.baseName, r.spec, r.qty, r.unit, r.reason, r.price, r.priceTotal]
                       : ['', '', '', '', '', '', '', '']);
   }
-  // B~I 沒有「圖片」欄（那是舊ERP貼上習慣才有，我們的資料不含圖片檔），
-  // 每次鏡射都重寫一次表頭，這樣即使凌晨被模板還原、表頭跟著沒了，下一次鏡射會自動補回來。
-  sh.getRange(1, 2, 1, 8).setValues([['品號', '品名', '規格', '數量', '單位', '原因', '零售價', '零售合計']]);
-  sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 2, TRANSFER_MIRROR_MAX_ROWS, 1).setNumberFormat('@'); // B品號
+  // B~I 沒有「圖片」欄（那是舊ERP貼上習慣才有，我們的資料不含圖片檔）。
+  // 表頭跟兩欄的文字格式（品號/驗收欄要是純文字，否則「065」這種尺碼會被吃成數字65）
+  // 原本每次鏡射都無條件重寫一次，那是三次範圍寫入、而且其中兩次蓋的是200列。
+  // 這些東西只有在那個分頁被20:30的模板還原沖掉時才會不見，平常一直都在——
+  // 改成先讀一列表頭比對，對得上就整組跳過，對不上（＝真的被還原過）才補寫回去。
+  // 自我修復的效果一樣，代價從「每次三次寫入」變成「每次一次讀取」。
+  const MIRROR_HEADER = ['品號', '品名', '規格', '數量', '單位', '原因', '零售價', '零售合計'];
+  const curHeader = sh.getRange(1, 2, 1, 8).getValues()[0];
+  const headerOk = MIRROR_HEADER.every(function(h, i){ return String(curHeader[i]) === h; });
+  if(!headerOk){
+    sh.getRange(1, 2, 1, 8).setValues([MIRROR_HEADER]);
+    sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 2, TRANSFER_MIRROR_MAX_ROWS, 1).setNumberFormat('@');  // B品號
+    sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 16, TRANSFER_MIRROR_MAX_ROWS, 1).setNumberFormat('@'); // P驗收
+  }
   sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 2, TRANSFER_MIRROR_MAX_ROWS, 8).setValues(itemBlock);
 
   const logs = readRows(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER)
@@ -3153,7 +3197,7 @@ function mirrorTransferToWorkspace_(){
     .slice(-TRANSFER_MIRROR_MAX_ROWS);
   const pBlock = [];
   for(let i = 0; i < TRANSFER_MIRROR_MAX_ROWS; i++){ pBlock.push([logs[i] ? logs[i].sku : '']); }
-  sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 16, TRANSFER_MIRROR_MAX_ROWS, 1).setNumberFormat('@'); // P驗收
+  // P欄的文字格式跟著上面的表頭檢查一起補，這裡只寫值
   sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 16, TRANSFER_MIRROR_MAX_ROWS, 1).setValues(pBlock);
 
   return {ok:true, items: items.length, scans: logs.length};
