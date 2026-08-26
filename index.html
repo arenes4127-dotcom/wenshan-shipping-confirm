@@ -651,7 +651,7 @@
         </label>
       </div>
 
-      <div class="section-label">待驗收（<span id="transferPendingCount">0</span>）</div>
+      <div class="section-label">待驗收（<span id="transferPendingCount">0</span>）<span id="transferSyncHint" class="hint" style="font-weight:400;"></span></div>
       <div class="card"><div id="transferPendingList"></div></div>
 
       <div class="section-label">今天已完成</div>
@@ -1020,6 +1020,8 @@ const LS = {
   orders: 'ssz_orders', log: 'ssz_log', staff: 'ssz_staff',
   currentStaff: 'ssz_current_staff', settings: 'ssz_settings',
   netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue',
+  // 待送出的調撥驗收掃描，跟 pickQueue 同樣道理：關掉分頁/斷線也不會掉，開起來繼續送
+  transferQueue: 'ssz_transfer_queue',
   // 同步時順手從來源數出來的「非本倉」訂單數（山物出／中華宅配／各調撥來源）。
   // 這些訂單本系統不匯入，本機訂單資料裡永遠是0，只有同步當下看得到，所以存起來給首頁用。
   sourceStats: 'ssz_source_stats',
@@ -3468,13 +3470,38 @@ let transferPending = [];   // 目前開放中的待驗收品項（一列＝一�
 let transferDone = [];      // 今天已完成的（含被人工放棄的不會出現在這裡）
 let transferLastRow = {};   // sku -> 最近一次成功掃描命中的列號，給「撤銷」用
 
+// 待送出的驗收掃描。跟揀貨的 pickQueue 完全同一套做法：畫面先反應、動作累積起來
+// 批次送後端。原本這裡是「每掃一件就 await 一次 scanTransferBatch，期間把輸入框
+// disable 掉」——現場量到掃完要等約5秒才有反應，就是在等這一次來回：
+// Apps Script 冷啟動＋搶寫入鎖＋整張表讀寫＋（每隔一次）鏡射回工作區（開外部
+// 試算表就要350-570ms，還要再整張讀一次調撥單、整份讀驗收紀錄、寫將近1800格）。
+// 那5秒完全不需要讓人站在那裡等：掃到什麼、要扣哪一列，本機的 transferFindLocalRow
+// 用的就是跟後端 findOpenRow 一模一樣的FIFO規則，先扣先顯示，後端回應再對帳即可。
+let transferQueue = [];
+let transferFlushTimer = null;
+const TRANSFER_FLUSH_MS = 1200;   // 比揀貨的2500短：驗收要盡快鏡射回工作區給別人看
+
 function transferStaff(){
   const sel = document.getElementById('transferStaffSelect');
   return sel ? staff.find(function(s){ return s.id === sel.value; }) : null;
 }
 
+let transferLoading = false;
 async function loadTransferPending(){
   if(!hasBackend()) return;
+  // 對帳發現分歧 → loadTransferPending → flush → 又對帳，理論上會互相呼叫。
+  // 每次 flush 都會把佇列清空，所以不會無限下去，但還是擋一道比較安心。
+  if(transferLoading) return;
+  transferLoading = true;
+  try{
+    // 佇列裡還有沒送出的掃描就先送掉，否則後端回來的清單不含那幾件，
+    // 會把畫面上已經扣掉的數字又加回去，看起來像掃到的東西不見了。
+    if(transferQueue.length){ try{ await flushTransferQueue(); }catch(err){} }
+    await loadTransferPendingInner_();
+  } finally { transferLoading = false; }
+}
+
+async function loadTransferPendingInner_(){
   let res;
   try{ res = await apiPost('getTransferPending', {}); }
   catch(err){ flash('err', '讀取待驗收清單失敗', err.message || '', 2200); return; }
@@ -3492,6 +3519,10 @@ function renderTransferLists(){
   const pendingBox = document.getElementById('transferPendingList');
   const doneBox = document.getElementById('transferDoneList');
   document.getElementById('transferPendingCount').textContent = transferPending.length;
+  // 畫面上的數字是本機先扣的樂觀值。還沒送到後端的那幾件要講出來，不然斷線時
+  // 現場會以為已經同步好了——跟揀貨頁「N 筆待同步」同一個做法。
+  const syncHint = document.getElementById('transferSyncHint');
+  if(syncHint) syncHint.textContent = transferQueue.length ? '　' + transferQueue.length + ' 筆待同步' : '';
 
   if(!transferPending.length){
     pendingBox.innerHTML = '<p class="hint" style="margin:0;">目前沒有待驗收的調撥品項。</p>';
@@ -3569,7 +3600,10 @@ function transferApplyResult_(r){
   renderTransferLists();
 }
 
-async function transferScan(code){
+// 掃描不再等後端。本機先照跟後端一樣的FIFO規則扣一件、出聲、更新畫面（幾毫秒內完成），
+// 動作丟進佇列批次送出，後端回應回來再對帳。連續掃10件從「10次來回、每次約5秒」變成
+// 「畫面即時反應 + 1次來回」。
+function transferScan(code){
   const raw = String(code || '').trim();
   if(!raw) return;
   if(!hasBackend()){ errorBeep(); flash('err', '需要連線', '調撥驗收要連上後端才能用', 1800); return; }
@@ -3577,40 +3611,103 @@ async function transferScan(code){
   if(!staffObj){ errorBeep(); flash('err', '請先選擇驗收人員', '', 1600); return; }
 
   const cands = [raw].concat(barcodeMap[raw] || []);
-  let target = cands.find(function(s){ return transferFindLocalRow(s); });
-  if(!target) target = cands[0];   // 本機都對不到就還是送給後端判斷，後端看得到最新真相
+  const local = (function(){
+    for(let i = 0; i < cands.length; i++){
+      const hit = transferFindLocalRow(cands[i]);
+      if(hit) return {sku: cands[i], row: hit};
+    }
+    return null;
+  })();
+  const target = local ? local.sku : cands[0];   // 本機都對不到還是要送，後端看得到最新真相
 
-  const el = document.getElementById('transferScanInput');
-  if(el) el.disabled = true;
-  let res;
-  try{
-    res = await apiPost('scanTransferBatch', {ops: [{
-      sku: target, staffId: staffObj.id, staffName: staffObj.name, time: new Date().toLocaleString('zh-TW')
-    }]});
-  }catch(err){
-    errorBeep(); flash('err', '掃描失敗', err.message || '', 2200);
-    if(el){ el.disabled = false; el.focus(); }
-    return;
-  }
-  if(el){ el.disabled = false; el.focus(); }
-  const r = (res && res.results && res.results[0]) || null;
-  if(!r || !r.ok){
+  const op = {sku: target, staffId: staffObj.id, staffName: staffObj.name,
+              time: new Date().toLocaleString('zh-TW'),
+              localRow: local ? local.row.row : null, raw: raw};
+
+  if(local){
+    // 本機就地扣一件。後端 findOpenRow 用的是同一套「這個品號還缺件數、匯入時間最早」
+    // 的規則，所以正常情況下扣到的會是同一列；萬一別人同時也在掃、扣到不同列，
+    // 對帳時後端回應是真相，會把畫面修正回來。
+    okBeep();
+    transferLastRow[target] = local.row.row;
+    transferBumpLocal_(local.row, 1);
+    flash('ok', local.row.baseName || target, '已掃 ' + local.row.scannedQty + ' / ' + local.row.qty, 1400);
+  }else{
+    // 待驗收清單是剛從後端載來的，本機查不到幾乎就是真的沒有——現場需要當下就知道，
+    // 不能等一趟網路才響。還是照樣送出去：後端要留一筆 no_match 稽核紀錄，而且如果
+    // 清單其實過期了（別人剛匯入新的調撥單），對帳時會自己補回來。
     errorBeep();
     flash('err', '找不到這個品號的待驗收項目', '「' + raw + '」目前沒有調撥單在等它，或已經收滿了', 2600);
-    return;
   }
-  okBeep();
-  transferLastRow[r.sku] = r.row;
-  transferApplyResult_(r);
-  flash('ok', r.baseName || r.sku, '已掃 ' + r.scannedQty + ' / ' + r.qty, 1400);
+
+  transferQueue.push(op);
+  saveJSON(LS.transferQueue, transferQueue);
+  scheduleTransferFlush();
+  renderTransferLists();   // 數字＋「N 筆待同步」一起更新
+}
+
+// 本機就地加減已掃件數，收滿就搬到「已完成」那一區（跟後端 done 的判定一致）。
+// delta 是 +1（掃描）或 -1（撤銷）。畫面由呼叫端統一重繪。
+function transferBumpLocal_(item, delta){
+  item.scannedQty = Math.max(0, (item.scannedQty || 0) + delta);
+  const idx = transferPending.indexOf(item);
+  if(delta > 0 && item.scannedQty >= item.qty && idx >= 0){
+    transferDone.unshift(transferPending.splice(idx, 1)[0]);
+  }
+}
+
+function scheduleTransferFlush(){
+  if(transferFlushTimer) clearTimeout(transferFlushTimer);
+  transferFlushTimer = setTimeout(flushTransferQueue, TRANSFER_FLUSH_MS);
+}
+
+// 回傳 Promise，讓「撤銷」「放棄」這種必須排在既有掃描後面的動作可以先 await 它，
+// 不然後端會先收到撤銷、再收到掃描，順序反過來結果就錯了。
+function flushTransferQueue(){
+  if(transferFlushTimer){ clearTimeout(transferFlushTimer); transferFlushTimer = null; }
+  if(!transferQueue.length || !hasBackend()) return Promise.resolve();
+  const batch = transferQueue.slice();
+  return apiPost('scanTransferBatch', {ops: batch.map(function(o){
+      return {sku: o.sku, staffId: o.staffId, staffName: o.staffName, time: o.time};
+    })})
+    .then(function(res){
+      // 只移除這次送出的那幾筆——期間人員可能又掃了新的，不能整個清空
+      transferQueue = transferQueue.slice(batch.length);
+      saveJSON(LS.transferQueue, transferQueue);
+      renderTransferLists();   // 清掉「N 筆待同步」
+      transferReconcile_(batch, (res && res.results) || []);
+    })
+    .catch(function(){
+      // 送不出去就留在佇列裡等下一輪。畫面上的數字是樂觀值，還沒被後端確認過，
+      // 這裡不回滾——回滾會讓現場已經數過的東西憑空消失，比暫時對不上更糟。
+      scheduleTransferFlush();
+      renderTransferLists();
+    });
+}
+
+// 後端回應是真相。跟本機當初的樂觀判斷對不起來（本機說有、後端說沒有，或反過來），
+// 就整批重新載入——與其在這裡逐列猜怎麼修，不如直接拿一份權威清單回來。
+function transferReconcile_(batch, results){
+  let diverged = false;
+  batch.forEach(function(op, i){
+    const r = results[i];
+    const okLocal = op.localRow != null;
+    const okServer = !!(r && r.ok);
+    if(okLocal !== okServer){ diverged = true; return; }
+    if(!okServer) return;
+    transferLastRow[r.sku] = r.row;
+    // 後端算出來的已掃件數跟本機不一樣（有人同時在掃同一批），也要重載
+    const mine = transferPending.concat(transferDone).find(function(x){ return x.row === r.row; });
+    if(!mine || mine.scannedQty !== r.scannedQty) diverged = true;
+  });
+  if(diverged) loadTransferPending();
 }
 
 // 待驗收卡片上的「✓ 確認1件」按鈕——沒有條碼、不方便掃描/複製貼上的品項，
 // 直接點按鈕當作掃到這個品號一次，跟transferScan(sku)是同一套邏輯，只是觸發方式不同。
-async function transferConfirmClick(btn, sku){
-  const doneBusy = withBusy(btn);
-  try{ await transferScan(sku); }
-  finally{ doneBusy(); }
+// transferScan 現在是同步的（本機先扣、批次送出），不用再包 withBusy 等網路。
+function transferConfirmClick(btn, sku){
+  transferScan(sku);
 }
 
 async function transferUndo(btn, sku){
@@ -3621,6 +3718,9 @@ async function transferUndo(btn, sku){
   let res;
   const doneBusy = withBusy(btn);
   try{
+    // 佇列裡可能還有沒送出的掃描。撤銷必須排在它們後面，否則後端會先扣掉這一件、
+    // 再把還沒送的那幾件加回去，數字就反了。
+    await flushTransferQueue();
     res = await apiPost('scanTransferBatch', {ops: [{
       sku: sku, undo: true, matchedRow: row, staffId: staffObj.id, staffName: staffObj.name,
       time: new Date().toLocaleString('zh-TW')
@@ -3658,7 +3758,11 @@ async function transferClose(btn, row, sku){
   if(!ok) return;
   let res;
   const doneBusy = withBusy(btn);
-  try{ res = await apiPost('closeTransferItem', {row: row, staffId: staffObj.id, staffName: staffObj.name, reason: '現場人工放棄'}); }
+  // 跟撤銷同樣道理：先把佇列裡還沒送出的掃描送掉，再放棄這一列
+  try{
+    await flushTransferQueue();
+    res = await apiPost('closeTransferItem', {row: row, staffId: staffObj.id, staffName: staffObj.name, reason: '現場人工放棄'});
+  }
   catch(err){ errorBeep(); flash('err', '放棄失敗', err.message || '', 2200); return; }finally{ doneBusy(); }
   if(!res || !res.ok){ errorBeep(); flash('err', '放棄失敗', (res && res.error) || '', 2600); return; }
   okBeep();
@@ -5226,6 +5330,16 @@ renderHome();
 // ---- 揀貨初始化 ----
 pickQueue = loadJSON(LS.pickQueue, []);
 if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就繼續送
+// ---- 調撥驗收：同樣把上次沒送完的掃描接著送 ----
+transferQueue = loadJSON(LS.transferQueue, []);
+if(transferQueue.length) scheduleTransferFlush();
+// 現場常常掃完就直接關掉分頁/切走。1.2秒的去抖動窗口內關掉的話那幾件會留在
+// localStorage 等下次開啟才送——資料不會掉，但工作區那邊會晚一步看到。
+// 這裡趁還看得到頁面時把它送出去（頁面隱藏時也送，手機切APP走的是這個事件）。
+window.addEventListener('pagehide', function(){ flushTransferQueue(); });
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState === 'hidden') flushTransferQueue();
+});
 ['pickFilterStore','pickFilterShip','pickFilterZone','pickHideDone'].forEach(id=>{
   const el = document.getElementById(id);
   if(el) el.addEventListener(el.type==='checkbox'?'change':'input', renderPickList);
