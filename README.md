@@ -44,7 +44,8 @@ https://script.google.com/macros/s/AKfycbxdzii_g-Dv59KDLIiWa2B7adWyv_JuLoBQBfP42
 | `index.html` | 前端 APP 單檔 | ❌（走 GitHub Pages） |
 | `zbar-wasm.min.js` / `zbar.wasm` | 條碼掃描引擎 | ❌ |
 | `barcode-detector-polyfill.min.js` | 舊瀏覽器的 BarcodeDetector 補丁 | ❌ |
-| `deploy.sh` | 一鍵部署後端 | ❌ |
+| `deploy.sh` | 一鍵部署後端（Git Bash） | ❌ |
+| `deploy.ps1` | 一鍵部署後端（PowerShell，內容等價） | ❌ |
 | `.clasp.json` | scriptId 設定 | ❌ |
 | `.claspignore` | 白名單，只放行 `Code.gs` + `appsscript.json` | ❌ |
 
@@ -94,12 +95,22 @@ clasp status         # 應該列出 Code.gs 與 appsscript.json 兩個 tracked �
 
 ### 後端（Code.gs）
 
+兩份腳本擇一，做的事完全一樣：
+
+```powershell
+# PowerShell（不用裝 Git Bash，右鍵「用 PowerShell 執行」也可以）
+.\deploy.ps1 "這次改了什麼"
+
+# 被執行原則擋下來的話
+powershell -ExecutionPolicy Bypass -File .\deploy.ps1 "這次改了什麼"
+```
+
 ```bash
+# Git Bash
 sh deploy.sh "這次改了什麼"
 ```
 
-Windows 上用 **Git Bash** 跑（`deploy.sh` 是 sh 腳本，PowerShell 不能直接執行）。
-腳本會依序做四件事：
+兩者都會依序做四件事：
 
 1. `node --check` 先擋語法錯誤，不讓壞程式上正式環境
 2. `clasp push -f`
