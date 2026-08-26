@@ -113,7 +113,16 @@ if (Test-Path (Join-Path $env:USERPROFILE ".clasprc.json")) {
 
 # ---- 6. 部署 -------------------------------------------------------------
 Step 6 "部署後端（會自動驗證版本號）"
-& (Join-Path $ProjectDir "deploy.ps1") "調撥驗收效能優化"
+# deploy.ps1 是後來才加進 repo 的，第4步更新失敗（例如有未commit的本機改動擋住 pull）
+# 的話這個檔案可能還不存在。先檢查，不要讓「找不到指令」這種訊息蓋掉真正的原因。
+$deployScript = Join-Path $ProjectDir "deploy.ps1"
+if (-not (Test-Path $deployScript)) {
+  Bad "找不到 deploy.ps1（第4步的更新沒成功，這個檔案還沒下載下來）"
+  Write-Host "      先處理本機未 commit 的改動，讓 git pull 跑得過去，再重跑這支腳本。"
+  Read-Host "`n按 Enter 結束"
+  exit 1
+}
+& $deployScript "調撥驗收效能優化"
 $deployOk = ($LASTEXITCODE -eq 0)
 
 Write-Host ""
