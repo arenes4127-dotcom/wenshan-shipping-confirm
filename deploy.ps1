@@ -13,7 +13,11 @@ param(
   [string]$Description = "手動部署"
 )
 
-$ErrorActionPreference = "Stop"
+# 這裡刻意不是 "Stop"。clasp 跟 node 會把進度/警告訊息寫到 stderr，而 PowerShell 在
+# ErrorActionPreference=Stop 之下會把「原生程式寫了 stderr」當成終止錯誤——結果是指令
+# 明明成功了，腳本卻中斷（實際踩過：git fetch 印出正常的 From https://... 就被當成錯誤）。
+# 原生程式的成敗一律看 $LASTEXITCODE，那才是真正的結束代碼。
+$ErrorActionPreference = "Continue"
 
 # 一定要指定部署ID。不帶 -i 的 clasp create-deployment 會產生全新的部署、拿到不同的
 # /exec 網址，等於倉庫所有裝置瞬間連不上後端。這個ID就是目前 /exec 網址裡的那一段。

@@ -240,6 +240,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   setupTransferStageSheet_: () => setupTransferStageSheet_(),
   testTransferFlow_: () => testTransferFlow_(),
   timeScanTransferBatch12_: () => timeScanTransferBatch12_(),
+  timeSingleTransferScan_: () => timeSingleTransferScan_(),
   setupShopeeUpdateStageSheet_: () => setupShopeeUpdateStageSheet_(),
   testShopeeUpdateStage_: () => testShopeeUpdateStage_(),
   testBackupAuditSheets_: () => testBackupAuditSheets_(),
@@ -3201,6 +3202,55 @@ function mirrorTransferToWorkspace_(rowsOverride){
   sh.getRange(TRANSFER_MIRROR_FIRST_ROW, 16, TRANSFER_MIRROR_MAX_ROWS, 1).setValues(pBlock);
 
   return {ok:true, items: items.length, scans: logs.length};
+}
+
+// 暫時性診斷用：使用者反映調撥驗收單筆掃描後還是有~5秒延遲，先量測一次真正
+// 的耗時分佈在哪，不要用猜的（同一個原則這份記憶庫已經記過很多次）。只做
+// 「一次呼叫」的單筆計時，不在同一次執行內重複呼叫scanTransferBatch本身
+// （這個曾經在別的功能上引發過事故，見專案記憶），mirrorTransferToWorkspace_
+// 額外單獨呼叫一次是為了量測「如果真的觸發鏡射，代價有多重」，這支函式本身
+// 冪等（覆寫整份鏡射內容，不是累加），呼叫兩次不會造成資料重複或損壞。
+// 全程只用ZZ-TEST開頭的測試貨號，測完清乾淨。用完可以刪掉，不是常駐功能。
+function timeSingleTransferScan_(){
+  const dst = getSheet(SHEET_TRANSFER, TRANSFER_HEADER);
+  const logSh = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER);
+  const beforeRows = dst.getLastRow();
+  const beforeLog = logSh.getLastRow();
+  const sku = 'ZZ-TEST-TIMING-SINGLE';
+  const now = nowStamp_();
+  let result = {ok:false};
+  try{
+    const row = ['TR-TIMING-TEST', sku, '計時測試商品', '', 1, '', '', '', '', '', 0, 'open', now, '計時測試', ''];
+    const start = dst.getLastRow() + 1;
+    dst.getRange(start, colOf(TRANSFER_HEADER,'sku')).setNumberFormat('@');
+    dst.getRange(start, colOf(TRANSFER_HEADER,'importedAt')).setNumberFormat('@');
+    dst.getRange(start, 1, 1, TRANSFER_HEADER.length).setValues([row]);
+
+    // 清掉去抖動旗標，模擬「距離上次鏡射已經超過8秒」——這是真實現場的常見情況，
+    // 使用者反映的延遲正是在這種情況下感受到的，不是連續快速掃描的那種情境。
+    try{ CacheService.getScriptCache().remove(TRANSFER_MIRROR_DEBOUNCE_KEY); }catch(e){}
+
+    const t0 = Date.now();
+    const res = scanTransferBatch([{sku: sku, staffId:'T', staffName:'計時測試'}]);
+    const totalScanMs = Date.now() - t0;
+
+    const t1 = Date.now();
+    const mirrorRes = mirrorTransferToWorkspace_();
+    const mirrorAloneMs = Date.now() - t1;
+
+    result = {ok:true,
+      scanResultOk: !!(res.ok && res.results[0] && res.results[0].ok),
+      totalScanMs: totalScanMs, mirrorAloneMs: mirrorAloneMs, mirrorItemCount: mirrorRes.items};
+  }catch(err){
+    result = {ok:false, error: String(err)};
+  }finally{
+    const last = dst.getLastRow();
+    for(let r = last; r > beforeRows; r--) dst.deleteRow(r);
+    const lastLog = logSh.getLastRow();
+    for(let r = lastLog; r > beforeLog; r--) logSh.deleteRow(r);
+    try{ mirrorTransferToWorkspace_(); }catch(e){}   // 把鏡射端殘留的測試資料沖乾淨
+  }
+  return result;
 }
 
 function mirrorTransferScheduled_(){
