@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-08-26.158';
+const BACKEND_VERSION = '2026-09-30.159';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -241,6 +241,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   testTransferFlow_: () => testTransferFlow_(),
   timeScanTransferBatch12_: () => timeScanTransferBatch12_(),
   timeSingleTransferScan_: () => timeSingleTransferScan_(),
+  timeOrderLookup_: () => timeOrderLookup_(),
   setupShopeeUpdateStageSheet_: () => setupShopeeUpdateStageSheet_(),
   testShopeeUpdateStage_: () => testShopeeUpdateStage_(),
   testBackupAuditSheets_: () => testBackupAuditSheets_(),
@@ -568,6 +569,123 @@ function readOrderRows(){
   return rows;
 }
 
+// ---------------- 訂單號 → 列號索引 ----------------
+// finalizeShipment / claimOrder / markPickDone 原本都是 readOrderRows() 整張讀
+// （500多列 × 24欄，而且 itemsJson 那欄是大 JSON），只為了從裡面挑出一列。
+// 這跟先前解決過兩次的是同一類問題，兩次的解法也都一樣是「建索引 + 只讀需要的那一列」：
+//   cacheInfoFor_  整欄讀25,539列  4秒多 → 70-90ms
+//   locIndex_      整欄重掃        1.6秒 → 46-114ms
+// 這裡套用同一招到「訂單」分頁。
+//
+// ⚠️ 最重要的一點：索引存的是「列號」，而「訂單」分頁的列會被刪除——
+// archiveShippedOrders_ 每天把已出貨訂單歸檔時會 deleteRow，後面所有列的列號整體往前位移。
+// 拿著過期的列號直接寫入，就是把出貨狀態寫到「別張訂單」上，那是這個系統最嚴重的資料錯誤。
+// 所以 findOrderRow_ 一律「讀出那一列、先驗證訂單號對不對得上，對不上就重建索引再試一次」。
+// 這個設計讓快取失效漏掉也不會寫錯資料，最多只是多花一次重建的成本（自我修復）。
+const ORDER_INDEX_CACHE_PREFIX = 'orderIdxV1_';
+const ORDER_INDEX_CACHE_SHARDS = 10;
+const ORDER_INDEX_CACHE_TTL_SEC = 300;
+
+function orderIndexCacheGet_(){ return shardedCacheGet_(ORDER_INDEX_CACHE_PREFIX, ORDER_INDEX_CACHE_SHARDS); }
+function orderIndexCacheSet_(idx){ shardedCacheSet_(ORDER_INDEX_CACHE_PREFIX, ORDER_INDEX_CACHE_SHARDS, idx, ORDER_INDEX_CACHE_TTL_SEC); }
+function orderIndexCacheClear_(){ shardedCacheClear_(ORDER_INDEX_CACHE_PREFIX, ORDER_INDEX_CACHE_SHARDS); }
+
+// 只讀訂單號那一欄來建索引：24欄變1欄，而且避開 itemsJson 那種大欄位。
+function buildOrderIndex_(sh){
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return {};
+  const col = sh.getRange(2, colOf(ORDERS_HEADER, 'orderNo'), lastRow - 1, 1).getValues();
+  const idx = {};
+  for(let i = 0; i < col.length; i++){
+    const k = String(col[i][0]||'').trim();
+    if(k && idx[k] === undefined) idx[k] = i + 2;   // 同號重複時以第一筆為準，跟 locIndex_ 一致
+  }
+  return idx;
+}
+
+function orderIndex_(sh, forceRebuild){
+  if(!forceRebuild){
+    try{
+      const cached = orderIndexCacheGet_();
+      if(cached) return cached;
+    }catch(err){ /* 快取讀取失敗就當沒快取，往下重建一次 */ }
+  }
+  const idx = buildOrderIndex_(sh);
+  try{ orderIndexCacheSet_(idx); }catch(err){ /* 存不進去不影響正確性，只是這次沒加速到 */ }
+  return idx;
+}
+
+// 取代 readOrderRows().find(r => r.orderNo === orderNo)。
+// 回傳物件的形狀跟 readRows() 產出的完全一樣（含 _row、status 已轉成英文代碼），
+// 所以呼叫端除了這一行以外什麼都不用改。找不到回 null。
+function findOrderRow_(sh, orderNo){
+  const want = String(orderNo||'').trim();
+  if(!want) return null;
+  // 兩輪：第一輪用快取的索引，對不上第二輪強制重建再試。重建過還對不上就是真的沒有這張訂單。
+  for(let attempt = 0; attempt < 2; attempt++){
+    const idx = orderIndex_(sh, attempt > 0);
+    const rowNum = idx[want];
+    if(!rowNum){
+      if(attempt > 0) return null;
+      continue;                       // 可能是剛同步進來的新訂單，重建索引再找一次
+    }
+    const raw = sh.getRange(rowNum, 1, 1, ORDERS_HEADER.length).getValues()[0];
+    if(String(raw[0]||'').trim() !== want){
+      if(attempt > 0) return null;
+      continue;                       // 列號位移了（歸檔刪過列），重建索引再試一次
+    }
+    const obj = {_row: rowNum};
+    ORDERS_HEADER.forEach(function(h, i){ obj[h] = raw[i]; });
+    obj.status = textToStatus(obj.status);
+    return obj;
+  }
+  return null;
+}
+
+// 量測索引到底省了多少。**全程唯讀**，不建測試列、不寫任何一格——
+// 這個專案有過「測相機掃描訂單號時不小心 claimOrder 認領了一張真實訂單」的紀錄，
+// 效能量測沒有必要冒那種風險，比對查詢本身就夠了。
+// 用法：{"action":"runOneTimeSetup","name":"timeOrderLookup_"}
+function timeOrderLookup_(){
+  const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return {ok:false, error:'訂單分頁沒有資料列，沒東西可以量'};
+
+  // 拿最後一列的訂單號當樣本：最後一列是全表掃描最晚才找到的，對舊做法最不利，
+  // 也最接近「剛同步進來的新訂單」這個真實情境。
+  const sampleOrderNo = String(sh.getRange(lastRow, colOf(ORDERS_HEADER,'orderNo')).getValue()||'').trim();
+  if(!sampleOrderNo) return {ok:false, error:'最後一列沒有訂單號'};
+
+  // ① 舊做法：整張讀 + find
+  const t0 = Date.now();
+  const allRows = readOrderRows();
+  const oldHit = allRows.find(function(r){ return String(r.orderNo||'').trim() === sampleOrderNo; });
+  const fullScanMs = Date.now() - t0;
+
+  // ② 新做法（冷）：索引不在快取裡，要先整欄讀一次建索引
+  try{ orderIndexCacheClear_(); }catch(err){}
+  const t1 = Date.now();
+  const coldHit = findOrderRow_(sh, sampleOrderNo);
+  const indexedColdMs = Date.now() - t1;
+
+  // ③ 新做法（熱）：索引已在 CacheService 裡，只讀目標那一列。這是現場絕大多數請求的情況。
+  const t2 = Date.now();
+  const warmHit = findOrderRow_(sh, sampleOrderNo);
+  const indexedWarmMs = Date.now() - t2;
+
+  return {ok:true,
+    orderRows: allRows.length,
+    sampleOrderNo: sampleOrderNo,
+    // 三種做法必須指到同一列，不然這個量測沒有意義
+    sameRow: !!(oldHit && coldHit && warmHit
+                && oldHit._row === coldHit._row && coldHit._row === warmHit._row),
+    row: oldHit ? oldHit._row : null,
+    fullScanMs: fullScanMs,
+    indexedColdMs: indexedColdMs,
+    indexedWarmMs: indexedWarmMs,
+    speedupWarm: indexedWarmMs > 0 ? Math.round(fullScanMs / indexedWarmMs * 10) / 10 : null};
+}
+
 // 用欄位名稱查1-indexed欄號，不要用寫死的數字——加新欄位時舊的寫死數字會全部錯位
 function colOf(header, name){
   const idx = header.indexOf(name);
@@ -658,6 +776,8 @@ function mergeOrders(incoming){
   // 新增的訂單才不會落在規則範圍外變成沒有顏色。順便也有自動修復的效果：
   // 萬一哪個一次性函式把分頁重建掉、規則跟著消失，下一次同步就會自己補回來。
   setupOrderSheetColors();
+  // 同步可能新增了訂單列，索引要跟著失效，新訂單才不用等第一次「找不到→重建」才查得到。
+  if(added) { try{ orderIndexCacheClear_(); }catch(err){} }
   return {ok:true, added, updated, skippedShipped};
 }
 
@@ -1564,6 +1684,10 @@ function archiveShippedOrders_(){
 
   // 由下往上刪，不然刪掉一列之後下面的列號會往上跑，會刪錯列
   toArchive.map(r=>r._row).sort((a,b)=>b-a).forEach(rowNum=> sh.deleteRow(rowNum));
+  // 刪列讓後面所有列號整體位移，訂單號→列號索引全部作廢。
+  // findOrderRow_ 本來就會驗證訂單號、對不上自己重建，所以這裡漏清也不會寫錯資料；
+  // 主動清掉只是省下「每個人下一次操作都各自撞一次過期索引再重建」的成本。
+  try{ orderIndexCacheClear_(); }catch(err){ /* 清不掉就讓它自然過期，不影響正確性 */ }
 
   rebuildOrderDetailSheet_(); // 訂單少了幾張，明細分頁跟著重建才不會對不起來
   Logger.log('已歸檔 '+toArchive.length+' 張已出貨訂單到「'+fileName+'」並從訂單分頁移除'
@@ -5964,8 +6088,7 @@ function markPickDone(body){
   const orderNo = String((body && body.orderNo) || '').trim();
   if(!orderNo) return {ok:false, error:'missing orderNo'};
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readOrderRows();
-  const row = rows.find(function(r){ return String(r.orderNo||'').trim() === orderNo; });
+  const row = findOrderRow_(sh, orderNo);   // 只讀這一列，不整張讀
   if(!row) return {ok:false, reason:'not_found'};
   if(row.status === 'shipped') return {ok:false, reason:'already_shipped'};
 
@@ -6569,8 +6692,7 @@ function testStaleClaimRelease_(){
 // ---------------- 認領訂單（避免兩人同時掃同一張） ----------------
 function claimOrder(orderNo, staffId, staffName){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readOrderRows();
-  let row = rows.find(r=>r.orderNo===orderNo);
+  let row = findOrderRow_(sh, orderNo);   // 只讀這一列，不整張讀
   if(!row) return {ok:false, reason:'not_found'};
   row = healOrderRowIfNeeded_(sh, row);
   if(row.status === 'shipped') return {ok:false, reason:'already_shipped'};
@@ -6597,8 +6719,7 @@ function claimOrder(orderNo, staffId, staffName){
 
 function releaseOrder(orderNo){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readOrderRows();
-  let row = rows.find(r=>r.orderNo===orderNo);
+  let row = findOrderRow_(sh, orderNo);   // 只讀這一列，不整張讀
   if(!row) return {ok:false, reason:'not_found'};
   row = healOrderRowIfNeeded_(sh, row);
   if(row.status === 'shipped') return {ok:true}; // 已出貨就不用管了
@@ -6610,8 +6731,9 @@ function releaseOrder(orderNo){
 function finalizeShipment(entry){
   if(!entry || !entry.orderNo) return {ok:false, error:'missing orderNo'};
   const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readOrderRows();
-  let row = rows.find(r=>r.orderNo===entry.orderNo);
+  // 只讀需要的那一列（見 findOrderRow_）。原本是 readOrderRows() 整張讀，
+  // 這是「完成出貨」按下去之後人員實際在等的那幾秒裡最大的一塊。
+  let row = findOrderRow_(ordersSh, entry.orderNo);
   if(row){
     row = healOrderRowIfNeeded_(ordersSh, row);
     // 防呆：這張訂單已經出貨過了就不要再記錄第二次（例如兩台裝置都認領到同一張訂單、
