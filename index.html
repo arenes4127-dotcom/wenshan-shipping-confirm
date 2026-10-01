@@ -1318,8 +1318,11 @@ function flushNetFailures(){
 
 // 真正發請求的底層函式，不含失敗記錄邏輯——補送連線失敗紀錄時要用這個，
 // 不然補送失敗又會記一筆新的失敗，變成無限循環。
-async function rawApiGet(){
-  const res = await fetch(settings.backendUrl, {method:'GET'});
+async function rawApiGet(lean){
+  // lean=true 時跟後端說「只要訂單、不用出貨紀錄」。
+  // 舊版後端不認得這個參數會直接忽略、照樣回完整資料，所以前端先上線也不會壞。
+  const url = settings.backendUrl + (lean ? (settings.backendUrl.indexOf('?')>=0 ? '&' : '?') + 'lean=1' : '');
+  const res = await fetch(url, {method:'GET'});
   if(!res.ok) throw new Error('HTTP '+res.status);
   const data = await res.json();
   if(data && data.ok===false) throw new Error(data.error||'後端回應失敗');
@@ -1338,9 +1341,9 @@ async function rawApiPost(action, payload){
   return data;
 }
 
-async function apiGet(){
+async function apiGet(lean){
   try{
-    const data = await rawApiGet();
+    const data = await rawApiGet(lean);
     flushNetFailures();
     return data;
   }catch(err){ recordNetFailure('getState', err.message); throw err; }
@@ -1375,19 +1378,24 @@ function normalizeDateField(v){
   return `${get('year')}/${get('month')}/${get('day')}`;
 }
 
-async function refreshFromBackend(silent){
+// lean=true：只更新訂單，不抓出貨紀錄。每 20 秒的背景輪詢用這個。
+async function refreshFromBackend(silent, lean){
   if(!hasBackend()) { setConnStatus('', '單機模式'); return; }
   const _t0 = (performance && performance.now ? performance.now() : Date.now());
   try{
-    const data = await apiGet();
+    const data = await apiGet(lean);
     const _tNet = (performance && performance.now ? performance.now() : Date.now());
     orders = data.orders || {};
     Object.values(orders).forEach(o=>{ o.date = normalizeDateField(o.date); });
-    log = data.log || [];
-    log.forEach(l=>{ l.orderDate = normalizeDateField(l.orderDate); });
+    // 只有這次真的有拿出貨紀錄才覆蓋。lean 模式後端不回 log 這個鍵，
+    // 寫成 data.log || [] 會把本機已經有的紀錄清成空的。
+    if(data.log){
+      log = data.log;
+      log.forEach(l=>{ l.orderDate = normalizeDateField(l.orderDate); });
+      saveJSON(LS.log, log);
+    }
     if(data.staff && data.staff.length) staff = data.staff;
     saveOrdersCache_();
-    saveJSON(LS.log, log);
     saveJSON(LS.staff, staff);
     setConnStatus('ok', '已連線（多人同步）');
     // 記一筆：背景刷新如果跟掃描重疊，它就是那幾秒的來源。
@@ -1453,12 +1461,19 @@ async function gotoView(name){
     loadTransferPending();
     setTimeout(function(){ const el = document.getElementById('transferScanInput'); if(el) el.focus(); }, 40);
   }
-  if(name==='log') renderLog();
+  if(name==='log'){
+    renderLog();   // 先畫本機既有的，不要讓畫面空著等網路
+    // 背景輪詢改成 lean（不抓出貨紀錄）之後，這一頁的資料只會在這裡更新。
+    // 進來時補抓一次完整的，看到的才是最新的。
+    if(hasBackend()) refreshFromBackend(true).then(ok=>{ if(ok) renderLog(); });
+  }
   if(name==='settings') renderSettings();
   if(name==='scan') setTimeout(()=>inputOrder && inputOrder.focus(), 30);
-  if((name==='home' || name==='orders' || name==='log' || name==='pick') && hasBackend() && !current){
-    const ok = await refreshFromBackend(true);
-    if(ok){ renderPending(); renderLog(); renderHome(); }
+  if((name==='home' || name==='orders' || name==='pick') && hasBackend() && !current){
+    // 不含 log：那一頁上面已經自己補抓完整資料了，不要重複抓一次。
+    // 這裡走 lean，切頁反應才不用等出貨紀錄一起搬過來。
+    const ok = await refreshFromBackend(true, true);
+    if(ok){ renderPending(); renderHome(); }
   }
 }
 document.querySelectorAll('[data-goto]').forEach(el=>{
@@ -2064,7 +2079,12 @@ document.getElementById('btnImportShipmentSheet').addEventListener('click', asyn
     if(hasBackend()){
       const entriesWithItems = candidateEntries.map(e=>{
         const order = orders[e.orderNo];
-        return Object.assign({}, e, {orderDate: order ? (order.date||'') : '', items: order ? order.items.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.qty})) : []});
+        // order.items 可能不存在：getState 對已出貨的訂單只回 {orderNo,status,date}
+        // （它們是回應體積的大宗，見後端 getState 的說明）。匯入的檔案裡本來就常含
+        // 已經出貨過的訂單，光判斷 order 存不存在不夠，要連 items 一起防。
+        // 後端 importShippedBatch 自己也會擋 already_shipped，所以這裡送空陣列是安全的。
+        const its = (order && order.items) ? order.items : [];
+        return Object.assign({}, e, {orderDate: order ? (order.date||'') : '', items: its.map(i=>({sku:i.sku,name:i.name,baseName:i.baseName,spec:i.spec,qty:i.qty,scanned:i.qty}))});
       });
       const result = await apiPost('importShippedBatch', {entries: entriesWithItems});
       imported = result.imported; skippedNotFound = result.skippedNotFound; skippedAlreadyShipped = result.skippedAlreadyShipped;
@@ -4363,7 +4383,8 @@ async function scanOrder(code){
     // 剛同步進來的訂單。以前這裡直接報「找不到」，人員只能自己跑去按同步再回來重掃。
     // 改成先補抓一次權威資料再找——只有真的查不到時才會走到這一步，不影響正常情況的速度。
     flash('', '查詢中…', '本機清單沒有這張，正在跟後端確認', 1500);
-    const ok = await refreshFromBackend(true);
+    // 走 lean：這一步人正站在機台前等，只需要訂單，不需要連出貨紀錄一起搬
+    const ok = await refreshFromBackend(true, true);
     if(ok) order = orders[code];
     perfMark_('本機查無→補抓後端');
   }
@@ -5777,7 +5798,7 @@ if(settings.productImageSheetUrl){
 setInterval(()=>{
   if(!hasBackend()) return;
   if(isScanStationActive_()) return;
-  refreshFromBackend(true).then(ok=>{
+  refreshFromBackend(true, true).then(ok=>{   // 第二個 true = lean，不抓出貨紀錄
     if(!ok) return;
     renderDataViews();   // 跟其他呼叫點統一；原本這裡 renderHome() 重複寫了兩次
   });

@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-01.160';
+const BACKEND_VERSION = '2026-10-01.161';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -122,7 +122,10 @@ const HEADER_LABELS = {
 };
 
 function doGet(e){
-  return respond(getState());
+  // ?lean=1 給背景輪詢用：只要訂單，不要出貨紀錄。
+  // 舊版前端不帶這個參數，拿到的還是完整回應，所以前後端誰先上線都不會壞。
+  const lean = !!(e && e.parameter && e.parameter.lean);
+  return respond(getState({lean: lean}));
 }
 
 // 多人同步時，這些動作只讀不寫（不動文山地圖／訂單／出貨紀錄等共用表格，
@@ -490,19 +493,37 @@ function readRows(name, header){
 }
 
 // ---------------- state (讀取全部資料，給前端初始化/輪詢用) ----------------
-function getState(){
+// opts.lean：給每20秒的背景輪詢用，只要訂單、不要出貨紀錄。
+//
+// 為什麼要分 lean：現場實測（timeGetState_，1,353 筆訂單）
+//   讀訂單表 1,131ms／讀出貨紀錄 285ms／讀人員 196ms／開試算表 241ms
+//   後端總運算 1,962ms，但客戶端量到 4,603ms
+// 中間那 2,640ms 差額是 622KB 的下載＋手持機上的 JSON.parse＋平台開銷。
+// 也就是說「傳多少」跟「算多久」一樣重要，兩邊都要減。
+// 出貨紀錄只有「出貨紀錄」那一頁在看，不需要每 20 秒跟著搬一次。
+function getState(opts){
+  const lean = !!(opts && opts.lean);
   const orderRows = readOrderRows();
   const orders = {};
   orderRows.forEach(r=>{
-    const rawItems = safeParse(r.itemsJson, []);
-    // 已出貨的訂單不會再被揀貨/掃描，數量/已掃這些追蹤欄位對它們來說已經沒用了——
-    // 出貨當下的完整明細本來就已經存進「出貨紀錄」那份快照，這裡不用重複帶一份。
-    // 只留 sku/name/baseName/spec 是為了 findItemBySku()（隨手從任何一張訂單找品名
-    // 顯示用）這個用途還能運作，其餘欄位丟掉。887筆訂單裡六百多筆已出貨，這裡每個
-    // 品項省下的位元組乘起來，是拖慢每次開APP第一次抓資料速度的主因之一。
-    const items = r.status === 'shipped'
-      ? rawItems.map(function(it){ return {sku: it.sku, name: it.name, baseName: it.baseName, spec: it.spec}; })
-      : rawItems;
+    // 註：findItemBySku()（隨手從任何訂單找品名來顯示）因此找不到已出貨訂單的品項。
+    // 那只影響顯示，而且它的呼叫端 findItemNameBySku 本來就寫著「都找不到就回空字串，
+    // 讓畫面顯示貨號本身，不要硬掰一個名字出來」——優雅降級已經設計好了。
+    // 已出貨的訂單只帶三個欄位就夠。
+    //
+    // 量過才知道體積在哪：1,353 筆、8 成已出貨時，拿掉品項之後回應仍有 607KB，
+    // 剩下的幾乎全是「已出貨訂單的欄位名稱」——18 個 key 多半是空字串，但光 key
+    // 本身每筆就要 400 多 bytes，乘上一千多筆就是幾百 KB。
+    //
+    // 前端對已出貨訂單只做三件事：掃到時講「此訂單已出貨」、CSV 匯入時去重、
+    // 以及被 status 過濾掉。全部只需要 orderNo / status。date 留著是因為
+    // refreshFromBackend 會對每張訂單跑 normalizeDateField，留著比較不會有意外
+    // （少一個欄位它也不會爆，已驗過，但這個欄位很便宜）。
+    if(r.status === 'shipped'){
+      orders[r.orderNo] = {orderNo: r.orderNo, status: r.status, date: cellToText(r.date)};
+      return;
+    }
+    const items = safeParse(r.itemsJson, []);
     orders[r.orderNo] = {
       orderNo: r.orderNo, store: r.store, date: cellToText(r.date),
       items: items, status: r.status,
@@ -532,7 +553,9 @@ function getState(){
   // 出貨紀錄現在存的是「一列一品項」，同一次出貨的N個品項會連續寫N列（訂單層級欄位重複），
   // 這裡依「訂單號+完成時間」把同一次出貨的品項列重新組回一筆帶items陣列的紀錄，
   // 維持給前端APP的資料格狀跟以前一樣（APP自己畫面上還是把出貨紀錄當「一次出貨一筆」呈現）。
-  const logRows = readRows(SHEET_LOG, LOG_HEADER);
+  // lean 模式整段跳過：讀出貨紀錄實測 285ms，加上它在回應裡佔的體積，
+  // 而這份資料只有「出貨紀錄」那一頁在看——不需要每 20 秒跟著搬一次。
+  const logRows = lean ? [] : readRows(SHEET_LOG, LOG_HEADER);
   const logGroups = {};
   const logKeyOrder = [];
   logRows.forEach(r=>{
@@ -558,7 +581,11 @@ function getState(){
   const log = logKeyOrder.map(k=>logGroups[k]).reverse(); // 最新的在前面
   const staffRows = readRows(SHEET_STAFF, STAFF_HEADER);
   const staff = staffRows.map(r=>({id:r.id, name:r.name}));
-  return {ok:true, orders, log, staff, version: BACKEND_VERSION};
+  // lean 時不回 log 這個鍵（而不是回空陣列）——前端才分得出「這次沒要」跟
+  // 「真的一筆都沒有」，不會把本機已經有的出貨紀錄清掉。
+  const out = {ok:true, orders, staff, version: BACKEND_VERSION, lean: lean};
+  if(!lean) out.log = log;
+  return out;
 }
 
 function safeParse(json, fallback){
