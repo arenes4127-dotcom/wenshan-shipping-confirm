@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-01.164';
+const BACKEND_VERSION = '2026-10-01.165';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -350,6 +350,36 @@ function runOneTimeSetup(name, arg){
 //
 // 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
 // （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
+// 只重建「每日維護（自動結案＋歸檔）」這一個觸發器。名字不帶底線，選單選得到。
+//
+// 為什麼需要這支、而不是直接跑 installAutomationTriggers_：那支會把十個排程全部砍掉重建，
+// 為了修一個排程去動其他九個，風險不對等。這支只碰 dailyMaintenance_。
+//
+// 什麼情況要用：diagnoseTriggers_ 說觸發器在，但編輯器左側「執行項目」裡完全沒有
+// dailyMaintenance_ 的紀錄。這代表它掛著但不會動——Google 在觸發器連續失敗後會自動
+// 停用它，而被停用的觸發器仍然留在 getProjectTriggers() 的清單裡，所以光看清單看不出來。
+// 刪掉重建會讓它重新開始排程。
+//
+// 時間維持 19:30，不能改到 20:30 之後：「文山出貨 工作區」自己有一個 20:30 的排程會把
+// 「文山出貨V2」從模板還原（等於清空當天訂單）。歸檔要讀那份鏡像來判斷「這張訂單是不是
+// 已經從來源消失了」，撞在一起跑的話鏡像是空的，歸檔的安全檢查會直接略過整批，
+// 結果就是永遠不會真的歸檔。
+function reinstallDailyMaintenanceTrigger(){
+  let removed = 0;
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    if(t.getHandlerFunction() === 'dailyMaintenance_'){ ScriptApp.deleteTrigger(t); removed++; }
+  });
+  ScriptApp.newTrigger('dailyMaintenance_').timeBased().atHour(19).nearMinute(30).everyDays(1).create();
+  const now = ScriptApp.getProjectTriggers().filter(function(t){
+    return t.getHandlerFunction() === 'dailyMaintenance_';
+  }).length;
+  // 發出請求不等於完成——建完一定要回頭數一次，這個系統在「以為裝好了其實沒裝」上面吃過虧。
+  const out = {刪掉舊的: removed, 現在有幾個: now, 時間: '每天 19:30',
+               結果: now === 1 ? 'OK' : '異常：預期剛好 1 個'};
+  Logger.log(JSON.stringify(out, null, 2));
+  return out;
+}
+
 // 手動把「已出貨且符合歸檔條件」的訂單搬走一批。名字不帶底線，所以編輯器的函式
 // 下拉選單選得到——不用等晚上 19:30 的 dailyMaintenance_。
 //
