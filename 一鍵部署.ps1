@@ -95,8 +95,20 @@ $verMatch = Select-String -Path Code.gs -Pattern "BACKEND_VERSION = '([^']*)'" |
 if (-not $verMatch) { Bad "Code.gs 裡找不到 BACKEND_VERSION，程式碼可能不完整"; Read-Host "`n按 Enter 結束"; exit 1 }
 $ver = $verMatch.Matches[0].Groups[1].Value
 Ok "程式碼版本：$ver"
-if ($ver -ne "2026-08-26.158") {
-  Write-Host "    (注意：預期是 2026-08-26.158，資料夾裡的程式碼可能沒更新到最新)" -ForegroundColor Yellow
+# 不要在這裡寫死「預期版號」——腳本本身也在 repo 裡，每次改版都得記得同步改這一行，
+# 一忘記就會對著正確的版本印出「可能沒更新到最新」的假警告（實際踩過）。
+# 改成拿 origin/master 上的 Code.gs 來比，這才是真的在回答「我手上的是不是最新的」。
+if ($hasGit -and (Test-Path ".git")) {
+  $remoteGs = git show origin/master:Code.gs 2>$null
+  if ($LASTEXITCODE -eq 0 -and $remoteGs) {
+    $remoteMatch = $remoteGs | Select-String -Pattern "BACKEND_VERSION = '([^']*)'" | Select-Object -First 1
+    if ($remoteMatch) {
+      $remoteVer = $remoteMatch.Matches[0].Groups[1].Value
+      if ($ver -ne $remoteVer) {
+        Write-Host "    (注意：GitHub 上是 $remoteVer，資料夾裡是 $ver —— 第4步的更新沒跑成功)" -ForegroundColor Yellow
+      }
+    }
+  }
 }
 
 # ---- 5. clasp 登入 -------------------------------------------------------
