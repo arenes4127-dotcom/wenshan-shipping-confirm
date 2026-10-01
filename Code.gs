@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-01.165';
+const BACKEND_VERSION = '2026-10-01.166';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -1896,14 +1896,26 @@ function archiveShippedOrders_(){
 
   // 先備份再刪，備份失敗就會直接拋錯中斷，不會發生「刪掉了但沒備份成功」
   const tz = ss.getSpreadsheetTimeZone();
-  const fileName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_已出貨訂單歸檔';
+  const folder = DriveApp.getFolderById(SHIPPED_ORDER_ARCHIVE_FOLDER_ID);
+
+  // 同名不能覆蓋。原本的做法是「同名就先丟進垃圾桶再建新的」——在「一天只跑一批」的
+  // 年代那是對的（當天重跑等於重做同一件事，不該留兩份）。但加了 ARCHIVE_MAX_ROWS_PER_RUN
+  // 之後，一天跑好幾批變成正常路徑，而每一批搬的是**不同的**訂單：第二批會把第一批
+  // 400 張的備份丟進垃圾桶，可是那 400 張的資料列早就從訂單分頁刪掉了——備份就這樣沒了。
+  // 2026-10-01 第一次實跑完 400 張、正要按第二次之前抓到的，差一步就真的弄丟。
+  // 改成找一個還沒被用掉的檔名，絕不刪既有檔案。
+  const baseName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_已出貨訂單歸檔';
+  let fileName = baseName;
+  let seq = 1;
+  while(folder.getFilesByName(fileName).hasNext()){
+    seq++;
+    fileName = baseName + '_第' + seq + '批';
+  }
+
   const displayHeader = ORDERS_HEADER.map(h => HEADER_LABELS[h] || h);
   const archiveRows = batch.map(r=>
     ORDERS_HEADER.map(h=> h==='status' ? statusToText(r[h]) : r[h])
   );
-  const folder = DriveApp.getFolderById(SHIPPED_ORDER_ARCHIVE_FOLDER_ID);
-  const existing = folder.getFilesByName(fileName);
-  while(existing.hasNext()){ existing.next().setTrashed(true); }
   const archiveSs = SpreadsheetApp.create(fileName);
   const archiveSh = archiveSs.getSheets()[0];
   archiveSh.setName(SHEET_ORDERS);
