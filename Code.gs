@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-01.162';
+const BACKEND_VERSION = '2026-10-01.163';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -303,6 +303,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   odmCheckTarget_: () => odmCheckTarget_(),
   odmAppendRows_: (arg) => odmAppendRows_(arg && arg.rows),
   diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
+  diagnoseTriggers_: () => diagnoseTriggers_(),
   peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
@@ -350,6 +351,7 @@ function runOneTimeSetup(name, arg){
 // 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
 // （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
 const READ_ONLY_DIAGNOSTICS = [
+  ['排程觸發器還在不在（歸檔沒跑的第一個可能原因）',        'diagnoseTriggers_'],
   ['封存積壓（已出貨卻沒歸檔的訂單，分別卡在哪一道保險）', 'diagnoseArchiveBacklog_'],
   ['getState 分段耗時（看時間花在讀哪一張表）',            'timeGetState_'],
   ['訂單查詢：全表掃描 vs 索引（看索引省了多少）',          'timeOrderLookup_']
@@ -1799,6 +1801,8 @@ function migrateOrderStatusToChinese_(){
 // 3天仍夠現場查最近出的貨，更久的歷史查Drive備份檔（每筆歸檔前都會先備份）。
 const SHIPPED_ORDER_RETENTION_DAYS = 3;
 const SHIPPED_ORDER_ARCHIVE_FOLDER_ID = '1fC7kFv-6ozYmrY1S_up55R_yslcu2qYE';
+// 一次最多搬幾張。觸發器有 6 分鐘上限，超過就被砍，而且是「整批白做」。
+const ARCHIVE_MAX_ROWS_PER_RUN = 400;
 function archiveShippedOrders_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(SHEET_ORDERS);
@@ -1830,13 +1834,22 @@ function archiveShippedOrders_(){
     if(isNaN(shippedAt) || shippedAt > cutoff) return false;
     return true;
   });
-  if(!toArchive.length){ Logger.log('目前沒有符合歸檔條件的已出貨訂單，不動作。'); return; }
+  if(!toArchive.length){ Logger.log('目前沒有符合歸檔條件的已出貨訂單，不動作。'); return {歸檔: 0, 剩餘待歸檔: 0}; }
+
+  // 單次上限：萬一哪天又積出一大堆（或我沒想到的情況讓刪列變慢），也只會「這次少搬一點、
+  // 明天接著搬」，不會變成「每天都跑到一半被 6 分鐘上限砍掉、一張都沒搬成、越積越多」。
+  // 2026-10-01 現場實測就是卡在這個死循環：443 張符合條件卻一張都沒歸檔。
+  // 由上而下排序，先搬最舊的。
+  toArchive.sort(function(a, b){ return a._row - b._row; });
+  const batch = toArchive.length > ARCHIVE_MAX_ROWS_PER_RUN
+    ? toArchive.slice(0, ARCHIVE_MAX_ROWS_PER_RUN) : toArchive;
+  const remaining = toArchive.length - batch.length;
 
   // 先備份再刪，備份失敗就會直接拋錯中斷，不會發生「刪掉了但沒備份成功」
   const tz = ss.getSpreadsheetTimeZone();
   const fileName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_已出貨訂單歸檔';
   const displayHeader = ORDERS_HEADER.map(h => HEADER_LABELS[h] || h);
-  const archiveRows = toArchive.map(r=>
+  const archiveRows = batch.map(r=>
     ORDERS_HEADER.map(h=> h==='status' ? statusToText(r[h]) : r[h])
   );
   const folder = DriveApp.getFolderById(SHIPPED_ORDER_ARCHIVE_FOLDER_ID);
@@ -1851,16 +1864,37 @@ function archiveShippedOrders_(){
   folder.addFile(archiveFile);
   DriveApp.getRootFolder().removeFile(archiveFile);
 
-  // 由下往上刪，不然刪掉一列之後下面的列號會往上跑，會刪錯列
-  toArchive.map(r=>r._row).sort((a,b)=>b-a).forEach(rowNum=> sh.deleteRow(rowNum));
+  // 由下往上刪，不然刪掉一列之後下面的列號會往上跑，會刪錯列。
+  //
+  // 而且要把連號的列合併成一次 deleteRows(start, count)。原本是每一列各呼叫一次
+  // deleteRow——443 列就是 443 次 RPC，在這張帶條件式格式與下拉選單的表上單次要
+  // 100ms 以上，光刪列就 45 秒起跳，加上前後的 batchCloseOtherWarehouseOrders_ 與
+  // rebuildOrderDetailSheet_ 就會撞到觸發器 6 分鐘上限被砍掉。被砍掉等於整批沒搬成，
+  // 隔天積更多、更跑不完——2026-10-01 診斷出來的 443 張積壓就是這樣來的。
+  // 已出貨的舊訂單在表上本來就大多是連號的，合併之後通常只剩個位數次呼叫。
+  const rowsDesc = batch.map(function(r){ return r._row; }).sort(function(a,b){ return b - a; });
+  let deleteCalls = 0;
+  let i = 0;
+  while(i < rowsDesc.length){
+    // rowsDesc 由大到小，連號的條件是下一個剛好比這一個小 1
+    let j = i;
+    while(j + 1 < rowsDesc.length && rowsDesc[j+1] === rowsDesc[j] - 1) j++;
+    // 這一段裡最小的列號是 rowsDesc[j]（由大到小排），從它開始往下刪 count 列
+    sh.deleteRows(rowsDesc[j], j - i + 1);
+    deleteCalls++;
+    i = j + 1;
+  }
   // 刪列讓後面所有列號整體位移，訂單號→列號索引全部作廢。
   // findOrderRow_ 本來就會驗證訂單號、對不上自己重建，所以這裡漏清也不會寫錯資料；
   // 主動清掉只是省下「每個人下一次操作都各自撞一次過期索引再重建」的成本。
   try{ orderIndexCacheClear_(); }catch(err){ /* 清不掉就讓它自然過期，不影響正確性 */ }
 
   rebuildOrderDetailSheet_(); // 訂單少了幾張，明細分頁跟著重建才不會對不起來
-  Logger.log('已歸檔 '+toArchive.length+' 張已出貨訂單到「'+fileName+'」並從訂單分頁移除'
-    +'（條件：已出貨＋來源已無此訂單＋出貨滿'+SHIPPED_ORDER_RETENTION_DAYS+'天）。');
+  Logger.log('已歸檔 '+batch.length+' 張已出貨訂單到「'+fileName+'」並從訂單分頁移除'
+    +'（條件：已出貨＋來源已無此訂單＋出貨滿'+SHIPPED_ORDER_RETENTION_DAYS+'天）；'
+    +'刪列呼叫 '+deleteCalls+' 次'
+    +(remaining ? '；還有 '+remaining+' 張超過單次上限，明天這個時間接著搬。' : '。'));
+  return {歸檔: batch.length, 剩餘待歸檔: remaining, 刪列呼叫次數: deleteCalls, 備份檔: fileName};
 }
 
 // 試跑用：只計算「如果現在跑歸檔會搬走哪些訂單」，不動任何資料，直接把結果回傳成JSON。
@@ -3573,6 +3607,26 @@ function peekTransferStage_(){
           第5列可見提示文字: sh.getRange('A5').getDisplayValue()};
 }
 
+// 唯讀診斷：排程到底還在不在。
+// 歸檔沒跑有兩種可能——觸發器根本不存在（被誤刪、或換帳號後沒重建），或是存在但跑到
+// 一半被 6 分鐘上限砍掉。前者看這支，後者要看編輯器左側「執行項目」裡的失敗紀錄。
+// 兩個原因的修法完全不同，所以不能用猜的。
+function diagnoseTriggers_(){
+  const want = ['autoSyncOrders_','hourlySync_','dailyMaintenance_','releaseStaleClaims_',
+                'backupAndClearShippingLog_','syncMissingLocationRowsDaily_',
+                'mirrorTransferScheduled_','importProductImages_'];
+  const got = {};
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    const fn = t.getHandlerFunction();
+    got[fn] = (got[fn] || 0) + 1;
+  });
+  const missing = want.filter(function(fn){ return !got[fn]; });
+  return {目前觸發器: got,
+          應該要有但不見了: missing,
+          觸發器總數: ScriptApp.getProjectTriggers().length,
+          歸檔排程還在嗎: !!got['dailyMaintenance_']};
+}
+
 // 唯讀診斷：量化「已出貨但一直沒被歸檔」的訂單，分別是被哪一道保險擋下來的。
 function diagnoseArchiveBacklog_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -3604,7 +3658,7 @@ function diagnoseArchiveBacklog_(){
     archivable++;
   });
   return {已出貨總數: rows.length, 來源仍存在被保留: inSource,
-          updatedAt無法解析而永久保留: blankUpdatedAt, 七天內算太新: tooNew,
+          updatedAt無法解析而永久保留: blankUpdatedAt, 保留天數內算太新_目前設定: {天數: SHIPPED_ORDER_RETENTION_DAYS, 筆數: tooNew},
           本來就該被歸檔卻沒歸檔: archivable, blankSamples: blankSamples,
           鏡像分頁列數: mirrorValues.length};
 }
