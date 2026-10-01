@@ -1030,7 +1030,47 @@ const LS = {
   locVocab: 'ssz_loc_vocab'
 };
 function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
-function saveJSON(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
+// localStorage 寫入失敗不可以中斷正在進行的作業。
+// 最常見的失敗是 QuotaExceededError：單一來源上限約 5MB，而 orders 整包序列化
+// 在 1,260 筆訂單時已經是 1.16MB，推算 5,000~6,000 筆就會超過。原本這裡沒有攔，
+// 一爆就直接往上拋，把呼叫端（例如 scanOrder）的流程整個打斷——掃到一半的訂單會卡住。
+//
+// 本機快取的定位只是「加速啟動 + 離線備援」，不是真相來源：記憶體裡的資料仍然正確，
+// 後端也仍然收得到。所以存不進去就記一筆、讓流程繼續，不要把現場作業拖下水。
+let cacheWriteFailed = false;
+function saveJSON(key, val){
+  try{
+    localStorage.setItem(key, JSON.stringify(val));
+    return true;
+  }catch(err){
+    if(!cacheWriteFailed){
+      cacheWriteFailed = true;   // 一次連線只提醒一次，不要每掃一件就跳一次
+      try{
+        flash('err', '本機快取已滿', '離線備援暫時停用，但掃描與上傳都正常。請回報此訊息。', 4000);
+        console.warn('localStorage 寫入失敗（' + key + '）：', err && err.name, err);
+      }catch(e){ /* 連提醒都失敗就算了，不能再往上拋 */ }
+    }
+    return false;
+  }
+}
+
+// 存進 localStorage 的訂單只留「還要處理的」。
+// 已出貨的訂單現場不會再操作，留在快取裡純粹佔空間，而那個空間有 5MB 硬上限。
+//
+// ⚠️ 被裁掉的只有「寫進 localStorage 的那一份」，記憶體裡的 orders 仍然完整
+// （getState 回來什麼就是什麼），所以本次連線期間所有依賴 shipped 的判斷都照常運作。
+// 只有「重新整理後、第一次 refreshFromBackend 回來之前」那段看不到已出貨訂單——
+// 那段時間本來就該以後端為準，而且後端 mergeOrders 自己也有 skippedShipped 守門，
+// 不會因為本機快取少了已出貨訂單就重複匯入。
+function saveOrdersCache_(){
+  const keep = {};
+  Object.keys(orders).forEach(function(k){
+    const o = orders[k];
+    if(o && o.status === 'shipped') return;
+    keep[k] = o;
+  });
+  return saveJSON(LS.orders, keep);
+}
 
 let orders = loadJSON(LS.orders, {});
 let log = loadJSON(LS.log, []);
@@ -1331,7 +1371,7 @@ async function refreshFromBackend(silent){
     log = data.log || [];
     log.forEach(l=>{ l.orderDate = normalizeDateField(l.orderDate); });
     if(data.staff && data.staff.length) staff = data.staff;
-    saveJSON(LS.orders, orders);
+    saveOrdersCache_();
     saveJSON(LS.log, log);
     saveJSON(LS.staff, staff);
     setConnStatus('ok', '已連線（多人同步）');
@@ -1346,7 +1386,29 @@ async function refreshFromBackend(silent){
 // ============================================================
 // 導覽
 // ============================================================
+// 出貨掃描頁期間完全不背景刷新。
+//
+// 原本的保護只擋 current（正在逐件掃商品時），但現場回報慢的是「掃訂單號到商品資料出現」
+// ——而掃訂單號的那一刻 current 正好是 null（剛結束上一張、正在等下一張），擋不住。
+// 輪詢一旦在那時候落下來，主執行緒要連著跑：getState 回應（1,260筆約500KB）的 JSON.parse
+// ＋三次整包 saveJSON，UI 整個凍住，看起來就是「掃了訂單號但商品半天才出來」。
+//
+// 停掉輪詢不會讓判斷失準：本機清單在掃訂單號時只是「候選」，真正的重複出貨／重複認領檢查
+// 都在後端（claimOrder 的 already_shipped / claimed_by_other、finalizeShipment 的
+// already_shipped）。本機資料舊了，最多就是多跑一次後端來回被擋下來，不會出錯。
+// 而且離開掃描頁時會立刻補一次刷新，scanOrder 查不到訂單時也會自動刷新重試。
+function isScanStationActive_(){
+  if(current) return true;
+  const active = document.querySelector('.view.active');
+  return !!(active && active.id === 'view-scan');
+}
+
 async function gotoView(name){
+  // 離開掃描頁 → 立刻補一次刷新（掃描期間輪詢是停的，資料可能已經舊了）
+  const prev = document.querySelector('.view.active');
+  if(prev && prev.id === 'view-scan' && name !== 'scan' && hasBackend()){
+    refreshFromBackend(true).then(ok=>{ if(ok) renderDataViews(); });
+  }
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.getElementById('view-'+name).classList.add('active');
   document.querySelectorAll('nav.tabbar button').forEach(b=>b.classList.toggle('active', b.dataset.goto===name));
@@ -1837,7 +1899,7 @@ async function mergeOrders(parsed){
     if(existing) updated++; else added++;
     orders[o.orderNo] = o;
   });
-  saveJSON(LS.orders, orders);
+  saveOrdersCache_();
   return {added, updated, skippedShipped};
 }
 
@@ -1996,7 +2058,7 @@ document.getElementById('btnImportShipmentSheet').addEventListener('click', asyn
         imported++;
       });
       saveJSON(LS.log, log);
-      saveJSON(LS.orders, orders);
+      saveOrdersCache_();
     }
     msg.className='msg ok';
     msg.textContent = `匯入完成：${imported} 筆已出貨紀錄（略過：找不到對應訂單 ${skippedNotFound}、尚無物流編號 ${skippedNoWaybill}、本系統已標記出貨 ${skippedAlreadyShipped}）。`;
@@ -2039,7 +2101,7 @@ ORD1003,SKU-A01,兒童學習褲(M),1,XLAND,2026/8/8`;
 document.getElementById('btnClearOrders').addEventListener('click', ()=>{
   if(!confirm('確定要清空所有待出貨訂單？（不影響已出貨紀錄）')) return;
   orders = {};
-  saveJSON(LS.orders, orders);
+  saveOrdersCache_();
   renderDataViews();
 });
 
@@ -3992,7 +4054,7 @@ async function markPickDone(orderNo, undo){
   const prevAt = o.pickDoneAt || '', prevBy = o.pickDoneBy || '';
   o.pickDoneAt = undo ? '' : time;
   o.pickDoneBy = undo ? '' : (staffObj ? staffObj.name : pickerId);
-  saveJSON(LS.orders, orders);
+  saveOrdersCache_();
   okBeep();
   renderPickList();
   if(!undo) flash('ok','已標記揀貨完成', orderNo + '　可以放到包貨區了', 1600);
@@ -4010,7 +4072,7 @@ async function markPickDone(orderNo, undo){
       unpicked: unpickedCount(o), transferPending: transferPending});
   }catch(err){
     o.pickDoneAt = prevAt; o.pickDoneBy = prevBy;
-    saveJSON(LS.orders, orders);
+    saveOrdersCache_();
     renderPickList();
     errorBeep();
     flash('err','標記失敗', '網路不通，這張的揀貨完成沒有記錄下來，請再按一次', 2600);
@@ -4115,7 +4177,7 @@ function setPicked(orderNo, sku, picked){
   const nowIso = new Date().toLocaleString('zh-TW');
   it.picked = !!picked;                   // 本機先反應，不等後端
   it.pickedBy = it.picked ? pickerId : '';
-  saveJSON(LS.orders, orders);
+  saveOrdersCache_();
   okBeep();
 
   // kind 要在這裡判斷再送出：後端只看得到品項的快照，判斷不出這件當下是
@@ -4226,6 +4288,14 @@ async function scanOrder(code){
     return;
   }
   let order = orders[code];
+  if(!order && hasBackend()){
+    // 掃描頁期間背景輪詢是停的（見 isScanStationActive_），本機清單可能還沒有這張
+    // 剛同步進來的訂單。以前這裡直接報「找不到」，人員只能自己跑去按同步再回來重掃。
+    // 改成先補抓一次權威資料再找——只有真的查不到時才會走到這一步，不影響正常情況的速度。
+    flash('', '查詢中…', '本機清單沒有這張，正在跟後端確認', 1500);
+    const ok = await refreshFromBackend(true);
+    if(ok) order = orders[code];
+  }
   if(!order){
     errorBeep();
     flash('err','找不到此訂單', `「${code}」不在待出貨清單中，或已完成出貨`, 1300);
@@ -4250,7 +4320,7 @@ async function scanOrder(code){
   order = Object.assign({}, order, {status:'scanning'});
   if(!order.claimedAt) order.claimedAt = new Date().toISOString(); // 先暫記，後端回來會用它的權威值覆蓋
   orders[code] = order;
-  saveJSON(LS.orders, orders);
+  saveOrdersCache_();
 
   // 每進入一次掃描畫面就換一個新的 session 編號。背景的認領回應回來時要先確認
   // session 還是同一個，否則就是「使用者已經中止、或已經換掃另一張訂單」，這個回應已經過期，
@@ -4307,7 +4377,7 @@ async function scanOrder(code){
         if(result.order && result.order.claimedAt){
           current.claimedAt = result.order.claimedAt;
           if(orders[code]) orders[code].claimedAt = result.order.claimedAt;
-          saveJSON(LS.orders, orders);
+          saveOrdersCache_();
         }
         // 本機的品項資料有可能在上次同步之後就過期了（例如來源改了數量又剛好重新同步過）。
         // 後端回來的才是準的，內容有出入就以它為準重畫，並且明確告知人員重新掃這一張，
@@ -4316,7 +4386,7 @@ async function scanOrder(code){
         if(serverItems.length && itemsSignature(serverItems) !== itemsSignature(current.items)){
           current.items = serverItems.map(i=>Object.assign({}, i, {scanned:0, noBarcodeCount:0, overScanCount:0, manualEditHistory:[]}));
           if(orders[code]) orders[code].items = serverItems;
-          saveJSON(LS.orders, orders);
+          saveOrdersCache_();
           renderItemTable();
           errorBeep();
           flash('err','商品內容已更新', '這張訂單的品項在雲端有變動，畫面已更新為最新內容，請重新確認並重掃', 2600);
@@ -4363,7 +4433,7 @@ function markClaimUnverified(orderNo, mySession, errMsg){
           if(result.order && result.order.claimedAt){
             current.claimedAt = result.order.claimedAt;
             if(orders[orderNo]) orders[orderNo].claimedAt = result.order.claimedAt;
-            saveJSON(LS.orders, orders);
+            saveOrdersCache_();
           }
           setPill('scan', `訂單 ${orderNo} 掃描中`);
           flash('ok','已連線並取得認領鎖', '可以放心繼續，這張訂單已經鎖定在你名下', 1800);
@@ -4395,7 +4465,7 @@ function rollbackClaim(orderNo, title, detail){
   if(orders[orderNo]){
     orders[orderNo].status = 'pending';
     orders[orderNo].claimedAt = '';
-    saveJSON(LS.orders, orders);
+    saveOrdersCache_();
   }
   closeScanScreen();
   errorBeep();
@@ -4875,7 +4945,7 @@ document.getElementById('btnAbort').addEventListener('click', async ()=>{
   closeScanScreen();
   if(orderNo){
     if(orders[orderNo]){ orders[orderNo].status = 'pending'; orders[orderNo].claimedAt = ''; }
-    saveJSON(LS.orders, orders);
+    saveOrdersCache_();
     renderDataViews();
     if(hasBackend()){
       try{ await apiPost('releaseOrder', {orderNo}); }catch(err){ /* 網路失敗就算了，下次同步會校正 */ }
@@ -4937,14 +5007,14 @@ async function finalizeShipment(waybillOverride){
         // 完成出貨的按鈕會卡住比較久）。直接更新本機狀態，其他裝置的異動交給20秒背景刷新去同步。
         if(orders[entry.orderNo]) orders[entry.orderNo].status = 'shipped';
         log.unshift(entry);
-        saveJSON(LS.orders, orders);
+        saveOrdersCache_();
         saveJSON(LS.log, log);
       }
     } else {
       log.unshift(entry);
       saveJSON(LS.log, log);
       current.status = 'shipped';
-      saveJSON(LS.orders, orders);
+      saveOrdersCache_();
     }
   }catch(err){
     document.getElementById('btnConfirm').disabled = false;
@@ -5576,7 +5646,7 @@ if(settings.productImageSheetUrl){
 // （掃描中的訂單current不會被這個刷新動到，見 refreshFromBackend 只換orders/log/staff）
 setInterval(()=>{
   if(!hasBackend()) return;
-  if(current) return; // 正在掃描中就不要背景刷新，避免搶網路/運算資源影響掃描時的反應速度，等這張訂單掃完再說
+  if(isScanStationActive_()) return;
   refreshFromBackend(true).then(ok=>{
     if(!ok) return;
     renderDataViews();   // 跟其他呼叫點統一；原本這裡 renderHome() 重複寫了兩次
