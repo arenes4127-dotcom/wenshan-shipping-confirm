@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-01.163';
+const BACKEND_VERSION = '2026-10-01.164';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -350,6 +350,25 @@ function runOneTimeSetup(name, arg){
 //
 // 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
 // （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
+// 手動把「已出貨且符合歸檔條件」的訂單搬走一批。名字不帶底線，所以編輯器的函式
+// 下拉選單選得到——不用等晚上 19:30 的 dailyMaintenance_。
+//
+// 這支會「寫」資料（刪訂單列），跟 runDiagnostic 的唯讀性質不同，所以刻意分開兩支，
+// 不要讓人以為按診斷會動到資料。
+//
+// 安全性跟排程走的是同一條路徑，一字不差：先讀來源鏡像分頁（讀不到就整個不動作）、
+// 只搬已出貨且來源已無此訂單且出貨滿 SHIPPED_ORDER_RETENTION_DAYS 天的、
+// 先在 Drive 建好備份檔再刪列（備份失敗會直接拋錯中斷，不會刪掉沒備份的資料）。
+//
+// 單次上限 ARCHIVE_MAX_ROWS_PER_RUN 筆。還有剩的話回傳值會寫「剩餘待歸檔」，
+// 再按一次「執行」就好。
+function runArchiveNow(){
+  const out = withScriptLock_('runArchiveNow', function(){ return archiveShippedOrders_(); });
+  const text = JSON.stringify(out, null, 2);
+  Logger.log(text);
+  return text;
+}
+
 const READ_ONLY_DIAGNOSTICS = [
   ['排程觸發器還在不在（歸檔沒跑的第一個可能原因）',        'diagnoseTriggers_'],
   ['封存積壓（已出貨卻沒歸檔的訂單，分別卡在哪一道保險）', 'diagnoseArchiveBacklog_'],
