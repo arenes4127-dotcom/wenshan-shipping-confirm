@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-01.161';
+const BACKEND_VERSION = '2026-10-01.162';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -337,6 +337,43 @@ function runOneTimeSetup(name, arg){
   if(!fn) return {ok:false, error:'unknown setup function: '+name};
   const result = fn(arg);
   return {ok:true, ran:name, result: result===undefined ? null : result};
+}
+
+// Apps Script 編輯器上方的函式下拉選單「不會」列出結尾是底線的函式——Google 把 name_
+// 當成 private 並刻意隱藏。我們的診斷函式全部叫 xxx_，所以在編輯器裡一個都選不到，
+// 現場想自己跑一次診斷是辦不到的（實際卡住過：請人跑 diagnoseArchiveBacklog_，選單裡沒有）。
+//
+// 這支就是唯一的入口，名字刻意不帶底線，所以選單看得到。
+// 用法：編輯器上方函式選單選「runDiagnostic」→ 按「執行」→ 看下方「執行記錄」。
+// 不用改任何程式碼、不用傳參數。
+//
+// 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
+// （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
+const READ_ONLY_DIAGNOSTICS = [
+  ['封存積壓（已出貨卻沒歸檔的訂單，分別卡在哪一道保險）', 'diagnoseArchiveBacklog_'],
+  ['getState 分段耗時（看時間花在讀哪一張表）',            'timeGetState_'],
+  ['訂單查詢：全表掃描 vs 索引（看索引省了多少）',          'timeOrderLookup_']
+];
+function runDiagnostic(){
+  const lines = ['文山出貨確認系統 唯讀診斷　' + BACKEND_VERSION,
+                 new Date().toLocaleString('zh-TW'), ''];
+  READ_ONLY_DIAGNOSTICS.forEach(function(pair){
+    const title = pair[0], name = pair[1];
+    lines.push('===== ' + title + ' =====');
+    lines.push('(' + name + ')');
+    // 一支失敗不能拖垮其他支——例如今天沒有訂單時 timeOrderLookup_ 本來就量不了，
+    // 但封存積壓那支照樣有結果，那才是現在真正要看的東西。
+    try{
+      const out = ONE_TIME_SETUP_FUNCTIONS[name]();
+      lines.push(JSON.stringify(out, null, 2));
+    }catch(err){
+      lines.push('這一項失敗了（其他項不受影響）：' + (err && err.message ? err.message : String(err)));
+    }
+    lines.push('');
+  });
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
 }
 
 // 暫時性診斷用：把出貨紀錄目前實際存的條件式格式規則（公式＋顏色＋範圍）以JSON回傳，
