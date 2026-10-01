@@ -899,9 +899,13 @@
           <button class="btn" id="btnSaveSettings">儲存設定</button>
           <button class="btn gray" id="btnTestBackend">測試連線</button>
           <button class="btn gray" id="btnScanPerf">掃描耗時診斷</button>
+          <button class="btn gray" id="btnCopyScanPerf" style="display:none;">複製診斷結果</button>
         </div>
         <p id="settingsMsg" class="msg"></p>
-        <pre id="scanPerfOut" style="display:none;white-space:pre-wrap;font-size:12px;line-height:1.5;background:#f6f6f6;padding:10px;border-radius:6px;margin-top:8px;overflow-x:auto;"></pre>
+        <!-- 這個 APP 是深色主題（--text 接近白、--bg 接近黑）。這裡一定要用主題變數，
+             不能寫死淺色背景——先前寫成 background:#f6f6f6 又沒設 color，
+             就變成白字白底，內容其實都在但完全看不見，現場回報「顯示空白」。 -->
+        <pre id="scanPerfOut" style="display:none;white-space:pre-wrap;font-size:12px;line-height:1.5;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:10px;border-radius:6px;margin-top:8px;overflow-x:auto;"></pre>
       </div>
 
       <div class="section-label">資料來源</div>
@@ -5335,12 +5339,9 @@ document.getElementById('btnSaveSettings').addEventListener('click', async (e)=>
 });
 // 掃描耗時診斷：把最近幾次的分段耗時列出來，讓現場可以直接回報真實數字，
 // 不用再靠開發機推論（已經推論錯兩次了）。
-document.getElementById('btnScanPerf').addEventListener('click', ()=>{
-  const out = document.getElementById('scanPerfOut');
-  out.style.display = 'block';
+function buildScanPerfText_(){
   if(!scanPerf.length){
-    out.textContent = '還沒有紀錄。\n請先回「出貨」頁掃幾張訂單號，再回來按這顆按鈕。';
-    return;
+    return '還沒有紀錄。\n請先回「出貨」頁掃幾張訂單號，再回來按這顆按鈕。';
   }
   const lines = ['最近 ' + scanPerf.length + ' 筆（新的在上面）', ''];
   scanPerf.forEach(function(r){
@@ -5354,8 +5355,37 @@ document.getElementById('btnScanPerf').addEventListener('click', ()=>{
     });
     lines.push('');
   });
-  lines.push('請把以上內容整段回報。');
-  out.textContent = lines.join('\n');
+  return lines.join('\n');
+}
+
+document.getElementById('btnScanPerf').addEventListener('click', ()=>{
+  const out = document.getElementById('scanPerfOut');
+  out.style.display = 'block';
+  // 包 try/catch：先前「顯示空白」如果不是配色問題，就會是這裡丟例外而靜默失敗。
+  // 寧可把錯誤訊息印在畫面上，也不要又留下一個看不出原因的空白框。
+  try{
+    out.textContent = buildScanPerfText_();
+    document.getElementById('btnCopyScanPerf').style.display =
+      scanPerf.length ? 'inline-block' : 'none';
+  }catch(err){
+    out.textContent = '診斷畫面本身出錯了：\n' + (err && err.message ? err.message : String(err))
+                    + '\n\n請把這段回報。';
+  }
+});
+
+// 手持機上要選取 <pre> 裡的多行文字很痛苦，給一顆直接複製的按鈕
+document.getElementById('btnCopyScanPerf').addEventListener('click', async ()=>{
+  const msg = document.getElementById('settingsMsg');
+  const text = buildScanPerfText_();
+  try{
+    await navigator.clipboard.writeText(text);
+    msg.className = 'msg ok';
+    msg.textContent = '已複製，直接貼到對話視窗就可以。';
+  }catch(err){
+    // 非 https 或舊瀏覽器沒有 clipboard API，退回手動選取
+    msg.className = 'msg err';
+    msg.textContent = '這台裝置不支援自動複製，請長按上面的文字手動選取。';
+  }
 });
 
 document.getElementById('btnTestBackend').addEventListener('click', async (e)=>{
