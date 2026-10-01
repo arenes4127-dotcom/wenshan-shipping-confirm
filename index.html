@@ -1929,7 +1929,7 @@ async function syncOrders(){
     msg.textContent = `同步完成：共讀到 ${n} 張${statusLabel}訂單（新增 ${added}／更新 ${updated}／已出貨略過 ${skippedShipped}）`
       + `${skippedOtherWarehouse>0 ? `，${skippedOtherWarehouse} 列非本倉訂單已略過` : ''}`
       + `${skippedRows>0 ? `，${skippedRows} 列資料欄位不全已略過` : ''}。`;
-    renderPending(); renderHome();
+    renderDataViews();
   }catch(err){
     msg.className='msg err';
     msg.textContent = `同步失敗：${err.message}（請確認試算表分享設定為「知道連結的任何人」可檢視，且此裝置有網路連線）`;
@@ -2026,7 +2026,7 @@ document.getElementById('btnImport').addEventListener('click', async (e)=>{
     msg.className = 'msg err';
     msg.textContent = `匯入失敗：${err.message}`;
   }finally{ doneBusy(); }
-  renderPending(); renderHome();
+  renderDataViews();
 });
 document.getElementById('btnLoadSample').addEventListener('click', ()=>{
   document.getElementById('csvInput').value =
@@ -2040,7 +2040,7 @@ document.getElementById('btnClearOrders').addEventListener('click', ()=>{
   if(!confirm('確定要清空所有待出貨訂單？（不影響已出貨紀錄）')) return;
   orders = {};
   saveJSON(LS.orders, orders);
-  renderPending(); renderHome();
+  renderDataViews();
 });
 
 // ============================================================
@@ -4153,6 +4153,27 @@ function escapeHtml(s){
   return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// 只重畫「現在真的看得到」的那一頁。
+//
+// renderPending() 要把 orders 全部跑一遍（filter×3、兩次 fillFilterOptions 各自再 map 一次），
+// 再把整張待出貨表格的 HTML 字串組出來丟進 innerHTML；renderHome() 也要掃過所有訂單跟所有
+// 出貨紀錄。這些都是同步、在主執行緒上跑的，而且成本跟訂單筆數成正比。
+//
+// 問題是：掃描商品的時候人在 view-scan，待出貨清單跟首頁兩頁都是隱藏的。
+// 那些工作一格都看不到，卻實實在在卡住主執行緒——這就是「掃完訂單號到商品列表出現」
+// 中間那段延遲的主因（掃訂單號本身早就是純本機、不等後端的）。
+// 訂單從 1,260 筆成長到上萬筆之後，這段只會更嚴重。
+//
+// 隱藏時跳過不會讓資料過期：gotoView() 切到那一頁時本來就會重畫一次。
+// 20秒背景輪詢老早就是這樣做的（只畫 activeView），這裡只是把其餘呼叫點統一成同一套。
+function renderDataViews(){
+  const active = document.querySelector('.view.active');
+  if(!active) return;
+  if(active.id === 'view-home')   renderHome();
+  if(active.id === 'view-orders') renderPending();
+  if(active.id === 'view-log')    renderLog();
+}
+
 function renderPending(){
   const tbody = document.getElementById('pendingTable');
   const q = (document.getElementById('pendingSearch').value||'').trim().toLowerCase();
@@ -4264,7 +4285,7 @@ async function scanOrder(code){
   document.getElementById('finalMsg').textContent='';
   setPill('scan', `訂單 ${current.orderNo} 掃描中`);
   renderItemTable();
-  renderPending(); renderHome();
+  renderDataViews();
   okBeep();
   setTimeout(()=>inputBarcode.focus(), 50);
 
@@ -4379,7 +4400,7 @@ function rollbackClaim(orderNo, title, detail){
   closeScanScreen();
   errorBeep();
   flash('err', title, detail, 2400);
-  refreshFromBackend(true).then(()=>{ renderPending(); renderHome(); });
+  refreshFromBackend(true).then(()=>{ renderDataViews(); });
 }
 
 function closeScanScreen(){
@@ -4389,7 +4410,7 @@ function closeScanScreen(){
   document.getElementById('stage-order').style.display='block';
   document.getElementById('completeBox').style.display='none';
   setPill('wait','等待掃描訂單號');
-  renderPending(); renderHome();
+  renderDataViews();
   setTimeout(()=>inputOrder.focus(), 50);
 }
 
@@ -4855,7 +4876,7 @@ document.getElementById('btnAbort').addEventListener('click', async ()=>{
   if(orderNo){
     if(orders[orderNo]){ orders[orderNo].status = 'pending'; orders[orderNo].claimedAt = ''; }
     saveJSON(LS.orders, orders);
-    renderPending(); renderHome();
+    renderDataViews();
     if(hasBackend()){
       try{ await apiPost('releaseOrder', {orderNo}); }catch(err){ /* 網路失敗就算了，下次同步會校正 */ }
     }
@@ -5558,12 +5579,7 @@ setInterval(()=>{
   if(current) return; // 正在掃描中就不要背景刷新，避免搶網路/運算資源影響掃描時的反應速度，等這張訂單掃完再說
   refreshFromBackend(true).then(ok=>{
     if(!ok) return;
-    const activeView = document.querySelector('.view.active');
-    if(!activeView) return;
-    if(activeView.id==='view-home') renderHome();
-    if(activeView.id==='view-orders') renderPending();
-    if(activeView.id==='view-log') renderLog();
-    if(activeView.id==='view-home') renderHome();
+    renderDataViews();   // 跟其他呼叫點統一；原本這裡 renderHome() 重複寫了兩次
   });
 }, 20000);
 </script>
