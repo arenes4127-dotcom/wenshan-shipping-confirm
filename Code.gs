@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-09-30.159';
+const BACKEND_VERSION = '2026-10-01.160';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -136,12 +136,50 @@ const NO_LOCK_ACTIONS = {
   listLocationContents: 1, getShopeePriceInfo: 1, getTransferPending: 1, __versioncheck__: 1
 };
 
+// ---------------- 寫入鎖 ----------------
+// 原本鎖只在 doPost 取得，排程觸發器（autoSyncOrders_ / hourlySync_ 等）直接呼叫
+// 業務函式，完全不經過它。實際後果不是慢，是 lost update：
+//
+//   09:00  autoSyncOrders_ → mergeOrders()  讀整張訂單表 → 逐列寫回
+//   09:00  某人按「完成出貨」               寫同一列的 status / 時間軸
+//
+// 兩邊同時讀-改-寫同一列，後寫的蓋掉先寫的，出貨狀態可能被同步洗回「待出貨」。
+// 這種錯誤不會有任何錯誤訊息，只會變成偶發的「明明出貨了怎麼又在待出貨清單」。
+// 09:00/09:15/14:05/14:15 正好都是倉庫尖峰時段。
+//
+// 改法：把鎖下沉，排程進入點自己包一層，跟 doPost 搶同一把 script lock。
+//
+// ⚠️ 可重入問題：doPost 已經持有鎖時又呼叫被包起來的函式（例如用 runOneTimeSetup
+// 手動觸發 autoSyncOrders_），同一次執行再 getScriptLock() 一次並等待會把自己卡死
+// ——Apps Script 的 Lock 不是可重入的。用模組層級旗標擋掉。
+// 旗標放模組層級是安全的：Apps Script 每次執行都是全新的全域作用域
+// （跟 _ssMemo_ / _headerOk_ 同樣道理），不會殘留到下一次請求。
+let _scriptLockHeld_ = false;
+const SCRIPT_LOCK_WAIT_MS = 10000;
+
+function withScriptLock_(label, fn, waitMs){
+  if(_scriptLockHeld_) return fn();          // 本次執行已經持有，直接跑
+  const lock = LockService.getScriptLock();
+  // 用 tryLock（回傳布林）而不是 waitLock（丟例外），才能給出看得懂的訊息。
+  // 原本 waitLock 寫在 try 外面，逾時會丟出未攔截的例外 → Web App 回傳 HTML 錯誤頁
+  // 而不是 JSON → 前端 res.json() 解析失敗，使用者看到的是莫名其妙的訊息。
+  if(!lock.tryLock(waitMs == null ? SCRIPT_LOCK_WAIT_MS : waitMs)){
+    throw new Error('系統忙碌中，請稍候再試（等不到寫入鎖：' + label + '）');
+  }
+  _scriptLockHeld_ = true;
+  try{
+    return fn();
+  }finally{
+    _scriptLockHeld_ = false;
+    try{ lock.releaseLock(); }catch(err){ /* 釋放失敗不能蓋掉原本的回傳值或例外 */ }
+  }
+}
+
 function doPost(e){
   const body = JSON.parse(e.postData.contents);
   const needsLock = !NO_LOCK_ACTIONS[body.action];
-  const lock = needsLock ? LockService.getScriptLock() : null;
-  if(lock) lock.waitLock(10000);
   try{
+    const run = function(){
     let result;
     switch(body.action){
       case 'mergeOrders': result = mergeOrders(body.orders || {}); break;
@@ -176,10 +214,12 @@ function doPost(e){
       default: result = {ok:false, error:'unknown action: '+body.action};
     }
     return respond(result);
+    };
+    // 只讀的動作跳過鎖（見 NO_LOCK_ACTIONS）；其餘跟排程搶同一把
+    return needsLock ? withScriptLock_('doPost:' + body.action, run) : run();
   }catch(err){
+    // 鎖等不到也會走到這裡，回傳正常的 JSON 讓前端顯示得出訊息
     return respond({ok:false, error: String(err)});
-  }finally{
-    if(lock) lock.releaseLock();
   }
 }
 
@@ -715,6 +755,9 @@ function mergeOrders(incoming){
 
   let added=0, updated=0, skippedShipped=0;
   const now = new Date().toISOString();
+  // 批次收集，不要在迴圈裡逐列寫——原因見迴圈後面 flushOrderRowWrites_ 的說明
+  const rowUpdates = [];   // {row, values}：既有訂單，列號分散
+  const rowAppends = [];   // values：新訂單，連續接在表尾
 
   Object.keys(incoming).forEach(orderNo=>{
     const o = incoming[orderNo];
@@ -725,14 +768,10 @@ function mergeOrders(incoming){
     const finalItems = applyItemOps_(o.items||[], safeParse(override, []));
     const itemsJson = JSON.stringify(finalItems);
     const {skuSummary, nameSummary} = summarizeItems(finalItems);
-    const targetRow = existing ? existing._row : sh.getLastRow()+1;
-    // 「日期」欄位強制設成純文字格式再寫入，避免 Google試算表把「2026/8/5」這種字串
-    // 自動偵測轉成日期型別儲存格（那樣讀回來會變成UTC的ISO時間字串，跟原本存的字不一樣）
-    sh.getRange(targetRow, colOf(ORDERS_HEADER,'date')).setNumberFormat('@');
-    // 時間軸那幾欄同樣要先設成純文字。不設的話「2026/08/13 14:13:40」會被試算表
-    // 自動吃成日期型別，讀回來變成「Thu Aug 13 2026 ... GMT+0800」，
-    // 解析時間的正則完全對不上，所有耗時就全部算不出來（實際踩到）。
-    sh.getRange(targetRow, colOf(ORDERS_HEADER,'createdAt'), 1, 4).setNumberFormat('@');
+    // 「日期」與時間軸那幾欄要強制設成純文字格式再寫入（避免試算表把「2026/8/5」
+    // 自動吃成日期型別，讀回來變成 UTC ISO 或「Thu Aug 13 2026 ... GMT+0800」，
+    // 解析時間的正則完全對不上、所有耗時算不出來——這個實際踩到過）。
+    // 格式設定跟值一起移到 flushOrderRowWrites_ 批次處理。
     // 防呆：如果這張訂單目前正在被認領/掃描中，重新同步只更新品項/賣場等資料本身，
     // 不要動狀態／認領人／認領時間——不然等於把人家正在處理的訂單無聲無息退回待處理，
     // 之後如果又被別人認領，同一張訂單就可能被兩個人各自完成一次出貨，造成重複出貨紀錄。
@@ -768,9 +807,11 @@ function mergeOrders(incoming){
       shipStartAt: existing ? (existing.shipStartAt||'') : '',
       shipDoneAt: existing ? (existing.shipDoneAt||'') : ''
     };
-    sh.getRange(targetRow, 1, 1, ORDERS_HEADER.length).setValues([ORDERS_HEADER.map(h=>rowObj[h])]);
-    if(existing) updated++; else added++;
+    const values = ORDERS_HEADER.map(h=>rowObj[h]);
+    if(existing){ rowUpdates.push({row: existing._row, values: values}); updated++; }
+    else { rowAppends.push(values); added++; }
   });
+  flushOrderRowWrites_(sh, rowUpdates, rowAppends);
   rebuildOrderDetailSheet_();
   // 顏色規則的範圍依實際列數計算，所以每次同步完（訂單列數可能變多）都要重新套用一次，
   // 新增的訂單才不會落在規則範圍外變成沒有顏色。順便也有自動修復的效果：
@@ -779,6 +820,55 @@ function mergeOrders(incoming){
   // 同步可能新增了訂單列，索引要跟著失效，新訂單才不用等第一次「找不到→重建」才查得到。
   if(added) { try{ orderIndexCacheClear_(); }catch(err){} }
   return {ok:true, added, updated, skippedShipped};
+}
+
+// 把 mergeOrders 收集到的整批列一次寫回。
+//
+// 原本是在迴圈裡一列一次：setNumberFormat(日期) + setNumberFormat(時間軸4欄) + setValues，
+// 等於每張訂單 3 次 RPC。1,000 筆就是 3,000 次來回。
+// 這在以前只是慢；但現在 mergeOrders 是在寫入鎖保護下執行的——佔著鎖做 3,000 次來回，
+// 等於尖峰時段（09:00/09:15/14:05/14:15 同步）把所有人擋在門外，那比它要解決的
+// lost update 更糟。所以鎖下沉跟這個批次化必須一起做，不能只做一半。
+//
+// 做法跟 scanTransferBatch 一致：更新的列用「最小列～最大列」整段讀出來當底、
+// 把要改的列蓋上去、再一次寫回（中間沒改到的列寫回去的還是它原本的值，不會覆蓋錯）。
+// ⚠️ 「不會覆蓋錯」成立的前提，正是「全程在寫入鎖保護下，不會有其他寫入者插進來」
+// ——這也是為什麼鎖一定要先下沉到排程，否則這個批次寫法本身就會變成新的覆蓋來源。
+// 更新範圍異常分散時退回逐列，避免為了改幾列而重寫幾千列。
+function flushOrderRowWrites_(sh, updates, appends){
+  const W = ORDERS_HEADER.length;
+  const dateCol = colOf(ORDERS_HEADER, 'date');
+  // createdAt / pickStartAt / shipStartAt / shipDoneAt 是連續四欄，可以一次設格式
+  const tlCol = colOf(ORDERS_HEADER, 'createdAt');
+
+  if(updates && updates.length){
+    const nums = updates.map(function(u){ return u.row; });
+    const minR = Math.min.apply(null, nums), maxR = Math.max.apply(null, nums);
+    const span = maxR - minR + 1;
+    // 要改的列夠密集才值得整段讀寫；太分散就逐列處理
+    if(span <= Math.max(updates.length * 4, 200)){
+      const block = sh.getRange(minR, 1, span, W).getValues();
+      updates.forEach(function(u){ block[u.row - minR] = u.values; });
+      sh.getRange(minR, dateCol, span, 1).setNumberFormat('@');
+      sh.getRange(minR, tlCol, span, 4).setNumberFormat('@');
+      sh.getRange(minR, 1, span, W).setValues(block);
+    }else{
+      updates.forEach(function(u){
+        sh.getRange(u.row, dateCol).setNumberFormat('@');
+        sh.getRange(u.row, tlCol, 1, 4).setNumberFormat('@');
+        sh.getRange(u.row, 1, 1, W).setValues([u.values]);
+      });
+    }
+  }
+
+  if(appends && appends.length){
+    // 新訂單本來就連續接在表尾，一次寫完。這裡才取 getLastRow()：
+    // 上面的更新不會增加列數，所以位置是對的。
+    const start = sh.getLastRow() + 1;
+    sh.getRange(start, dateCol, appends.length, 1).setNumberFormat('@');
+    sh.getRange(start, tlCol, appends.length, 4).setNumberFormat('@');
+    sh.getRange(start, 1, appends.length, W).setValues(appends);
+  }
 }
 
 // ---------------- 自動排程：配合蝦皮隔日到貨，一天四次自動同步訂單，不用等人手動按同步鈕 ----------------
@@ -806,6 +896,12 @@ function isHandledRoutingStatus_(status){
 }
 const MIRROR_ORDER_SHEET_NAME = '文山出貨V2';
 function autoSyncOrders_(){
+  // 包鎖：mergeOrders 會逐列改寫整張「訂單」分頁，跟使用者的完成出貨／認領撞同一列。
+  // 09:00/09:15/14:05/14:15 正好是倉庫尖峰，這支是 lost update 風險最高的一支。
+  return withScriptLock_('autoSyncOrders_', autoSyncOrdersLocked_);
+}
+
+function autoSyncOrdersLocked_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(MIRROR_ORDER_SHEET_NAME);
   if(!sh){ Logger.log('找不到「'+MIRROR_ORDER_SHEET_NAME+'」鏡像分頁，無法自動同步'); return; }
@@ -1328,6 +1424,11 @@ function appendDailyStats_(){
 }
 
 function backupAndClearShippingLog_(){
+  // 包鎖：會把「出貨紀錄」整片清空，清空當下如果有人正在 appendLogRow，那筆出貨紀錄會消失。
+  return withScriptLock_('backupAndClearShippingLog_', backupAndClearShippingLogLocked_);
+}
+
+function backupAndClearShippingLogLocked_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(SHEET_LOG);
   if(!sh){ Logger.log('找不到「出貨紀錄」分頁'); return; }
@@ -1513,10 +1614,14 @@ function testBackupAuditSheets_(){
 // 訂單狀態白天可能來回變動，給它一整天的時間穩定下來再處理，不要一變就立刻結案。
 // 每一筆都會寫進系統紀錄，可以回溯。
 function dailyMaintenance_(){
-  const closed = batchCloseOtherWarehouseOrders_();
-  const archived = archiveShippedOrders_();
-  Logger.log('每日維護完成：' + JSON.stringify({自動結案: closed, 歸檔: archived}));
-  return {自動結案: closed, 歸檔: archived};
+  // 包鎖：archiveShippedOrders_ 會 deleteRow，刪列當下如果有人正在寫同一張表，
+  // 列號會在對方讀取與寫入之間位移——那是比一般 lost update 更嚴重的錯誤。
+  return withScriptLock_('dailyMaintenance_', function(){
+    const closed = batchCloseOtherWarehouseOrders_();
+    const archived = archiveShippedOrders_();
+    Logger.log('每日維護完成：' + JSON.stringify({自動結案: closed, 歸檔: archived}));
+    return {自動結案: closed, 歸檔: archived};
+  });
 }
 
 // ---------------- 一次性設定用：在「訂單」分頁的「人工結案」欄裝下拉選單 ----------------
@@ -3378,7 +3483,8 @@ function timeSingleTransferScan_(){
 }
 
 function mirrorTransferScheduled_(){
-  try{ mirrorTransferToWorkspace_(); }
+  // 包鎖：鏡射會整片覆寫工作區的「調撥驗收」分頁，而 scanTransferBatch 也會寫同一片
+  try{ withScriptLock_('mirrorTransferScheduled_', mirrorTransferToWorkspace_); }
   catch(err){ Logger.log('mirrorTransferToWorkspace_ 失敗：' + err); }
 }
 
@@ -4449,9 +4555,12 @@ function testNewItemCreate_(){
 
 // 排程用：每天跑一次，真的寫入
 function syncMissingLocationRowsDaily_(){
-  const r = syncMissingLocationRows_({dryRun: false});
-  Logger.log('儲位主檔補列：' + JSON.stringify(r));
-  return r;
+  // 包鎖：會對「文山地圖」新增列，而 changeLocationBatch 也會寫同一份
+  return withScriptLock_('syncMissingLocationRowsDaily_', function(){
+    const r = syncMissingLocationRows_({dryRun: false});
+    Logger.log('儲位主檔補列：' + JSON.stringify(r));
+    return r;
+  });
 }
 // 給API手動觸發的乾跑版本
 function previewMissingLocationRows_(){
@@ -5199,6 +5308,11 @@ function getShopeePriceInfo_(body){
 // 跑不完——請求直接超時、分頁也沒建出來。直接讀儲存格快得多，而且只讀需要的那幾欄。
 const PRODUCT_IMAGE_TAB = '商品規格對照';
 function importProductImages_(){
+  // 包鎖：會改寫「商品主圖」分頁，而設定頁的 refreshProductImages 也會呼叫同一支。
+  return withScriptLock_('importProductImages_', importProductImagesLocked_);
+}
+
+function importProductImagesLocked_(){
   const src = openSheetMemo_(PRODUCT_IMAGE_SOURCE_ID);
   const sh0 = src.getSheetByName(PRODUCT_IMAGE_TAB) || src.getSheets()[0];
   const lastRow = sh0.getLastRow();
@@ -6464,12 +6578,16 @@ function syncLogisticsConfirm_(){
 
 // 每小時跑的維護工作合併在這裡，一個觸發器做完兩件事，不用裝兩個。
 function hourlySync_(){
-  syncNativeOrderSheet_();
-  syncLogisticsConfirm_();
-  // 順序不能顛倒：要先更新完物流籃狀態，才知道哪些訂單該結案。
-  // 掛在每小時而不是每天19:30，是因為留在清單裡的每一分鐘都可能被人重複揀一次。
-  closeBasketConfirmedPending_();
-  syncSpecialNotes_();
+  // 包鎖：closeBasketConfirmedPending_ 會寫「訂單」分頁的 manualClose 欄，
+  // 跟使用者的 finalizeShipment / claimOrder 撞同一列。見 withScriptLock_ 的說明。
+  return withScriptLock_('hourlySync_', function(){
+    syncNativeOrderSheet_();
+    syncLogisticsConfirm_();
+    // 順序不能顛倒：要先更新完物流籃狀態，才知道哪些訂單該結案。
+    // 掛在每小時而不是每天19:30，是因為留在清單裡的每一分鐘都可能被人重複揀一次。
+    closeBasketConfirmedPending_();
+    syncSpecialNotes_();
+  });
 }
 
 // 唯讀診斷用：看某個分頁的資料列是靜態值還是公式（公式才看得出資料是從哪裡串過來的）。
@@ -6631,6 +6749,13 @@ function releaseOrderClaimNow_(orderNo){
 }
 
 function releaseStaleClaims_(){
+  // 包鎖：會改寫「訂單」分頁的狀態／認領欄。
+  // 注意它也被 mergeOrders 內部呼叫——那時鎖已經在手上，靠 withScriptLock_ 的
+  // 可重入守衛直接跑完，不會自己卡死自己。
+  return withScriptLock_('releaseStaleClaims_', releaseStaleClaimsLocked_);
+}
+
+function releaseStaleClaimsLocked_(){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   const rows = readOrderRows();
   let released = 0;
