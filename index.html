@@ -898,8 +898,10 @@
         <div class="row">
           <button class="btn" id="btnSaveSettings">儲存設定</button>
           <button class="btn gray" id="btnTestBackend">測試連線</button>
+          <button class="btn gray" id="btnScanPerf">掃描耗時診斷</button>
         </div>
         <p id="settingsMsg" class="msg"></p>
+        <pre id="scanPerfOut" style="display:none;white-space:pre-wrap;font-size:12px;line-height:1.5;background:#f6f6f6;padding:10px;border-radius:6px;margin-top:8px;overflow-x:auto;"></pre>
       </div>
 
       <div class="section-label">資料來源</div>
@@ -1071,6 +1073,13 @@ function saveOrdersCache_(){
   });
   return saveJSON(LS.orders, keep);
 }
+
+// 掃描耗時診斷用的狀態。刻意宣告在這裡（檔案很前段）而不是放在 scanOrder 旁邊：
+// recordRefreshPerf_ 會被 refreshFromBackend 呼叫，而啟動流程很早就會刷新一次。
+// let/const 有暫時性死區，宣告位置在呼叫之後的話那一次會丟 ReferenceError。
+const SCAN_PERF_MAX = 10;
+let scanPerf = [];          // 最近幾次掃描／背景刷新的分段耗時
+let scanPerfCur = null;
 
 let orders = loadJSON(LS.orders, {});
 let log = loadJSON(LS.log, []);
@@ -1364,8 +1373,10 @@ function normalizeDateField(v){
 
 async function refreshFromBackend(silent){
   if(!hasBackend()) { setConnStatus('', '單機模式'); return; }
+  const _t0 = (performance && performance.now ? performance.now() : Date.now());
   try{
     const data = await apiGet();
+    const _tNet = (performance && performance.now ? performance.now() : Date.now());
     orders = data.orders || {};
     Object.values(orders).forEach(o=>{ o.date = normalizeDateField(o.date); });
     log = data.log || [];
@@ -1375,6 +1386,12 @@ async function refreshFromBackend(silent){
     saveJSON(LS.log, log);
     saveJSON(LS.staff, staff);
     setConnStatus('ok', '已連線（多人同步）');
+    // 記一筆：背景刷新如果跟掃描重疊，它就是那幾秒的來源。
+    // 網路段（含後端 getState 執行時間與下載）跟本機段（JSON處理＋寫快取）分開記，
+    // 才看得出該往後端調還是往前端調。
+    recordRefreshPerf_(Math.round(_tNet - _t0),
+                       Math.round((performance && performance.now ? performance.now() : Date.now()) - _tNet),
+                       Object.keys(orders).length);
     return true;
   }catch(err){
     setConnStatus('err', '連線失敗，使用本機快取');
@@ -4278,7 +4295,56 @@ const inputOrder = document.getElementById('inputOrder');
 const inputBarcode = document.getElementById('inputBarcode');
 const inputFinalWaybill = document.getElementById('inputFinalWaybill');
 
+// ---------------- 掃描耗時診斷 ----------------
+// 為什麼需要這個：「掃訂單號到商品資料出現」的延遲已經查過三輪，每一輪我都是從
+// 程式碼推論出一個原因、改掉、然後發現改善幅度遠小於預期（30秒→10秒→8秒）。
+// 推論已經不可靠了——scanOrder 同步路徑上每一步讀起來都很快，但現場就是 8 秒。
+// 所以改成在真實裝置上量真實數字：倉庫手持機的 CPU、瀏覽器、網路都跟開發機差很遠，
+// 只有它自己量出來的數字算數。
+//
+// 這組程式碼純粹是量測，不改變任何行為。
+
+function perfStart_(label){
+  scanPerfCur = {label: label, t0: (performance && performance.now ? performance.now() : Date.now()), marks: []};
+}
+function perfMark_(name){
+  if(!scanPerfCur) return;
+  const now = (performance && performance.now ? performance.now() : Date.now());
+  scanPerfCur.marks.push([name, Math.round(now - scanPerfCur.t0)]);
+}
+// 背景刷新單獨記一筆，跟掃描紀錄放同一份清單，時間戳排在一起就看得出有沒有重疊
+function recordRefreshPerf_(netMs, localMs, orderCount){
+  const rec = {label:'背景刷新', total: netMs + localMs, at: new Date().toLocaleTimeString('zh-TW'),
+    note: orderCount + ' 筆訂單',
+    marks: [['網路＋後端', netMs], ['本機處理＋寫快取', netMs + localMs]]};
+  scanPerf.unshift(rec);
+  if(scanPerf.length > SCAN_PERF_MAX) scanPerf.length = SCAN_PERF_MAX;
+  try{ saveJSON('ssz_scan_perf', scanPerf); }catch(e){}
+}
+
+function perfEnd_(extra){
+  if(!scanPerfCur) return;
+  // 最關鍵的一段：等瀏覽器真的把畫面畫出來。前面所有 JS 都跑完不代表人看得到——
+  // 在低階 Android 上，版面計算與繪製往往才是真正吃掉時間的地方，而那段完全
+  // 不會出現在任何 JS 計時裡。用 rAF + setTimeout(0) 夾出「下一次繪製之後」。
+  const rec = scanPerfCur;
+  scanPerfCur = null;
+  if(extra) rec.note = extra;
+  requestAnimationFrame(function(){
+    setTimeout(function(){
+      const now = (performance && performance.now ? performance.now() : Date.now());
+      rec.marks.push(['畫面繪製完成', Math.round(now - rec.t0)]);
+      rec.total = Math.round(now - rec.t0);
+      rec.at = new Date().toLocaleTimeString('zh-TW');
+      scanPerf.unshift(rec);
+      if(scanPerf.length > SCAN_PERF_MAX) scanPerf.length = SCAN_PERF_MAX;
+      try{ saveJSON('ssz_scan_perf', scanPerf); }catch(e){}
+    }, 0);
+  });
+}
+
 async function scanOrder(code){
+  perfStart_('掃訂單號');
   code = String(code||'').trim();
   inputOrder.value = '';
   if(!code) return;
@@ -4295,6 +4361,7 @@ async function scanOrder(code){
     flash('', '查詢中…', '本機清單沒有這張，正在跟後端確認', 1500);
     const ok = await refreshFromBackend(true);
     if(ok) order = orders[code];
+    perfMark_('本機查無→補抓後端');
   }
   if(!order){
     errorBeep();
@@ -4319,8 +4386,10 @@ async function scanOrder(code){
   // 在他掃到第一件之前就回來了；而認領衝突要兩個人同時掃同一張才會發生，極罕見。
   order = Object.assign({}, order, {status:'scanning'});
   if(!order.claimedAt) order.claimedAt = new Date().toISOString(); // 先暫記，後端回來會用它的權威值覆蓋
+  perfMark_('找到訂單、通過檢查');
   orders[code] = order;
   saveOrdersCache_();
+  perfMark_('寫入本機快取');
 
   // 每進入一次掃描畫面就換一個新的 session 編號。背景的認領回應回來時要先確認
   // session 還是同一個，否則就是「使用者已經中止、或已經換掃另一張訂單」，這個回應已經過期，
@@ -4354,9 +4423,13 @@ async function scanOrder(code){
   document.getElementById('completeBox').style.display='none';
   document.getElementById('finalMsg').textContent='';
   setPill('scan', `訂單 ${current.orderNo} 掃描中`);
+  perfMark_('畫面欄位填好');
   renderItemTable();
+  perfMark_('商品表格組好(' + (current.items||[]).length + '件)');
   renderDataViews();
+  perfMark_('其餘畫面更新');
   okBeep();
+  perfEnd_('訂單 ' + current.orderNo);
   setTimeout(()=>inputBarcode.focus(), 50);
 
   // ---- 背景認領（不擋畫面）----
@@ -5260,6 +5333,31 @@ document.getElementById('btnSaveSettings').addEventListener('click', async (e)=>
   }
   doneBusy();
 });
+// 掃描耗時診斷：把最近幾次的分段耗時列出來，讓現場可以直接回報真實數字，
+// 不用再靠開發機推論（已經推論錯兩次了）。
+document.getElementById('btnScanPerf').addEventListener('click', ()=>{
+  const out = document.getElementById('scanPerfOut');
+  out.style.display = 'block';
+  if(!scanPerf.length){
+    out.textContent = '還沒有紀錄。\n請先回「出貨」頁掃幾張訂單號，再回來按這顆按鈕。';
+    return;
+  }
+  const lines = ['最近 ' + scanPerf.length + ' 筆（新的在上面）', ''];
+  scanPerf.forEach(function(r){
+    lines.push('【' + r.label + '】' + (r.at||'') + '　總計 ' + r.total + 'ms'
+               + (r.note ? '　' + r.note : ''));
+    let prev = 0;
+    (r.marks||[]).forEach(function(m){
+      const seg = m[1] - prev; prev = m[1];
+      // 每一段各自花多久（不是累計），才看得出是哪一段在吃時間
+      lines.push('    ' + String(seg).padStart(6) + 'ms  ' + m[0]);
+    });
+    lines.push('');
+  });
+  lines.push('請把以上內容整段回報。');
+  out.textContent = lines.join('\n');
+});
+
 document.getElementById('btnTestBackend').addEventListener('click', async (e)=>{
   const url = document.getElementById('settingBackendUrl').value.trim();
   const msg = document.getElementById('settingsMsg');
@@ -5419,6 +5517,8 @@ function countShippedToday(){
 // ============================================================
 renderHome();
 // ---- 揀貨初始化 ----
+// 掃描耗時紀錄跨重新整理保留，現場掃完才有空回設定頁看
+scanPerf = loadJSON('ssz_scan_perf', []);
 pickQueue = loadJSON(LS.pickQueue, []);
 if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就繼續送
 // ---- 調撥驗收：同樣把上次沒送完的掃描接著送 ----
