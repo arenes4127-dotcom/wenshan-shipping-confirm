@@ -4329,7 +4329,27 @@ const inputFinalWaybill = document.getElementById('inputFinalWaybill');
 // 這組程式碼純粹是量測，不改變任何行為。
 
 function perfStart_(label){
+  // 上一次量測沒收尾（早退、或中途丟例外）的話，scanPerfCur 會留著，下一次的 t0 就會
+  // 沿用舊的起點，量出來的數字整個是錯的。所以開新的之前先把舊的結掉，而且留一筆
+  // 「未完成」的紀錄——那本身就是線索，不要默默吞掉。
+  if(scanPerfCur) perfAbort_('未完成（被下一次掃描接手）');
   scanPerfCur = {label: label, t0: (performance && performance.now ? performance.now() : Date.now()), marks: []};
+}
+// 早退路徑用這個收尾。跟 perfEnd_ 的差別是不等繪製——早退時畫面本來就沒有重畫，
+// 等 rAF 只會把一個無關的時間算進去。重點是「有這筆紀錄」而且 scanPerfCur 有清掉。
+function perfAbort_(reason){
+  if(!scanPerfCur) return;
+  const rec = scanPerfCur;
+  scanPerfCur = null;
+  const now = (performance && performance.now ? performance.now() : Date.now());
+  rec.total = Math.round(now - rec.t0);
+  rec.note = reason;
+  rec.aborted = true;
+  rec.at = new Date().toLocaleTimeString('zh-TW');
+  rec.marks.push(['中止：' + reason, rec.total]);
+  scanPerf.unshift(rec);
+  if(scanPerf.length > SCAN_PERF_MAX) scanPerf.length = SCAN_PERF_MAX;
+  try{ saveJSON('ssz_scan_perf', scanPerf); }catch(e){}
 }
 function perfMark_(name){
   if(!scanPerfCur) return;
@@ -4368,13 +4388,14 @@ function perfEnd_(extra){
 }
 
 async function scanOrder(code){
-  perfStart_('掃訂單號');
   code = String(code||'').trim();
   inputOrder.value = '';
-  if(!code) return;
+  if(!code) return;   // 空字串不是一次掃描，計時從這之後才開始
+  perfStart_('掃訂單號');
   if(!currentStaffId || !staff.find(s=>s.id===currentStaffId)){
     errorBeep();
     flash('err','請先選擇包貨人員', '首頁或此頁上方「目前包貨人員」還沒選，選好才能開始掃描', 1600);
+    perfAbort_('未選包貨人員');
     return;
   }
   let order = orders[code];
@@ -4391,16 +4412,19 @@ async function scanOrder(code){
   if(!order){
     errorBeep();
     flash('err','找不到此訂單', `「${code}」不在待出貨清單中，或已完成出貨`, 1300);
+    perfAbort_('找不到訂單 ' + code);
     return;
   }
   if(order.status === 'shipped'){
     errorBeep();
     flash('err','此訂單已出貨', '請確認是否掃錯訂單', 1300);
+    perfAbort_('訂單已出貨 ' + code);
     return;
   }
   if(isManuallyClosed(order)){
     errorBeep();
     flash('err','此訂單已人工結案', `結案原因：${order.manualClose}，不需要由文山出貨`, 1800);
+    perfAbort_('訂單已人工結案 ' + code);
     return;
   }
 
