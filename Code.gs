@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-13.168';
+const BACKEND_VERSION = '2026-10-13.169';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -350,6 +350,40 @@ function runOneTimeSetup(name, arg){
 //
 // 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
 // （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
+// 一直搬到沒得搬為止（或時間快用完為止）。名字不帶底線，選單選得到。
+//
+// 為什麼要這支：單次上限是 ARCHIVE_MAX_ROWS_PER_RUN，積壓一大就得手動連按好幾次
+// runArchiveNow。這支幫忙連按，但每一批之間會放掉寫入鎖，現場人員的操作還是插得進來。
+//
+// 時間預算刻意抓得保守：Apps Script 的執行上限是 6 分鐘，而「被砍掉」在這條路徑上
+// 代價很高（還在緩衝區的刪列會整批作廢）。所以用掉 3.5 分鐘就收手，把剩下的留給下一次，
+// 不要去賭最後一批來不來得及跑完。
+const ARCHIVE_LOOP_BUDGET_MS = 210000;   // 3.5 分鐘
+const ARCHIVE_LOOP_MAX_ROUNDS = 12;
+function runArchiveUntilDone(){
+  const startedAt = Date.now();
+  const rounds = [];
+  let archived = 0, remaining = null, stopReason = '全部搬完';
+  for(let i = 0; i < ARCHIVE_LOOP_MAX_ROUNDS; i++){
+    if(Date.now() - startedAt > ARCHIVE_LOOP_BUDGET_MS){ stopReason = '時間預算用完，再按一次接著搬'; break; }
+    const out = withScriptLock_('runArchiveUntilDone', function(){ return archiveShippedOrders_(); });
+    // 安全檢查沒過時 archiveShippedOrders_ 是直接 return（沒有回傳值），
+    // 那代表「刻意不動作」，不能當成暫時失敗一直重試。
+    if(!out){ stopReason = '歸檔的安全檢查沒通過（看上面的 Logger 訊息），這一輪什麼都沒做'; break; }
+    rounds.push({歸檔: out.歸檔, 剩餘: out.剩餘待歸檔, 備份檔: out.備份檔 || null});
+    archived += (out.歸檔 || 0);
+    remaining = out.剩餘待歸檔;
+    if(!out.歸檔){ stopReason = '這一輪沒有東西可搬'; break; }
+    if(!out.剩餘待歸檔) break;
+    if(i === ARCHIVE_LOOP_MAX_ROUNDS - 1) stopReason = '達到單次執行的輪數上限，再按一次接著搬';
+  }
+  const result = {本次總共歸檔: archived, 還剩下: remaining,
+                  跑了幾輪: rounds.length, 為什麼停: stopReason,
+                  耗時秒: Math.round((Date.now() - startedAt) / 1000), 每輪明細: rounds};
+  Logger.log(JSON.stringify(result, null, 2));
+  return JSON.stringify(result, null, 2);
+}
+
 // 只重建「每日維護（自動結案＋歸檔）」這一個觸發器。名字不帶底線，選單選得到。
 //
 // 為什麼需要這支、而不是直接跑 installAutomationTriggers_：那支會把十個排程全部砍掉重建，
