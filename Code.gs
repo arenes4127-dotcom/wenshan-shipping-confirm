@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-13.171';
+const BACKEND_VERSION = '2026-10-13.172';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -2039,6 +2039,25 @@ function archiveShippedOrders_(){
   const archiveFile = DriveApp.getFileById(archiveSs.getId());
   folder.addFile(archiveFile);
   DriveApp.getRootFolder().removeFile(archiveFile);
+  SpreadsheetApp.flush();   // 備份內容先確實寫出去，再動原始資料
+
+  // ⚠️ SpreadsheetApp.create() 會把「新建的那份」變成作用中試算表。後面所有靠
+  // getActiveSpreadsheet() 取得目標的操作（包含 rebuildOrderDetailSheet_）就會跑到
+  // 錯的試算表上去。而且那份備份檔的第一個分頁也叫「訂單」（上面 archiveSh.setName），
+  // 名字一模一樣，所以不會拋任何錯——只是安安靜靜地對錯的表動手。
+  //
+  // 2026-10-13 現場的症狀完全吻合：deleteRows 呼叫 8 次、沒拋錯、沒逾時，
+  // 原本那張「訂單」卻一列都沒少；同一批 400 張被備份了 25 次。
+  // 而單獨測試刪列（diagnoseDeleteRows，沒有經過 create()）是正常的。
+  //
+  // 所以建完備份一定要把作用中試算表切回來，並且重新取得分頁 handle 再去刪列。
+  SpreadsheetApp.setActiveSpreadsheet(ss);
+  const shLive = ss.getSheetByName(SHEET_ORDERS);
+  if(!shLive){
+    Logger.log('⛔ 建完備份後重新取得「訂單」分頁失敗，為安全起見不刪任何列。備份檔：' + fileName);
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '建完備份後重新取得「訂單」分頁失敗'};
+  }
 
   // 由下往上刪，不然刪掉一列之後下面的列號會往上跑，會刪錯列。
   //
@@ -2055,7 +2074,7 @@ function archiveShippedOrders_(){
   // findOrderRow_ 從第一天就有這道「讀回來驗證」，刪列這條更危險的路徑反而沒有，是漏掉。
   const colOrderNo = colOf(ORDERS_HEADER, 'orderNo');
   const minRow = batch[0]._row, maxRow = batch[batch.length - 1]._row;
-  const liveNos = sh.getRange(minRow, colOrderNo, maxRow - minRow + 1, 1).getValues();
+  const liveNos = shLive.getRange(minRow, colOrderNo, maxRow - minRow + 1, 1).getValues();
   const mismatches = [];
   batch.forEach(function(r){
     const live = String(liveNos[r._row - minRow][0] || '').trim();
@@ -2072,7 +2091,7 @@ function archiveShippedOrders_(){
 
   // 量測點：2026-10-13 現場出現「呼叫了 8 次 deleteRows、沒拋錯、卻一列都沒少」的狀況，
   // 連續 12 輪算出同一批 516 張。不要再憑推論，直接把每一步的 lastRow 記下來。
-  const lastRowBefore = sh.getLastRow();
+  const lastRowBefore = shLive.getLastRow();
 
   const rowsDesc = batch.map(function(r){ return r._row; }).sort(function(a,b){ return b - a; });
   let deleteCalls = 0;
@@ -2082,19 +2101,21 @@ function archiveShippedOrders_(){
     let j = i;
     while(j + 1 < rowsDesc.length && rowsDesc[j+1] === rowsDesc[j] - 1) j++;
     // 這一段裡最小的列號是 rowsDesc[j]（由大到小排），從它開始往下刪 count 列
-    sh.deleteRows(rowsDesc[j], j - i + 1);
+    shLive.deleteRows(rowsDesc[j], j - i + 1);
     deleteCalls++;
     i = j + 1;
   }
-  const lastRowAfterDelete = sh.getLastRow();
+  const lastRowAfterDelete = shLive.getLastRow();
   SpreadsheetApp.flush();
-  const lastRowAfterFlush = sh.getLastRow();
+  const lastRowAfterFlush = shLive.getLastRow();
   const deleteCheck = {刪前lastRow: lastRowBefore, 刪後lastRow: lastRowAfterDelete,
                        flush後lastRow: lastRowAfterFlush,
                        應該要少幾列: batch.length,
                        實際少了幾列: lastRowBefore - lastRowAfterFlush,
                        刪列呼叫次數: deleteCalls,
-                       要刪的列號範圍: minRow + '~' + maxRow};
+                       要刪的列號範圍: minRow + '~' + maxRow,
+                       刪列當下的作用中試算表: SpreadsheetApp.getActiveSpreadsheet().getName(),
+                       刪的是哪張試算表: shLive.getParent().getName()};
   if(lastRowBefore - lastRowAfterFlush !== batch.length){
     Logger.log('⛔ 刪列沒有照預期生效：' + JSON.stringify(deleteCheck, null, 2));
   }
