@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-13.169';
+const BACKEND_VERSION = '2026-10-13.170';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -350,6 +350,78 @@ function runOneTimeSetup(name, arg){
 //
 // 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
 // （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
+// 直接問試算表一個問題：這支腳本到底能不能從「訂單」分頁刪掉一列？
+//
+// 2026-10-13 現場：archiveShippedOrders_ 呼叫了 8 次 deleteRows、沒有拋任何錯、
+// 執行也沒有逾時（每輪 11~13 秒），但一列都沒有被刪掉——連續 12 輪算出同一批 516 張，
+// 產生 24 個大小都是 92,942 bytes 的備份檔。同一段程式碼 10/01 才剛把 1,353 列
+// 成功降到 910 列，所以問題不在程式邏輯，在這張試算表現在的狀態。
+//
+// 這支會做一次「受控的寫入測試」：在最後一列底下補一列我們自己造的測試列，
+// flush、量 lastRow、再把那一列刪掉、flush、再量一次。全程只碰自己造的那一列，
+// 不會動到任何一張真實訂單。如果連自己剛加的那一列都刪不掉，就確定是試算表層面的
+// 限制（保護範圍、權限、或分頁狀態），不是歸檔邏輯的問題。
+function diagnoseDeleteRows(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SHEET_ORDERS);
+  const out = {試算表: ss.getName(), 試算表ID: ss.getId(),
+               分頁: sh ? sh.getName() : null, 分頁ID: sh ? sh.getSheetId() : null,
+               執行身分: Session.getEffectiveUser().getEmail()};
+  if(!sh){ out.結論 = '找不到「訂單」分頁'; Logger.log(JSON.stringify(out, null, 2)); return JSON.stringify(out, null, 2); }
+
+  out.lastRow = sh.getLastRow();
+  out.maxRows = sh.getMaxRows();
+  out.最後一列底下還有幾列空的 = sh.getMaxRows() - sh.getLastRow();
+
+  // 保護設定：整頁保護或範圍保護都可能讓寫入／刪列失敗
+  function describeProtections(type, label){
+    try{
+      return sh.getProtections(type).map(function(p){
+        let editors = '';
+        try{ editors = p.getEditors().map(function(u){ return u.getEmail(); }).join(','); }catch(e){ editors = '(讀不到)'; }
+        let range = '';
+        try{ range = p.getRange() ? p.getRange().getA1Notation() : ''; }catch(e){}
+        return {說明: p.getDescription(), 範圍: range, 我可以編輯嗎: p.canEdit(),
+                只有我自己: (function(){ try{ return p.isWarningOnly(); }catch(e){ return null; } })(),
+                編輯者: editors};
+      });
+    }catch(err){ return '讀取' + label + '保護設定失敗：' + err; }
+  }
+  out.整頁保護 = describeProtections(SpreadsheetApp.ProtectionType.SHEET, '整頁');
+  out.範圍保護 = describeProtections(SpreadsheetApp.ProtectionType.RANGE, '範圍');
+
+  // 受控寫入測試：只碰自己造的那一列
+  const marker = '__刪列測試_可刪除_' + new Date().getTime() + '__';
+  try{
+    const before = sh.getLastRow();
+    sh.getRange(before + 1, 1).setValue(marker);
+    SpreadsheetApp.flush();
+    const afterInsert = sh.getLastRow();
+    const wroteOk = sh.getRange(afterInsert, 1).getValue() === marker;
+
+    sh.deleteRows(afterInsert, 1);
+    SpreadsheetApp.flush();
+    const afterDelete = sh.getLastRow();
+
+    out.寫入測試 = {原本lastRow: before, 補一列後: afterInsert, 那一列寫進去了嗎: wroteOk,
+                    刪掉後: afterDelete, 刪列有生效嗎: afterDelete === before};
+    if(!wroteOk){
+      out.結論 = '連「寫入」都沒生效——問題比刪列更前面，先看保護設定與執行身分。';
+    } else if(afterDelete !== before){
+      out.結論 = '寫得進去但刪不掉：deleteRows 沒有拋錯卻沒有生效。這就是歸檔卡住的原因。';
+      // 刪不掉的話那一列會留在表上，至少把內容清掉，不要留一列垃圾在訂單分頁裡
+      try{ sh.getRange(afterInsert, 1).clearContent(); SpreadsheetApp.flush(); }catch(e){}
+    } else {
+      out.結論 = '寫入與刪列都正常。那歸檔卡住的原因在別處，不是試算表層面的限制。';
+    }
+  }catch(err){
+    out.寫入測試 = '測試過程拋錯：' + err;
+    out.結論 = '拋錯了——錯誤訊息本身就是答案，不用再猜。';
+  }
+  Logger.log(JSON.stringify(out, null, 2));
+  return JSON.stringify(out, null, 2);
+}
+
 // 一直搬到沒得搬為止（或時間快用完為止）。名字不帶底線，選單選得到。
 //
 // 為什麼要這支：單次上限是 ARCHIVE_MAX_ROWS_PER_RUN，積壓一大就得手動連按好幾次
@@ -374,6 +446,15 @@ function runArchiveUntilDone(){
     archived += (out.歸檔 || 0);
     remaining = out.剩餘待歸檔;
     if(!out.歸檔){ stopReason = '這一輪沒有東西可搬'; break; }
+    // 刪列如果沒有真的落到試算表上，下一輪會重新算出「一模一樣」的待歸檔集合，
+    // 於是同一批訂單被反覆備份、列卻一列都沒少。2026-10-13 現場就是這樣白跑 12 輪、
+    // 產生 12 個內容相同的備份檔才停。發現兩輪之間「剩餘」沒有變就立刻收手，
+    // 不要一直撞同一面牆。
+    if(rounds.length >= 2 && out.剩餘待歸檔 === rounds[rounds.length - 2].剩餘){
+      stopReason = '刪列沒有生效：連續兩輪算出來的待歸檔數量一樣（' + out.剩餘待歸檔
+                 + '），代表上一輪備份了卻沒有真的從訂單分頁移除。已停止，請先跑 diagnoseDeleteRows。';
+      break;
+    }
     if(!out.剩餘待歸檔) break;
     if(i === ARCHIVE_LOOP_MAX_ROUNDS - 1) stopReason = '達到單次執行的輪數上限，再按一次接著搬';
   }
