@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-13.170';
+const BACKEND_VERSION = '2026-10-13.171';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -2048,6 +2048,32 @@ function archiveShippedOrders_(){
   // rebuildOrderDetailSheet_ 就會撞到觸發器 6 分鐘上限被砍掉。被砍掉等於整批沒搬成，
   // 隔天積更多、更跑不完——2026-10-01 診斷出來的 443 張積壓就是這樣來的。
   // 已出貨的舊訂單在表上本來就大多是連號的，合併之後通常只剩個位數次呼叫。
+  // 刪之前先把那幾列的訂單號讀回來對一次。列號是 readOrderRows() 當下拍的快照，
+  // 中間若有任何流程動過這張表，列號就會錯位——而「照錯的列號刪」是這個系統最嚴重的
+  // 資料錯誤（會把別人的訂單整列刪掉）。對不上就整批放棄，一列都不刪；備份檔已經建好，
+  // 下一次重算一次就好，損失只是一個多餘的備份檔。
+  // findOrderRow_ 從第一天就有這道「讀回來驗證」，刪列這條更危險的路徑反而沒有，是漏掉。
+  const colOrderNo = colOf(ORDERS_HEADER, 'orderNo');
+  const minRow = batch[0]._row, maxRow = batch[batch.length - 1]._row;
+  const liveNos = sh.getRange(minRow, colOrderNo, maxRow - minRow + 1, 1).getValues();
+  const mismatches = [];
+  batch.forEach(function(r){
+    const live = String(liveNos[r._row - minRow][0] || '').trim();
+    if(live !== String(r.orderNo || '').trim() && mismatches.length < 5){
+      mismatches.push({列: r._row, 預期訂單號: String(r.orderNo || ''), 實際讀到: live});
+    }
+  });
+  if(mismatches.length){
+    Logger.log('⛔ 列號與訂單號對不上，整批放棄不刪（備份檔已建立，下次重算）：'
+      + JSON.stringify(mismatches));
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '列號與訂單號對不上，為避免刪錯列而整批放棄', 對不上的範例: mismatches};
+  }
+
+  // 量測點：2026-10-13 現場出現「呼叫了 8 次 deleteRows、沒拋錯、卻一列都沒少」的狀況，
+  // 連續 12 輪算出同一批 516 張。不要再憑推論，直接把每一步的 lastRow 記下來。
+  const lastRowBefore = sh.getLastRow();
+
   const rowsDesc = batch.map(function(r){ return r._row; }).sort(function(a,b){ return b - a; });
   let deleteCalls = 0;
   let i = 0;
@@ -2060,17 +2086,27 @@ function archiveShippedOrders_(){
     deleteCalls++;
     i = j + 1;
   }
+  const lastRowAfterDelete = sh.getLastRow();
+  SpreadsheetApp.flush();
+  const lastRowAfterFlush = sh.getLastRow();
+  const deleteCheck = {刪前lastRow: lastRowBefore, 刪後lastRow: lastRowAfterDelete,
+                       flush後lastRow: lastRowAfterFlush,
+                       應該要少幾列: batch.length,
+                       實際少了幾列: lastRowBefore - lastRowAfterFlush,
+                       刪列呼叫次數: deleteCalls,
+                       要刪的列號範圍: minRow + '~' + maxRow};
+  if(lastRowBefore - lastRowAfterFlush !== batch.length){
+    Logger.log('⛔ 刪列沒有照預期生效：' + JSON.stringify(deleteCheck, null, 2));
+  }
   // 刪列讓後面所有列號整體位移，訂單號→列號索引全部作廢。
   // findOrderRow_ 本來就會驗證訂單號、對不上自己重建，所以這裡漏清也不會寫錯資料；
   // 主動清掉只是省下「每個人下一次操作都各自撞一次過期索引再重建」的成本。
   try{ orderIndexCacheClear_(); }catch(err){ /* 清不掉就讓它自然過期，不影響正確性 */ }
 
-  // 刪完立刻 flush。Apps Script 會把試算表的寫入操作緩衝起來批次送出，腳本被執行時間
-  // 上限砍掉時「還沒送出的那批」會整個作廢——這就是為什麼 9/28~9/30 連續三天都備份成功
-  // 卻「一列都沒刪」，而不是刪了一半：443 次 deleteRow 全卡在緩衝區裡沒來得及 flush。
-  // 現在只剩個位數次呼叫、9 秒跑完，照理碰不到上限，但這道保險很便宜：就算哪天又慢到
-  // 被砍，至少已經刪掉的是真的刪掉了，隔天接著處理剩下的，不會回到「每天白做一次」。
-  SpreadsheetApp.flush();
+  // flush 已經在刪列之後、量測點之前就做掉了（見上面的 deleteCheck）。
+  // 為什麼一定要 flush：Apps Script 會把試算表的寫入緩衝起來批次送出，腳本被執行時間
+  // 上限砍掉時「還沒送出的那批」會整個作廢。至少已經刪掉的要是真的刪掉了，
+  // 隔天才能接著處理剩下的，不會回到「每天白做一次」。
 
   // 「訂單明細」只是方便在試算表裡肉眼看的衍生檢視，從訂單分頁就能重算出來。
   // 重建它失敗，絕不該把上面已經完成的歸檔一起拖下水——而在 flush 之前它正是這樣做的：
@@ -2088,7 +2124,8 @@ function archiveShippedOrders_(){
     +'（條件：已出貨＋來源已無此訂單＋出貨滿'+SHIPPED_ORDER_RETENTION_DAYS+'天）；'
     +'刪列呼叫 '+deleteCalls+' 次'
     +(remaining ? '；還有 '+remaining+' 張超過單次上限，明天這個時間接著搬。' : '。'));
-  return {歸檔: batch.length, 剩餘待歸檔: remaining, 刪列呼叫次數: deleteCalls, 備份檔: fileName};
+  return {歸檔: batch.length, 剩餘待歸檔: remaining, 刪列呼叫次數: deleteCalls, 備份檔: fileName,
+          刪列實況: deleteCheck};
 }
 
 // 試跑用：只計算「如果現在跑歸檔會搬走哪些訂單」，不動任何資料，直接把結果回傳成JSON。
