@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-01.167';
+const BACKEND_VERSION = '2026-10-13.168';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -1957,7 +1957,18 @@ function archiveShippedOrders_(){
   // 被砍，至少已經刪掉的是真的刪掉了，隔天接著處理剩下的，不會回到「每天白做一次」。
   SpreadsheetApp.flush();
 
-  rebuildOrderDetailSheet_(); // 訂單少了幾張，明細分頁跟著重建才不會對不起來
+  // 「訂單明細」只是方便在試算表裡肉眼看的衍生檢視，從訂單分頁就能重算出來。
+  // 重建它失敗，絕不該把上面已經完成的歸檔一起拖下水——而在 flush 之前它正是這樣做的：
+  // rebuildOrderDetailSheet_ 會整張重讀訂單、展開成一列一品項再整份重寫，訂單越多越慢，
+  // 腳本在這裡被 6 分鐘上限砍掉時，前面還在緩衝區裡的刪列操作會整批作廢。
+  // 實測 10/08~10/12 連續五天就是這樣：備份每天都建出來，刪列一列都沒生效，越積越慢。
+  // 現在 flush 已經在前面，這個 try/catch 是第二道：就算它拋錯，歸檔仍然算數，
+  // 下一次同步時 mergeOrders() 本來就會重建這張明細分頁。
+  try{
+    rebuildOrderDetailSheet_();
+  }catch(err){
+    Logger.log('歸檔已完成，但「訂單明細」分頁重建失敗（不影響歸檔結果，下次同步會重建）：' + err);
+  }
   Logger.log('已歸檔 '+batch.length+' 張已出貨訂單到「'+fileName+'」並從訂單分頁移除'
     +'（條件：已出貨＋來源已無此訂單＋出貨滿'+SHIPPED_ORDER_RETENTION_DAYS+'天）；'
     +'刪列呼叫 '+deleteCalls+' 次'
