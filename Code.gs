@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-13.172';
+const BACKEND_VERSION = '2026-10-14.173';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -350,6 +350,100 @@ function runOneTimeSetup(name, arg){
 //
 // 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
 // （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
+// 把「為什麼歸檔刪不動」的變因一個一個拆開測。
+//
+// 2026-10-14 量到的事實：deleteRows 對正確的試算表、正確的列號（314~720，已通過
+// 訂單號驗證）呼叫 8 次，沒拋錯，lastRow 從 1453 到 1453，一列都沒少。
+// 但 diagnoseDeleteRows 刪「最後一列」是成功的。兩者差在兩個地方：
+//   (A) 中段的列 vs 最尾端的列
+//   (B) 歸檔在刪列前做過 SpreadsheetApp.create() 建備份試算表
+// 這支把兩個變因分開驗，全程只碰自己造出來的列。
+//
+// 唯一會動到真實資料位置的是步驟B：它會在中段插入一列（真實資料整體下移一列），
+// 再把同一列刪掉（移回來）。萬一插得進去卻刪不掉，表上會留下一列空白——
+// 那不會寫壞任何訂單（findOrderRow_ 一律先驗訂單號才寫），但要手動刪掉，
+// 結論裡會明講。這個風險換到的是「中段到底能不能刪」這個關鍵答案。
+function diagnoseArchiveDeleteSteps(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SHEET_ORDERS);
+  const out = {試算表: ss.getName(), 分頁: sh ? sh.getName() : null};
+  if(!sh){ out.結論 = '找不到「訂單」分頁'; Logger.log(JSON.stringify(out,null,2)); return JSON.stringify(out,null,2); }
+
+  const mark = '__測試_可刪除_' + new Date().getTime() + '__';
+
+  // 步驟A：尾端插一列再刪掉（重現 diagnoseDeleteRows 的已知成功案例，當作基準線）
+  function endOfSheetTest(label){
+    const before = sh.getLastRow();
+    sh.insertRowsAfter(before, 1);
+    sh.getRange(before + 1, 1).setValue(mark);
+    SpreadsheetApp.flush();
+    const mid = sh.getLastRow();
+    sh.deleteRows(before + 1, 1);
+    SpreadsheetApp.flush();
+    const after = sh.getLastRow();
+    return {步驟: label, 原本: before, 插入後: mid, 刪除後: after, 刪得掉嗎: after === before};
+  }
+  out.A_尾端刪列 = endOfSheetTest('create() 之前、表格尾端');
+
+  // 步驟B：中段插一列再刪掉。挑第 314 列，就是歸檔實際要刪的範圍起點。
+  const midRow = Math.min(314, Math.max(2, sh.getLastRow()));
+  try{
+    const before = sh.getLastRow();
+    sh.insertRowsBefore(midRow, 1);
+    sh.getRange(midRow, 1).setValue(mark);
+    SpreadsheetApp.flush();
+    const afterInsert = sh.getLastRow();
+    const 插進去了 = sh.getRange(midRow, 1).getValue() === mark;
+    sh.deleteRows(midRow, 1);
+    SpreadsheetApp.flush();
+    const afterDelete = sh.getLastRow();
+    out.B_中段刪列 = {測試列: midRow, 原本: before, 插入後: afterInsert,
+                      那一列寫進去了嗎: 插進去了, 刪除後: afterDelete,
+                      刪得掉嗎: afterDelete === before};
+    if(afterDelete !== before){
+      out.B_要手動處理 = '第 ' + midRow + ' 列插進去了但刪不掉，表上多了一列空白，請手動刪除該列。';
+    }
+  }catch(err){ out.B_中段刪列 = '拋錯：' + err; }
+
+  // 步驟C：照歸檔的做法建一份新試算表、搬進資料夾、再丟掉
+  try{
+    const tmp = SpreadsheetApp.create('__刪列變因測試_可刪除_' + new Date().getTime());
+    tmp.getSheets()[0].setName(SHEET_ORDERS);   // 跟歸檔一樣：分頁也叫「訂單」
+    const f = DriveApp.getFileById(tmp.getId());
+    const folder = DriveApp.getFolderById(SHIPPED_ORDER_ARCHIVE_FOLDER_ID);
+    folder.addFile(f); DriveApp.getRootFolder().removeFile(f);
+    SpreadsheetApp.flush();
+    SpreadsheetApp.setActiveSpreadsheet(ss);
+    out.C_建新試算表 = {建立並搬檔: 'OK', 之後的作用中試算表: SpreadsheetApp.getActiveSpreadsheet().getName()};
+    try{ DriveApp.getFileById(tmp.getId()).setTrashed(true); }catch(e){}
+  }catch(err){ out.C_建新試算表 = '拋錯：' + err; }
+
+  // 步驟D：create() 之後，尾端還刪得掉嗎
+  const shAfter = ss.getSheetByName(SHEET_ORDERS);
+  try{
+    const before = shAfter.getLastRow();
+    shAfter.insertRowsAfter(before, 1);
+    shAfter.getRange(before + 1, 1).setValue(mark);
+    SpreadsheetApp.flush();
+    const mid = shAfter.getLastRow();
+    shAfter.deleteRows(before + 1, 1);
+    SpreadsheetApp.flush();
+    const after = shAfter.getLastRow();
+    out.D_create後尾端刪列 = {原本: before, 插入後: mid, 刪除後: after, 刪得掉嗎: after === before};
+    if(after !== before){ out.D_要手動處理 = '第 ' + (before+1) + ' 列刪不掉，請手動刪除該列。'; }
+  }catch(err){ out.D_create後尾端刪列 = '拋錯：' + err; }
+
+  const a = out.A_尾端刪列 && out.A_尾端刪列.刪得掉嗎;
+  const b = out.B_中段刪列 && out.B_中段刪列.刪得掉嗎;
+  const d = out.D_create後尾端刪列 && out.D_create後尾端刪列.刪得掉嗎;
+  out.結論 = (a && !b) ? '兇手是「中段的列刪不掉」，跟 create() 無關。'
+           : (a && b && !d) ? '兇手是 SpreadsheetApp.create()：之後的刪列就失效了。'
+           : (a && b && d) ? '三種情境都刪得掉。那兇手在歸檔流程的其他地方，不是這兩個變因。'
+           : '基準線（步驟A）就失敗了，先看 A 的數字。';
+  Logger.log(JSON.stringify(out, null, 2));
+  return JSON.stringify(out, null, 2);
+}
+
 // 直接問試算表一個問題：這支腳本到底能不能從「訂單」分頁刪掉一列？
 //
 // 2026-10-13 現場：archiveShippedOrders_ 呼叫了 8 次 deleteRows、沒有拋任何錯、
@@ -2117,7 +2211,12 @@ function archiveShippedOrders_(){
                        刪列當下的作用中試算表: SpreadsheetApp.getActiveSpreadsheet().getName(),
                        刪的是哪張試算表: shLive.getParent().getName()};
   if(lastRowBefore - lastRowAfterFlush !== batch.length){
-    Logger.log('⛔ 刪列沒有照預期生效：' + JSON.stringify(deleteCheck, null, 2));
+    // 一列都沒刪掉卻回報「已歸檔 400 張並從訂單分頁移除」，是比沒刪更糟的事——
+    // 2026-10-14 的紀錄就長這樣，光看那行 log 會以為歸檔成功了。回傳真話。
+    Logger.log('⛔ 刪列沒有照預期生效，這一批不算歸檔：' + JSON.stringify(deleteCheck, null, 2));
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '備份檔建好了，但刪列沒有生效，訂單分頁一列都沒少',
+            刪列實況: deleteCheck};
   }
   // 刪列讓後面所有列號整體位移，訂單號→列號索引全部作廢。
   // findOrderRow_ 本來就會驗證訂單號、對不上自己重建，所以這裡漏清也不會寫錯資料；
