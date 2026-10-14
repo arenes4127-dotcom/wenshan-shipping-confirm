@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-14.173';
+const BACKEND_VERSION = '2026-10-14.174';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -350,6 +350,89 @@ function runOneTimeSetup(name, arg){
 //
 // 裡面只放**唯讀**的診斷：不寫任何一格、不建測試列、不認領訂單。
 // （這個專案有過「測掃描時不小心 claimOrder 認領了一張真實訂單」的紀錄，所以這條界線要守住。）
+// 第三輪變因拆解。前兩輪的結果：
+//   diagnoseDeleteRows        尾端刪 1 列                 → 成功
+//   diagnoseArchiveDeleteSteps 尾端/中段/create()後 各刪 1 列 → 三個都成功
+//   真正的歸檔                 8 次 deleteRows(列, ~50)      → lastRow 1453→1453，完全沒作用
+//
+// 剩下兩個從來沒被測到的差異：
+//   (1) 一次刪 1 列 vs 一次刪 ~50 列（howMany 參數）
+//   (2) 刪「同一次執行裡剛插進去的列」vs 刪「本來就在表上的列」
+// 而且歸檔是連第一次呼叫都沒作用（lastRow 連 1 都沒掉），不是刪到一半停住。
+//
+// 這支全程只碰自己在表格最尾端造出來的列，不動任何真實訂單，也不改變真實資料的位置。
+function diagnoseMultiRowDelete(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SHEET_ORDERS);
+  const out = {試算表: ss.getName(), 分頁: sh ? sh.getName() : null};
+  if(!sh){ out.結論 = '找不到「訂單」分頁'; Logger.log(JSON.stringify(out,null,2)); return JSON.stringify(out,null,2); }
+  const N = 60;
+  const mark = '__多列刪除測試_可刪除_' + new Date().getTime() + '__';
+
+  function addRows(){
+    const before = sh.getLastRow();
+    sh.insertRowsAfter(before, N);
+    const vals = [];
+    for(let k = 0; k < N; k++) vals.push([mark + '_' + k]);
+    sh.getRange(before + 1, 1, N, 1).setValues(vals);
+    SpreadsheetApp.flush();
+    return {start: before + 1, before: before, afterInsert: sh.getLastRow(),
+            maxRows: sh.getMaxRows()};
+  }
+  function cleanup(start, before){
+    // 刪不掉就把內容清掉，至少不要在訂單分頁留下一堆看起來像訂單的垃圾列
+    if(sh.getLastRow() !== before){
+      try{ sh.getRange(start, 1, sh.getLastRow() - start + 1, 1).clearContent(); SpreadsheetApp.flush(); }catch(e){}
+      return '刪不掉，已清掉內容；表上會多出空列（不影響訂單資料，但 maxRows 會變大）';
+    }
+    return null;
+  }
+
+  // 測試一：一次刪掉 N 列（跟歸檔一樣的用法）
+  try{
+    const a = addRows();
+    sh.deleteRows(a.start, N);
+    SpreadsheetApp.flush();
+    const after = sh.getLastRow();
+    out['①一次刪' + N + '列'] = {原本: a.before, 插入後: a.afterInsert, 刪除後: after,
+                                 應該少: N, 實際少: a.afterInsert - after, 刪得掉嗎: after === a.before};
+    const c = cleanup(a.start, a.before); if(c) out['①善後'] = c;
+  }catch(err){ out['①一次刪' + N + '列'] = '拋錯：' + err; }
+
+  // 測試二：同樣 N 列，但一列一列刪（由下往上）
+  try{
+    const a = addRows();
+    for(let r = a.start + N - 1; r >= a.start; r--) sh.deleteRows(r, 1);
+    SpreadsheetApp.flush();
+    const after = sh.getLastRow();
+    out['②一列一列刪' + N + '次'] = {原本: a.before, 插入後: a.afterInsert, 刪除後: after,
+                                      應該少: N, 實際少: a.afterInsert - after, 刪得掉嗎: after === a.before};
+    const c = cleanup(a.start, a.before); if(c) out['②善後'] = c;
+  }catch(err){ out['②一列一列刪' + N + '次'] = '拋錯：' + err; }
+
+  // 測試三：先 flush 再「重新取得分頁 handle」才刪，排除 handle 狀態的影響
+  try{
+    const a = addRows();
+    const sh2 = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_ORDERS);
+    sh2.deleteRows(a.start, N);
+    SpreadsheetApp.flush();
+    const after = sh2.getLastRow();
+    out['③換新handle一次刪' + N + '列'] = {原本: a.before, 插入後: a.afterInsert, 刪除後: after,
+                                           應該少: N, 實際少: a.afterInsert - after, 刪得掉嗎: after === a.before};
+    const c = cleanup(a.start, a.before); if(c) out['③善後'] = c;
+  }catch(err){ out['③換新handle一次刪' + N + '列'] = '拋錯：' + err; }
+
+  const g = function(k){ const v = out[k]; return v && v.刪得掉嗎; };
+  const one = g('①一次刪' + N + '列'), two = g('②一列一列刪' + N + '次'), three = g('③換新handle一次刪' + N + '列');
+  out.結論 = (!one && two) ? '兇手找到了：一次刪多列（howMany>1）沒有作用，一列一列刪才有效。'
+           : (one && two) ? '一次刪多列也正常。那差異不在 howMany，而在「刪的是本來就在表上的列」——下一步要往那邊查。'
+           : (!one && !two) ? '連一列一列刪都失效了，跟前兩輪的結果矛盾，要重看整個執行環境。'
+           : '結果混雜，看上面每一項的數字。';
+  out.備註 = 'maxRows 目前 ' + sh.getMaxRows() + '、lastRow ' + sh.getLastRow();
+  Logger.log(JSON.stringify(out, null, 2));
+  return JSON.stringify(out, null, 2);
+}
+
 // 把「為什麼歸檔刪不動」的變因一個一個拆開測。
 //
 // 2026-10-14 量到的事實：deleteRows 對正確的試算表、正確的列號（314~720，已通過
