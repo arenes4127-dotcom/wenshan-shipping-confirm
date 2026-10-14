@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-14.176';
+const BACKEND_VERSION = '2026-10-14.177';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -2268,93 +2268,93 @@ function archiveShippedOrders_(){
 
   // 量測點：2026-10-13 現場出現「呼叫了 8 次 deleteRows、沒拋錯、卻一列都沒少」的狀況，
   // 連續 12 輪算出同一批 516 張。不要再憑推論，直接把每一步的 lastRow 記下來。
-  // ---- 暖機寫入 ----
-  // 把 A1 用它自己目前的值寫回去一次，再 flush。語意上什麼都沒改。
+  // ---- 不刪列，改成「重寫保留的部分」 ----
+  // deleteRows 在這條路徑上已經確認無效，而且是試到沒招為止才下的結論：
+  //   單獨刪一列、分組刪、逐列刪、換新 handle、刪之前先暖機寫入——全部沒有作用；
+  //   試算表 ID、分頁 ID、執行身分都正確；沒有任何保護範圍；沒拋錯、沒逾時；
+  //   lastRow 連 1 都沒掉。而同樣的呼叫在 diagnoseMultiRowDelete 裡又每一次都成功。
+  // 底層原因我沒有找出來。但不需要找出來也能把事情做對：歸檔要的是「訂單分頁變小」，
+  // 不是「非得用 deleteRows 不可」。
   //
-  // 為什麼要這一行：把所有觀察排在一起之後，唯一涵蓋全部的對應關係是
-  // 「刪之前有沒有先寫過『訂單』這張表」——
-  //   刪得掉：diagnoseDeleteRows（先 setValue）、diagnoseArchiveDeleteSteps（先 insertRows）、
-  //           diagnoseMultiRowDelete（先 insertRows + setValues）。
-  //   刪不掉：runArchiveNow / runArchiveUntilDone——全程只「讀」訂單分頁，
-  //           寫的是另一份備份試算表，從來沒有寫過訂單這張表。
-  // 這也解釋了最難解釋的那一點：為什麼 10/02~10/05 好、10/08 之後壞。排程走的是
-  // dailyMaintenance_，它在歸檔前會先跑 batchCloseOtherWarehouseOrders_，而那支
-  // 只有「真的有山物出／中華宅配訂單要結案」時才會 setValue。有別倉訂單的那幾天
-  // 先寫過表 → 刪得掉；沒有的那幾天沒寫 → 刪不掉。
-  //
-  // 底層機制我說不上來，這是依據觀察歸納出來的規律，不是查到的規格。但它涵蓋目前
-  // 每一筆資料，而這一行的代價幾乎是零；下面的探路列會直接驗證它有沒有效。
-  shLive.getRange(1, 1).setValue(shLive.getRange(1, 1).getValue());
-  SpreadsheetApp.flush();
-
-  const lastRowBefore = shLive.getLastRow();
-
-  // ---- 探路列 ----
-  // 所有合成測試都刪得掉（尾端、中段、create() 之後、一次 60 列），真實歸檔卻一列都
-  // 刪不掉。唯一還沒驗證的差異是「刪的是本來就在表上的列」，而那個用合成測試驗不了——
-  // 只要是測試自己造的列，就一定是剛插進去的。所以拿一列真的來問。
-  //
-  // 挑這一批裡列號最大的那一列：它本來就要被刪、而且已經備份過，不是額外風險；
-  // 列號最大，刪掉也不會影響其他待刪列的列號。
-  const canaryRow = batch[batch.length - 1]._row;
-  shLive.deleteRows(canaryRow, 1);
-  SpreadsheetApp.flush();
-  const lastRowAfterCanary = shLive.getLastRow();
-  const canaryOk = (lastRowAfterCanary === lastRowBefore - 1);
-
-  let deleteCalls = 1;      // 探路那一次也算
-  let 刪法 = '分組';
-  if(canaryOk){
-    const rowsDesc = batch.slice(0, batch.length - 1)
-                          .map(function(r){ return r._row; })
-                          .sort(function(a, b){ return b - a; });
-    let i = 0;
-    while(i < rowsDesc.length){
-      // rowsDesc 由大到小，連號的條件是下一個剛好比這一個小 1
-      let j = i;
-      while(j + 1 < rowsDesc.length && rowsDesc[j+1] === rowsDesc[j] - 1) j++;
-      // 這一段裡最小的列號是 rowsDesc[j]（由大到小排），從它開始往下刪 count 列
-      shLive.deleteRows(rowsDesc[j], j - i + 1);
-      deleteCalls++;
-      i = j + 1;
-    }
-    SpreadsheetApp.flush();
-
-    // 分組刪列如果「完全沒有作用」（lastRow 停在探路後的值），就改成一列一列刪。
-    // 之所以敢重用同一組列號：完全沒作用代表沒有任何列位移過，舊列號仍然有效。
-    // 只要少了「一部分」就不敢賭了——那代表列號已經位移，再照舊列號刪會刪錯列，
-    // 寧可整批停在這裡，下一次重算。
-    if(shLive.getLastRow() === lastRowAfterCanary && rowsDesc.length){
-      刪法 = '分組無效，改用逐列';
-      rowsDesc.forEach(function(rowNum){ shLive.deleteRows(rowNum, 1); deleteCalls++; });
-      SpreadsheetApp.flush();
-    } else if(shLive.getLastRow() !== lastRowBefore - batch.length){
-      刪法 = '分組只刪掉一部分，不再繼續（列號已位移，照舊列號刪會刪錯列）';
-    }
-  } else {
-    刪法 = '探路列就刪不掉，整批不再嘗試';
+  // 改法：把要保留的列整理好，從第 2 列開始一次 setValues 寫回去，尾巴多出來的清空。
+  // 列的「內容」往上搬，不動實體列。條件式格式與資料驗證都是以範圍設定的，改值不會
+  // 讓它們跑掉；A1 的系統警語也不在改寫範圍內。
+  // 先確認這張表自從 readOrderRows() 之後沒有變動過。建備份檔那幾秒內如果有新訂單
+  // 被寫進來（lastRow 變大），下面清尾巴就會把那筆新訂單一起清掉——那是真正的資料遺失。
+  // 快照對不上就什麼都不做，備份檔留著，下一次重算一次即可。
+  const snapshotLastRow = 1 + rows.length;
+  if(lastRowBefore !== snapshotLastRow){
+    Logger.log('⛔ 訂單分頁在備份期間被改動過（快照 lastRow ' + snapshotLastRow
+      + '、現在 ' + lastRowBefore + '），這一批不動，下次重算。備份檔：' + fileName);
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '訂單分頁在建備份期間被改動過，為避免清掉新進訂單而整批放棄',
+            快照lastRow: snapshotLastRow, 現在lastRow: lastRowBefore};
   }
 
-  const lastRowAfterDelete = shLive.getLastRow();
+  const archiveRowSet = {};
+  batch.forEach(function(r){ archiveRowSet[r._row] = true; });
+  const keep = rows.filter(function(r){ return !archiveRowSet[r._row]; });
+  const keepValues = keep.map(function(r){
+    return ORDERS_HEADER.map(function(h){ return h === 'status' ? statusToText(r[h]) : r[h]; });
+  });
+
+  if(keepValues.length){
+    shLive.getRange(2, 1, keepValues.length, ORDERS_HEADER.length).setValues(keepValues);
+  }
+  const tailStart = 2 + keepValues.length;
+  const tailCount = lastRowBefore - tailStart + 1;
+  if(tailCount > 0){
+    shLive.getRange(tailStart, 1, tailCount, ORDERS_HEADER.length).clearContent();
+  }
   SpreadsheetApp.flush();
+
+  // 寫完一定要讀回來驗證。這條路徑上「呼叫了卻沒有作用」已經發生過太多次，
+  // 不能再相信「沒拋錯就是成功」。把保留下來的訂單號整欄讀回來，逐一跟預期比對。
   const lastRowAfterFlush = shLive.getLastRow();
-  const deleteCheck = {刪前lastRow: lastRowBefore, 刪後lastRow: lastRowAfterDelete,
-                       flush後lastRow: lastRowAfterFlush,
+  const expectLastRow = 1 + keepValues.length;
+  let 內容對得上 = (lastRowAfterFlush === expectLastRow);
+  let 第一個對不上的 = null;
+  if(內容對得上 && keepValues.length){
+    const backNos = shLive.getRange(2, colOrderNo, keepValues.length, 1).getValues();
+    for(let k = 0; k < keep.length; k++){
+      const want = String(keep[k].orderNo || '').trim();
+      const got = String(backNos[k][0] || '').trim();
+      if(want !== got){
+        內容對得上 = false;
+        第一個對不上的 = {第幾筆: k + 1, 列: k + 2, 預期: want, 實際: got};
+        break;
+      }
+    }
+  }
+
+  const deleteCheck = {作法: '重寫保留列（不使用 deleteRows）',
+                       寫入前lastRow: lastRowBefore, 寫入後lastRow: lastRowAfterFlush,
+                       預期lastRow: expectLastRow,
                        應該要少幾列: batch.length,
                        實際少了幾列: lastRowBefore - lastRowAfterFlush,
-                       刪列呼叫次數: deleteCalls,
-                       要刪的列號範圍: minRow + '~' + maxRow,
-                       刪之前有先暖機寫入: true,
-                       探路列: canaryRow, 探路後lastRow: lastRowAfterCanary,
-                       探路刪得掉嗎: canaryOk, 刪法: 刪法,
-                       刪列當下的作用中試算表: SpreadsheetApp.getActiveSpreadsheet().getName(),
-                       刪的是哪張試算表: shLive.getParent().getName()};
-  if(lastRowBefore - lastRowAfterFlush !== batch.length){
-    // 一列都沒刪掉卻回報「已歸檔 400 張並從訂單分頁移除」，是比沒刪更糟的事——
-    // 2026-10-14 的紀錄就長這樣，光看那行 log 會以為歸檔成功了。回傳真話。
-    Logger.log('⛔ 刪列沒有照預期生效，這一批不算歸檔：' + JSON.stringify(deleteCheck, null, 2));
+                       保留幾列: keepValues.length, 清空尾巴幾列: Math.max(tailCount, 0),
+                       這批的列號範圍: minRow + '~' + maxRow,
+                       讀回來內容對得上嗎: 內容對得上,
+                       第一個對不上的: 第一個對不上的,
+                       作用中試算表: SpreadsheetApp.getActiveSpreadsheet().getName(),
+                       寫的是哪張試算表: shLive.getParent().getName()};
+
+  if(!內容對得上){
+    // 讀回來跟預期不一樣：不管是整個沒寫進去、還是只寫了一部分，都不能當成歸檔成功。
+    // 備份檔已經建好，原始資料也還在表上（最壞情況是尾巴多了幾列重複，下次會被重新
+    // 算進待歸檔，不會遺失）。回報真話，讓人看得到到底發生什麼。
+    Logger.log('⛔ 重寫後讀回來跟預期不符，這一批不算歸檔：' + JSON.stringify(deleteCheck, null, 2));
     return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
-            中止原因: '備份檔建好了，但刪列沒有生效，訂單分頁一列都沒少',
+            中止原因: '備份檔建好了，但重寫訂單分頁後讀回來跟預期不符',
+            刪列實況: deleteCheck};
+  }
+
+  if(lastRowBefore - lastRowAfterFlush !== batch.length){
+    // 內容逐筆對過了，列數還是對不上的話一樣不當成成功——寧可少算一次歸檔，
+    // 也不要像 10/08~10/14 那樣連續一週回報「已歸檔 400 張」其實一列都沒少。
+    Logger.log('⛔ 列數跟預期對不上，這一批不算歸檔：' + JSON.stringify(deleteCheck, null, 2));
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '備份檔建好了，但訂單分頁的列數跟預期對不上',
             刪列實況: deleteCheck};
   }
   // 刪列讓後面所有列號整體位移，訂單號→列號索引全部作廢。
@@ -2381,9 +2381,9 @@ function archiveShippedOrders_(){
   }
   Logger.log('已歸檔 '+batch.length+' 張已出貨訂單到「'+fileName+'」並從訂單分頁移除'
     +'（條件：已出貨＋來源已無此訂單＋出貨滿'+SHIPPED_ORDER_RETENTION_DAYS+'天）；'
-    +'刪列呼叫 '+deleteCalls+' 次'
+    +'（作法：重寫保留列，不使用 deleteRows）'
     +(remaining ? '；還有 '+remaining+' 張超過單次上限，明天這個時間接著搬。' : '。'));
-  return {歸檔: batch.length, 剩餘待歸檔: remaining, 刪列呼叫次數: deleteCalls, 備份檔: fileName,
+  return {歸檔: batch.length, 剩餘待歸檔: remaining, 備份檔: fileName,
           刪列實況: deleteCheck};
 }
 
