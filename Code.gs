@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-14.174';
+const BACKEND_VERSION = '2026-10-14.175';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -2270,18 +2270,52 @@ function archiveShippedOrders_(){
   // 連續 12 輪算出同一批 516 張。不要再憑推論，直接把每一步的 lastRow 記下來。
   const lastRowBefore = shLive.getLastRow();
 
-  const rowsDesc = batch.map(function(r){ return r._row; }).sort(function(a,b){ return b - a; });
-  let deleteCalls = 0;
-  let i = 0;
-  while(i < rowsDesc.length){
-    // rowsDesc 由大到小，連號的條件是下一個剛好比這一個小 1
-    let j = i;
-    while(j + 1 < rowsDesc.length && rowsDesc[j+1] === rowsDesc[j] - 1) j++;
-    // 這一段裡最小的列號是 rowsDesc[j]（由大到小排），從它開始往下刪 count 列
-    shLive.deleteRows(rowsDesc[j], j - i + 1);
-    deleteCalls++;
-    i = j + 1;
+  // ---- 探路列 ----
+  // 所有合成測試都刪得掉（尾端、中段、create() 之後、一次 60 列），真實歸檔卻一列都
+  // 刪不掉。唯一還沒驗證的差異是「刪的是本來就在表上的列」，而那個用合成測試驗不了——
+  // 只要是測試自己造的列，就一定是剛插進去的。所以拿一列真的來問。
+  //
+  // 挑這一批裡列號最大的那一列：它本來就要被刪、而且已經備份過，不是額外風險；
+  // 列號最大，刪掉也不會影響其他待刪列的列號。
+  const canaryRow = batch[batch.length - 1]._row;
+  shLive.deleteRows(canaryRow, 1);
+  SpreadsheetApp.flush();
+  const lastRowAfterCanary = shLive.getLastRow();
+  const canaryOk = (lastRowAfterCanary === lastRowBefore - 1);
+
+  let deleteCalls = 1;      // 探路那一次也算
+  let 刪法 = '分組';
+  if(canaryOk){
+    const rowsDesc = batch.slice(0, batch.length - 1)
+                          .map(function(r){ return r._row; })
+                          .sort(function(a, b){ return b - a; });
+    let i = 0;
+    while(i < rowsDesc.length){
+      // rowsDesc 由大到小，連號的條件是下一個剛好比這一個小 1
+      let j = i;
+      while(j + 1 < rowsDesc.length && rowsDesc[j+1] === rowsDesc[j] - 1) j++;
+      // 這一段裡最小的列號是 rowsDesc[j]（由大到小排），從它開始往下刪 count 列
+      shLive.deleteRows(rowsDesc[j], j - i + 1);
+      deleteCalls++;
+      i = j + 1;
+    }
+    SpreadsheetApp.flush();
+
+    // 分組刪列如果「完全沒有作用」（lastRow 停在探路後的值），就改成一列一列刪。
+    // 之所以敢重用同一組列號：完全沒作用代表沒有任何列位移過，舊列號仍然有效。
+    // 只要少了「一部分」就不敢賭了——那代表列號已經位移，再照舊列號刪會刪錯列，
+    // 寧可整批停在這裡，下一次重算。
+    if(shLive.getLastRow() === lastRowAfterCanary && rowsDesc.length){
+      刪法 = '分組無效，改用逐列';
+      rowsDesc.forEach(function(rowNum){ shLive.deleteRows(rowNum, 1); deleteCalls++; });
+      SpreadsheetApp.flush();
+    } else if(shLive.getLastRow() !== lastRowBefore - batch.length){
+      刪法 = '分組只刪掉一部分，不再繼續（列號已位移，照舊列號刪會刪錯列）';
+    }
+  } else {
+    刪法 = '探路列就刪不掉，整批不再嘗試';
   }
+
   const lastRowAfterDelete = shLive.getLastRow();
   SpreadsheetApp.flush();
   const lastRowAfterFlush = shLive.getLastRow();
@@ -2291,6 +2325,8 @@ function archiveShippedOrders_(){
                        實際少了幾列: lastRowBefore - lastRowAfterFlush,
                        刪列呼叫次數: deleteCalls,
                        要刪的列號範圍: minRow + '~' + maxRow,
+                       探路列: canaryRow, 探路後lastRow: lastRowAfterCanary,
+                       探路刪得掉嗎: canaryOk, 刪法: 刪法,
                        刪列當下的作用中試算表: SpreadsheetApp.getActiveSpreadsheet().getName(),
                        刪的是哪張試算表: shLive.getParent().getName()};
   if(lastRowBefore - lastRowAfterFlush !== batch.length){
