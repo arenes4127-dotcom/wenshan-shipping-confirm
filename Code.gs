@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-14.175';
+const BACKEND_VERSION = '2026-10-14.176';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -2268,6 +2268,25 @@ function archiveShippedOrders_(){
 
   // 量測點：2026-10-13 現場出現「呼叫了 8 次 deleteRows、沒拋錯、卻一列都沒少」的狀況，
   // 連續 12 輪算出同一批 516 張。不要再憑推論，直接把每一步的 lastRow 記下來。
+  // ---- 暖機寫入 ----
+  // 把 A1 用它自己目前的值寫回去一次，再 flush。語意上什麼都沒改。
+  //
+  // 為什麼要這一行：把所有觀察排在一起之後，唯一涵蓋全部的對應關係是
+  // 「刪之前有沒有先寫過『訂單』這張表」——
+  //   刪得掉：diagnoseDeleteRows（先 setValue）、diagnoseArchiveDeleteSteps（先 insertRows）、
+  //           diagnoseMultiRowDelete（先 insertRows + setValues）。
+  //   刪不掉：runArchiveNow / runArchiveUntilDone——全程只「讀」訂單分頁，
+  //           寫的是另一份備份試算表，從來沒有寫過訂單這張表。
+  // 這也解釋了最難解釋的那一點：為什麼 10/02~10/05 好、10/08 之後壞。排程走的是
+  // dailyMaintenance_，它在歸檔前會先跑 batchCloseOtherWarehouseOrders_，而那支
+  // 只有「真的有山物出／中華宅配訂單要結案」時才會 setValue。有別倉訂單的那幾天
+  // 先寫過表 → 刪得掉；沒有的那幾天沒寫 → 刪不掉。
+  //
+  // 底層機制我說不上來，這是依據觀察歸納出來的規律，不是查到的規格。但它涵蓋目前
+  // 每一筆資料，而這一行的代價幾乎是零；下面的探路列會直接驗證它有沒有效。
+  shLive.getRange(1, 1).setValue(shLive.getRange(1, 1).getValue());
+  SpreadsheetApp.flush();
+
   const lastRowBefore = shLive.getLastRow();
 
   // ---- 探路列 ----
@@ -2325,6 +2344,7 @@ function archiveShippedOrders_(){
                        實際少了幾列: lastRowBefore - lastRowAfterFlush,
                        刪列呼叫次數: deleteCalls,
                        要刪的列號範圍: minRow + '~' + maxRow,
+                       刪之前有先暖機寫入: true,
                        探路列: canaryRow, 探路後lastRow: lastRowAfterCanary,
                        探路刪得掉嗎: canaryOk, 刪法: 刪法,
                        刪列當下的作用中試算表: SpreadsheetApp.getActiveSpreadsheet().getName(),
