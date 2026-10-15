@@ -53,15 +53,12 @@ function makeSS(name, sheets){
 const CACHE_HEADER2 = ['品號','品名','規格','ODM士林倉','三相之力','山物獵人網購倉',
                        '中華門市倉','門外漢門市倉','網購庫存倉','總倉'];
 const cacheRows = [new Array(10).fill(''), CACHE_HEADER2];
-// 門市對照（使用者提供）：
-//   秀山莊-中華門市 = G
-//   ODM-台中門市    = E ＋ H   ← 一家店對到兩欄，要加總
-//   ODM-士林門市    = D
+// 門市對照（使用者提供）：D=士林、E=台中、G=中華、H=台南
 //            品號     品名    規格   D  E  F  G  H   I   J
-cacheRows.push(['SKU-A','商品A','紅', 0, 1, 0, 5, 2, 10,  3]);  // 中華5、台中1+2=3
-cacheRows.push(['SKU-B','商品B','藍', 0, 0, 0, 3, 0,  0,  0]);  // 中華3、台中0
-cacheRows.push(['SKU-C','商品C','黑', 0, 0, 0, 0, 7,  0,  0]);  // 中華0、台中7
-cacheRows.push(['SKU-D','商品D','白', 0, 1, 0, 4, 1,  0,  0]);  // 中華4、台中2
+cacheRows.push(['SKU-A','商品A','紅', 0, 1, 0, 5, 2, 10,  3]);  // 中華5、台南2、台中1
+cacheRows.push(['SKU-B','商品B','藍', 0, 0, 0, 3, 0,  0,  0]);  // 中華3、台南0
+cacheRows.push(['SKU-C','商品C','黑', 0, 0, 0, 0, 7,  0,  0]);  // 中華0、台南7
+cacheRows.push(['SKU-D','商品D','白', 0, 1, 0, 4, 1,  0,  0]);  // 中華4、台南1
 const cache = makeSheet('山物地圖(快取)', cacheRows);
 
 // 「條碼轉品號」：A? B品號 C條碼 D品名
@@ -114,9 +111,10 @@ const ck = (id, cond, extra) => { if(!cond){ console.log('  FAIL', id, extra===u
 
 console.log('【門市欄位對照】');
 X.STORE_DEFS.forEach(d => console.log('   ', d.name, '←', d.from.join(' ＋ '), 'cols', JSON.stringify(d.cols)));
-ck('共 3 家門市（網路倉庫不列入）', X.STORE_LIST.length === 3, X.STORE_LIST);
+ck('共 4 家門市（網路倉庫不列入）', X.STORE_LIST.length === 4, X.STORE_LIST);
 ck('秀山莊-中華門市 = G(7)', JSON.stringify(X.storeDef_('秀山莊-中華門市').cols) === '[7]');
-ck('ODM-台中門市 = E(5)＋H(8)', JSON.stringify(X.storeDef_('ODM-台中門市').cols) === '[5,8]');
+ck('ODM-台南門市 = H(8)', JSON.stringify(X.storeDef_('ODM-台南門市').cols) === '[8]');
+ck('ODM-台中門市 = E(5)', JSON.stringify(X.storeDef_('ODM-台中門市').cols) === '[5]');
 ck('ODM-士林門市 = D(4)', JSON.stringify(X.storeDef_('ODM-士林門市').cols) === '[4]');
 ck('快取第7欄表頭是中華門市倉', CACHE_HEADER2[6] === '中華門市倉', CACHE_HEADER2[6]);
 ck('快取第5欄表頭是三相之力', CACHE_HEADER2[4] === '三相之力', CACHE_HEADER2[4]);
@@ -186,19 +184,19 @@ ck('SKU-D 實0 應4 差-4 未盤到', detail['SKU-D'][iSc]===0 && detail['SKU-D'
 ck('SKU-C 不該出現（中華庫存0、也沒掃）', !detail['SKU-C'], detail['SKU-C']);
 ck('9999 標成查無此品號', detail['9999999999999'] && detail['9999999999999'][iRs]==='庫存表查無此品號', detail['9999999999999']);
 
-console.log('\n【一家門市對到兩欄要加總】ODM-台中門市 = E＋H：A應1+2=3、C應0+7=7、D應1+1=2');
-const st2 = X.startCountSession({store:'ODM-台中門市', counterId:'02', counterName:'小華'});
-X.countScanBatch({sessionId: st2.sessionId, ops:[{code:'SKU-A', qty:3}]});
+console.log('\n【另一家門市分開對帳】ODM-台南門市 = H：A應2、C應7、D應1');
+const st2 = X.startCountSession({store:'ODM-台南門市', counterId:'02', counterName:'小華'});
+X.countScanBatch({sessionId: st2.sessionId, ops:[{code:'SKU-A', qty:2}]});
 const fin2 = X.finishCountSession({sessionId: st2.sessionId});
 console.log('  回傳：', JSON.stringify(fin2));
 const d2 = {};
 det._rows.slice(1).forEach(row=>{ if(row[0]===st2.sessionId && row[iSku]) d2[row[iSku]] = row; });
-console.log('  台中門市明細：');
+console.log('  台南門市明細：');
 Object.keys(d2).forEach(k=>console.log('   ', k, '實盤', d2[k][iSc], '應有', d2[k][iEx], d2[k][iRs]));
-ck('台中 SKU-A 應有=3（E1＋H2，不是中華的5）且相符', d2['SKU-A'] && d2['SKU-A'][iEx]===3 && d2['SKU-A'][iRs]==='相符', d2['SKU-A']);
-ck('台中 SKU-C 應有=7 未盤到', d2['SKU-C'] && d2['SKU-C'][iEx]===7 && d2['SKU-C'][iRs]==='未盤到', d2['SKU-C']);
-ck('台中 SKU-D 應有=2（E1＋H1）未盤到', d2['SKU-D'] && d2['SKU-D'][iEx]===2 && d2['SKU-D'][iRs]==='未盤到', d2['SKU-D']);
-ck('台中 SKU-B 不該出現（E0 H0 又沒掃）', !d2['SKU-B'], d2['SKU-B']);
+ck('台南 SKU-A 應有=2（H欄，不是中華的5）且相符', d2['SKU-A'] && d2['SKU-A'][iEx]===2 && d2['SKU-A'][iRs]==='相符', d2['SKU-A']);
+ck('台南 SKU-C 應有=7 未盤到', d2['SKU-C'] && d2['SKU-C'][iEx]===7 && d2['SKU-C'][iRs]==='未盤到', d2['SKU-C']);
+ck('台南 SKU-D 應有=1 未盤到', d2['SKU-D'] && d2['SKU-D'][iEx]===1 && d2['SKU-D'][iRs]==='未盤到', d2['SKU-D']);
+ck('台南 SKU-B 不該出現（H0 又沒掃）', !d2['SKU-B'], d2['SKU-B']);
 ck('兩場次互不干擾：中華那場 SKU-A 應有仍是 5', detail['SKU-A'][iEx]===5);
 
 const ls = X.listCountSessions({});

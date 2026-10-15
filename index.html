@@ -564,6 +564,7 @@
           <button class="btn block" data-goto="pick">開始揀貨</button>
           <button class="btn block" data-goto="scan">開始掃描出貨</button>
           <button class="btn gray block" data-goto="orders">訂單資料管理</button>
+          <button class="btn gray block" data-goto="count">門市商品盤點</button>
         </div>
       </div>
     </section>
@@ -656,6 +657,52 @@
 
       <div class="section-label">今天已完成</div>
       <div class="card"><div id="transferDoneList"></div></div>
+    </section>
+
+    <!-- ============ 門市盤點 ============ -->
+    <section id="view-count" class="view">
+      <div class="section-label">門市商品盤點</div>
+
+      <div class="card" id="countSetup">
+        <p class="hint" style="margin-top:0;">掃到哪算哪：同一個商品重複掃就累加。整箱的可以直接改數量，
+          不用一件一件掃。按「結束盤點」才會跟庫存表對帳產出差異表——過程中不會動到任何庫存資料。</p>
+        <label class="field" style="margin-bottom:8px;">
+          <span>門市</span>
+          <select id="countStoreSelect"></select>
+        </label>
+        <label class="field" style="margin-bottom:8px;">
+          <span>盤點人</span>
+          <select id="countStaffSelect"></select>
+        </label>
+        <button type="button" class="btn block" id="countStartBtn">開始盤點</button>
+      </div>
+
+      <div class="card" id="countActive" style="display:none;">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;">
+          <div><strong id="countActiveStore"></strong>　<span class="hint" id="countActiveWho"></span></div>
+          <div class="hint" id="countActiveStats"></div>
+        </div>
+        <label class="field" style="margin:10px 0 0;">
+          <span>掃描或輸入商品條碼／貨號<span id="countSyncHint" class="hint" style="font-weight:400;"></span></span>
+          <div class="scan-row">
+            <input id="countScanInput" class="scan-input" type="text" placeholder="請掃描商品條碼" autocomplete="off">
+            <button type="button" class="btn-camera" onclick="openCameraScan(countScan)" title="用相機掃描">📷</button>
+          </div>
+        </label>
+        <div class="stack" style="margin-top:10px;">
+          <button type="button" class="btn block" id="countFinishBtn">結束盤點並對帳</button>
+          <button type="button" class="btn gray block" id="countAbandonBtn">離開（不結束，之後可接續）</button>
+        </div>
+      </div>
+
+      <div class="section-label" id="countListLabel" style="display:none;">已盤品項（<span id="countItemCount">0</span>）</div>
+      <div class="card" id="countListCard" style="display:none;"><div id="countList"></div></div>
+
+      <div class="section-label" id="countResultLabel" style="display:none;">對帳結果</div>
+      <div class="card" id="countResultCard" style="display:none;"><div id="countResult"></div></div>
+
+      <div class="section-label">最近的盤點場次</div>
+      <div class="card"><div id="countSessionList"><p class="hint">載入中…</p></div></div>
     </section>
 
     <!-- ============ 訂單資料 ============ -->
@@ -1033,7 +1080,11 @@ const LS = {
   sourceStats: 'ssz_source_stats',
   // 儲位選單的字彙（有哪些區、每區幾格幾層）。存本機是為了進頁面就有選單可用，
   // 不用先等一趟網路；背景再去後端更新一次。
-  locVocab: 'ssz_loc_vocab'
+  locVocab: 'ssz_loc_vocab',
+  // 門市盤點：場次、本機已掃清單、待送出的掃描。跟 pickQueue／transferQueue 同樣理由——
+  // 關掉分頁或斷線都不能讓現場已經數過的東西消失，開起來要接得回去。
+  countSession: 'ssz_count_session', countItems: 'ssz_count_items',
+  countQueue: 'ssz_count_queue', countStores: 'ssz_count_stores'
 };
 function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
 // localStorage 寫入失敗不可以中斷正在進行的作業。
@@ -1466,6 +1517,13 @@ async function gotoView(name){
     // 背景輪詢改成 lean（不抓出貨紀錄）之後，這一頁的資料只會在這裡更新。
     // 進來時補抓一次完整的，看到的才是最新的。
     if(hasBackend()) refreshFromBackend(true).then(ok=>{ if(ok) renderLog(); });
+  }
+  if(name==='count'){
+    renderCountStaffSelect();
+    renderCount();
+    loadCountStores();
+    if(countSession) resyncCountSession();
+    setTimeout(function(){ const el = document.getElementById('countScanInput'); if(el && countSession) el.focus(); }, 40);
   }
   if(name==='settings') renderSettings();
   if(name==='scan') setTimeout(()=>inputOrder && inputOrder.focus(), 30);
@@ -5594,8 +5652,313 @@ renderHome();
 // ---- 揀貨初始化 ----
 // 掃描耗時紀錄跨重新整理保留，現場掃完才有空回設定頁看
 scanPerf = loadJSON('ssz_scan_perf', []);
+
+// ============================================================
+// 門市商品盤點
+// ============================================================
+// 現場邏輯跟調撥驗收同一套：掃描當下只改本機、立刻畫出來，送出丟到背景批次。
+// 手持機在倉庫裡網路不穩，掃一件等一次來回是不能用的。
+// 跟調撥不同的是「掃到哪算哪」——沒有預先的清單，重複掃同一個商品就累加。
+let countSession = null;   // {sessionId, store, counterId, counterName}
+let countItems = [];       // [{key, sku, name, qty, at, pending}] 最新掃到的排最前面
+let countQueue = [];       // 還沒送出去的掃描
+let countStores = [];
+let countFlushTimer = null;
+const COUNT_FLUSH_MS = 600;
+
+function saveCountState_(){
+  try{
+    saveJSON(LS.countSession, countSession);
+    saveJSON(LS.countItems, countItems);
+    saveJSON(LS.countQueue, countQueue);
+  }catch(e){}
+}
+
+function renderCountStaffSelect(){
+  const sel = document.getElementById('countStaffSelect');
+  if(!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = staff.length
+    ? staff.map(s=>`<option value="${s.id}">${s.id} - ${s.name}</option>`).join('')
+    : '<option value="">（尚未建立人員，請先新增）</option>';
+  sel.value = (keep && staff.find(s=>s.id===keep)) ? keep : currentStaffId;
+}
+
+// 門市清單從後端來，不在前端寫第二份。欄位對照只有一個地方說了算，
+// 兩邊各寫一份遲早會對不起來。
+function loadCountStores(){
+  const sel = document.getElementById('countStoreSelect');
+  const cached = loadJSON(LS.countStores, []);
+  if(cached.length && !countStores.length) countStores = cached;
+  const paint = function(){
+    if(!sel) return;
+    const keep = sel.value;
+    sel.innerHTML = countStores.length
+      ? countStores.map(x=>`<option value="${x}">${x}</option>`).join('')
+      : '<option value="">（讀取門市清單中…）</option>';
+    if(keep && countStores.indexOf(keep) >= 0) sel.value = keep;
+  };
+  paint();
+  if(!hasBackend()) return;
+  apiPost('listCountSessions', {limit: 20}).then(function(res){
+    if(!res || !res.ok) return;
+    countStores = res.stores || [];
+    try{ saveJSON(LS.countStores, countStores); }catch(e){}
+    paint();
+    renderCountSessionList(res.sessions || []);
+  }).catch(function(){
+    const box = document.getElementById('countSessionList');
+    if(box) box.innerHTML = '<p class="hint">讀不到場次清單（不影響盤點，稍後會自己補上）</p>';
+  });
+}
+
+function renderCountSessionList(sessions){
+  const box = document.getElementById('countSessionList');
+  if(!box) return;
+  if(!sessions.length){ box.innerHTML = '<p class="hint">還沒有任何盤點紀錄。</p>'; return; }
+  box.innerHTML = sessions.map(function(x){
+    const done = String(x.countStatus||'') === '已完成';
+    const diff = done ? `差異 ${x.countDiffCount} 項` : '進行中';
+    return `<div class="row"><div><strong>${x.countStore||''}</strong>
+      <div class="hint">${x.startedAt||''}　${x.counterName||''}</div></div>
+      <div style="text-align:right;"><span class="tag${done?'':' danger'}">${x.countStatus||''}</span>
+      <div class="hint">${x.countScannedQty||0} 件 / ${x.countItemCount||0} 項　${diff}</div></div></div>`;
+  }).join('');
+}
+
+function renderCount(){
+  const setup = document.getElementById('countSetup');
+  const active = document.getElementById('countActive');
+  if(!setup || !active) return;
+  const on = !!countSession;
+  setup.style.display = on ? 'none' : 'block';
+  active.style.display = on ? 'block' : 'none';
+  ['countListLabel','countListCard'].forEach(function(id){
+    const el = document.getElementById(id); if(el) el.style.display = on ? 'block' : 'none';
+  });
+  if(on){
+    document.getElementById('countActiveStore').textContent = countSession.store;
+    document.getElementById('countActiveWho').textContent = countSession.counterName || countSession.counterId || '';
+    let qty = 0;
+    countItems.forEach(function(x){ qty += Number(x.qty) || 0; });
+    document.getElementById('countActiveStats').textContent = qty + ' 件 / ' + countItems.length + ' 項';
+    document.getElementById('countItemCount').textContent = countItems.length;
+    const hint = document.getElementById('countSyncHint');
+    if(hint) hint.textContent = countQueue.length ? '　' + countQueue.length + ' 筆待同步' : '';
+  }
+  const list = document.getElementById('countList');
+  if(list){
+    list.innerHTML = countItems.length ? countItems.map(function(x){
+      const name = x.name || '（查不到品名）';
+      const warn = x.sku ? '' : '<span class="tag danger">未知條碼</span>';
+      return `<div class="row"><div><strong>${x.sku || x.key}</strong> ${warn}
+        <div class="hint">${name}</div></div>
+        <div style="text-align:right;white-space:nowrap;">
+          <strong style="font-size:17px;">${x.qty}</strong>
+          <button type="button" class="btn gray" style="margin-left:8px;padding:4px 10px;"
+            onclick="promptCountQty('${(x.sku || x.key).replace(/'/g, "\\'")}')">改</button>
+        </div></div>`;
+    }).join('') : '<p class="hint">還沒掃到任何商品。</p>';
+  }
+}
+
+function startCount(){
+  const store = (document.getElementById('countStoreSelect')||{}).value || '';
+  const staffId = (document.getElementById('countStaffSelect')||{}).value || '';
+  const who = staff.find(s=>s.id===staffId);
+  if(!store){ errorBeep(); flash('err','請先選門市','門市清單還沒載入的話，請確認後端連線', 1800); return; }
+  if(!who){ errorBeep(); flash('err','請先選盤點人','設定頁可以新增人員', 1800); return; }
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線才能開始盤點','開場次要跟後端拿場次編號', 2000); return; }
+  apiPost('startCountSession', {store: store, counterId: who.id, counterName: who.name})
+    .then(function(res){
+      if(!res || !res.ok){ errorBeep(); flash('err','開不了場次', (res && res.error) || '', 2500); return; }
+      countSession = {sessionId: res.sessionId, store: store, counterId: who.id, counterName: who.name};
+      countItems = []; countQueue = [];
+      saveCountState_();
+      renderCount();
+      okBeep();
+      flash('ok','盤點開始', store + '　' + who.name, 1500);
+      setTimeout(function(){ const el = document.getElementById('countScanInput'); if(el) el.focus(); }, 40);
+    })
+    .catch(function(err){ errorBeep(); flash('err','開不了場次', err.message || '', 2500); });
+}
+
+function countScan(code){
+  code = String(code||'').trim();
+  if(!code) return;
+  if(!countSession){ errorBeep(); flash('err','還沒開始盤點','請先選門市按「開始盤點」', 1800); return; }
+  // 樂觀：先用條碼當 key 畫出來，後端回來才知道真正的品號與品名。
+  // 兩個不同條碼對到同一個品號時，countReconcile_ 會把它們併成一列。
+  let hit = countItems.filter(function(x){ return x.key === code || x.sku === code; })[0];
+  if(hit){
+    hit.qty = (Number(hit.qty)||0) + 1;
+    countItems = [hit].concat(countItems.filter(function(x){ return x !== hit; }));
+  } else {
+    hit = {key: code, sku: '', name: '', qty: 1, at: new Date().toISOString(), pending: true};
+    countItems.unshift(hit);
+  }
+  countQueue.push({code: code, qty: 1, at: nowStampLocal_()});
+  saveCountState_();
+  renderCount();
+  okBeep();
+  scheduleCountFlush();
+}
+
+function nowStampLocal_(){
+  const d = new Date(), p = n => String(n).padStart(2,'0');
+  return d.getFullYear()+'/'+p(d.getMonth()+1)+'/'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+
+function scheduleCountFlush(){
+  if(countFlushTimer) clearTimeout(countFlushTimer);
+  countFlushTimer = setTimeout(flushCountQueue, COUNT_FLUSH_MS);
+}
+
+function flushCountQueue(){
+  if(countFlushTimer){ clearTimeout(countFlushTimer); countFlushTimer = null; }
+  if(!countQueue.length || !countSession || !hasBackend()) return Promise.resolve();
+  const batch = countQueue.slice();
+  return apiPost('countScanBatch', {sessionId: countSession.sessionId, ops: batch})
+    .then(function(res){
+      // 只移除這次送出的——期間人員可能又掃了新的，不能整個清掉
+      countQueue = countQueue.slice(batch.length);
+      if(res && res.ok) countReconcile_(res.results || []);
+      saveCountState_();
+      renderCount();
+    })
+    .catch(function(){
+      // 送不出去就留在佇列裡等下一輪。畫面上是樂觀值，這裡不回滾——
+      // 回滾會讓現場已經數過的東西憑空消失，比暫時對不上更糟。
+      scheduleCountFlush();
+      renderCount();
+    });
+}
+
+// 後端回應是真相：它知道條碼對到哪個品號、以及這個場次累計到幾件。
+function countReconcile_(results){
+  results.forEach(function(r){
+    if(!r || !r.sku) return;
+    const byCode = countItems.filter(function(x){ return x.key === r.code; })[0];
+    const bySku  = countItems.filter(function(x){ return x.sku === r.sku && x !== byCode; })[0];
+    if(byCode && bySku){
+      // 兩個條碼對到同一個品號 → 併成一列，數量用後端的累計值
+      bySku.qty = Number(r.total) || bySku.qty;
+      bySku.name = bySku.name || r.name || '';
+      countItems = countItems.filter(function(x){ return x !== byCode; });
+      return;
+    }
+    const t = byCode || bySku;
+    if(!t) return;
+    t.sku = r.sku;
+    if(r.name) t.name = r.name;
+    t.qty = Number(r.total) || t.qty;
+    t.pending = false;
+  });
+}
+
+function promptCountQty(sku){
+  if(!countSession) return;
+  const hit = countItems.filter(function(x){ return (x.sku || x.key) === sku; })[0];
+  if(!hit) return;
+  const v = prompt('「' + (hit.name || sku) + '」實際盤到幾件？', String(hit.qty));
+  if(v === null) return;
+  const qty = Number(String(v).trim());
+  if(isNaN(qty) || qty < 0){ errorBeep(); flash('err','數量不對','請輸入 0 或正整數', 1800); return; }
+  if(!hit.sku){ errorBeep(); flash('err','這筆還沒同步完','等「待同步」歸零之後再改', 2000); return; }
+  // 先把還沒送出的掃描送完，不然後端那邊的累計值會蓋掉這次手改的數字
+  Promise.resolve(flushCountQueue()).then(function(){
+    return apiPost('setCountQty', {sessionId: countSession.sessionId, sku: hit.sku, qty: qty});
+  }).then(function(res){
+    if(!res || !res.ok){ errorBeep(); flash('err','改不了數量', (res && res.error) || '', 2500); return; }
+    hit.qty = qty;
+    saveCountState_();
+    renderCount();
+    okBeep();
+  }).catch(function(err){ errorBeep(); flash('err','改不了數量', err.message || '', 2500); });
+}
+
+// 手持機當掉、換人接手、或是隔天接續盤：拿後端的權威清單回來重畫
+function resyncCountSession(){
+  if(!countSession || !hasBackend()) return;
+  apiPost('getCountSession', {sessionId: countSession.sessionId}).then(function(res){
+    if(!res || !res.ok){
+      // 場次在後端不存在了（例如試算表被整理過），本機就不要再抓著它不放
+      countSession = null; countItems = []; countQueue = [];
+      saveCountState_(); renderCount();
+      return;
+    }
+    if(String(res.session.countStatus||'') === '已完成'){
+      countSession = null; countItems = []; countQueue = [];
+      saveCountState_(); renderCount();
+      flash('', '這個場次已經結束了', '如要再盤請開新的場次', 2500);
+      return;
+    }
+    // 還沒送出去的掃描不能被覆蓋掉——先把後端的畫回來，再把佇列裡的加回去
+    countItems = (res.items || []).map(function(x){
+      return {key: x.sku, sku: x.sku, name: x.baseName, qty: x.scanned, at: x.lastScanAt, pending: false};
+    }).reverse();
+    saveCountState_();
+    renderCount();
+    if(countQueue.length) scheduleCountFlush();
+  }).catch(function(){});
+}
+
+function finishCount(){
+  if(!countSession) return;
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線才能結束盤點','對帳要讀庫存表', 2200); return; }
+  if(!confirm('結束「' + countSession.store + '」這次盤點並跟庫存表對帳？\n結束之後就不能再掃了。')) return;
+  const sid = countSession.sessionId, store = countSession.store;
+  Promise.resolve(flushCountQueue()).then(function(){
+    if(countQueue.length){
+      throw new Error('還有 ' + countQueue.length + ' 筆掃描沒送出去，等同步完再結束');
+    }
+    return apiPost('finishCountSession', {sessionId: sid});
+  }).then(function(res){
+    if(!res || !res.ok){ errorBeep(); flash('err','結束失敗', (res && res.error) || '', 3000); return; }
+    countSession = null; countItems = []; countQueue = [];
+    saveCountState_();
+    renderCount();
+    ['countResultLabel','countResultCard'].forEach(function(id){
+      const el = document.getElementById(id); if(el) el.style.display = 'block';
+    });
+    const box = document.getElementById('countResult');
+    if(box){
+      const over = Number(res['未列出的未盤到']) || 0;
+      box.innerHTML = `<div class="row"><div><strong>${store}</strong><div class="hint">${sid}</div></div></div>
+        <div class="row"><div>掃到的品項</div><div><strong>${res['掃到的品項']}</strong></div></div>
+        <div class="row"><div>相符</div><div><strong>${res['相符']}</strong></div></div>
+        <div class="row"><div>有差異（盤盈／盤虧）</div><div><strong>${res['有差異']}</strong></div></div>
+        <div class="row"><div>未盤到（庫存表有、現場沒掃到）</div><div><strong>${res['未盤到']}</strong></div></div>
+        <div class="row"><div>庫存表查無此品號</div><div><strong>${res['庫存表查無此品號']}</strong></div></div>
+        ${over ? `<p class="hint">未盤到的品項超過單次上限，還有 ${over} 筆沒列進明細。</p>` : ''}
+        <p class="hint">逐筆差異在後端試算表「盤點明細」分頁，用場次編號篩選。這次盤點沒有改動任何庫存資料。</p>`;
+    }
+    okBeep();
+    loadCountStores();
+  }).catch(function(err){ errorBeep(); flash('err','結束失敗', err.message || '', 3000); });
+}
+
 pickQueue = loadJSON(LS.pickQueue, []);
 if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就繼續送
+// ---- 門市盤點：接回上次沒做完的場次與沒送完的掃描 ----
+countSession = loadJSON(LS.countSession, null);
+countItems = loadJSON(LS.countItems, []);
+countQueue = loadJSON(LS.countQueue, []);
+if(countQueue.length) scheduleCountFlush();
+wireScanInput(document.getElementById('countScanInput'), countScan);
+document.getElementById('countStartBtn').addEventListener('click', startCount);
+document.getElementById('countFinishBtn').addEventListener('click', finishCount);
+document.getElementById('countAbandonBtn').addEventListener('click', function(){
+  // 刻意不清掉場次：離開只是回首頁，場次還開著，回來還能接續。
+  flushCountQueue();
+  gotoView('home');
+});
+// 跟調撥驗收同樣理由：現場常常掃完就直接切走，趁還看得到頁面把去抖動窗口內的那幾筆送出去
+window.addEventListener('pagehide', function(){ flushCountQueue(); });
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState === 'hidden') flushCountQueue();
+});
+
 // ---- 調撥驗收：同樣把上次沒送完的掃描接著送 ----
 transferQueue = loadJSON(LS.transferQueue, []);
 if(transferQueue.length) scheduleTransferFlush();
