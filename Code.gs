@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.182';
+const BACKEND_VERSION = '2026-10-15.183';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -9164,9 +9164,34 @@ function setupCountSheets_(){
 // 做兩件事：建好兩張分頁，然後立刻把門市欄位對照印出來讓人核對。
 // 欄位核對不是可選步驟——欄位錯不會拋任何錯，只會默默算出一整張假的差異表，
 // 所以把它綁在同一支裡，不給人跳過的機會。
+// Google 偶爾會丟「Service Spreadsheets timed out」——跟程式無關，就是當下試算表忙
+// （IMPORTRANGE 在重算之類）。2026-10-15 第一次跑 setupCount 就撞到，卡在建分頁那一步。
+// 這類逾時重試通常就過了，所以在會踩到它的地方包一層重試，不要讓現場為了 Google
+// 的一次抽風重按一遍、還不知道該不該重按。
+// 只重試逾時／暫時性錯誤：其他錯誤（欄位不存在、權限不足）重試一百次也不會變對，
+// 直接往上拋比較誠實。
+function isTransientSheetError_(err){
+  const m = String((err && err.message) || err || '');
+  return /timed out|internal error|try again|暫時|逾時|service error|Service Spreadsheets/i.test(m);
+}
+function withSheetRetry_(label, fn, tries){
+  const max = tries || 3;
+  let lastErr = null;
+  for(let i = 1; i <= max; i++){
+    try{ return fn(); }
+    catch(err){
+      lastErr = err;
+      if(!isTransientSheetError_(err) || i === max) throw err;
+      Logger.log('（' + label + ' 第 ' + i + ' 次遇到暫時性錯誤，等一下重試）' + err);
+      Utilities.sleep(2000 * i);
+    }
+  }
+  throw lastErr;
+}
+
 function setupCount(){
-  const made = setupCountSheets_();
-  const check = diagnoseStoreStock();
+  const made = withSheetRetry_('建立盤點分頁', setupCountSheets_);
+  const check = withSheetRetry_('讀門市庫存', diagnoseStoreStock);
   const text = '【已建立分頁】' + JSON.stringify(made, null, 2)
              + '\n\n【門市欄位核對】' + check
              + '\n\n請逐家核對「實際讀到的欄位」跟「預期應該是」是不是同一組名稱。'
