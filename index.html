@@ -689,6 +689,12 @@
             <button type="button" class="btn-camera" onclick="openCameraScan(countScan)" title="用相機掃描">📷</button>
           </div>
         </label>
+        <label class="field" style="margin:10px 0 0;flex-direction:row;align-items:center;gap:8px;">
+          <input type="checkbox" id="countIncludeUnscanned" style="width:auto;">
+          <span style="font-weight:400;">也列出「庫存表有、現場沒掃到」的品項（只有全店盤點才勾）</span>
+        </label>
+        <p class="hint" style="margin:4px 0 0;">中華門市有兩萬多個品項有庫存。只盤一區卻勾這個，
+          會拿到一張兩萬多列、幾乎全是假盤虧的表，真正的差異反而被埋住。</p>
         <div class="stack" style="margin-top:10px;">
           <button type="button" class="btn block" id="countFinishBtn">結束盤點並對帳</button>
           <button type="button" class="btn gray block" id="countAbandonBtn">離開（不結束，之後可接續）</button>
@@ -5912,7 +5918,8 @@ function finishCount(){
     if(countQueue.length){
       throw new Error('還有 ' + countQueue.length + ' 筆掃描沒送出去，等同步完再結束');
     }
-    return apiPost('finishCountSession', {sessionId: sid});
+    const inc = !!(document.getElementById('countIncludeUnscanned')||{}).checked;
+    return apiPost('finishCountSession', {sessionId: sid, includeUnscanned: inc});
   }).then(function(res){
     if(!res || !res.ok){ errorBeep(); flash('err','結束失敗', (res && res.error) || '', 3000); return; }
     countSession = null; countItems = []; countQueue = [];
@@ -5924,12 +5931,16 @@ function finishCount(){
     const box = document.getElementById('countResult');
     if(box){
       const over = Number(res['未列出的未盤到']) || 0;
+      const notScanned = Number(res['庫存表中沒被掃到的品項總數']) || 0;
+      const inc = !!res['有列出未盤到嗎'];
       box.innerHTML = `<div class="row"><div><strong>${store}</strong><div class="hint">${sid}</div></div></div>
         <div class="row"><div>掃到的品項</div><div><strong>${res['掃到的品項']}</strong></div></div>
         <div class="row"><div>相符</div><div><strong>${res['相符']}</strong></div></div>
         <div class="row"><div>有差異（盤盈／盤虧）</div><div><strong>${res['有差異']}</strong></div></div>
-        <div class="row"><div>未盤到（庫存表有、現場沒掃到）</div><div><strong>${res['未盤到']}</strong></div></div>
         <div class="row"><div>庫存表查無此品號</div><div><strong>${res['庫存表查無此品號']}</strong></div></div>
+        ${inc
+          ? `<div class="row"><div>未盤到（庫存表有、現場沒掃到）</div><div><strong>${res['未盤到']}</strong></div></div>`
+          : `<p class="hint">庫存表另有 ${notScanned} 個品項這次沒被掃到，未列入差異表（不是全店盤點）。</p>`}
         ${over ? `<p class="hint">未盤到的品項超過單次上限，還有 ${over} 筆沒列進明細。</p>` : ''}
         <p class="hint">逐筆差異在後端試算表「盤點明細」分頁，用場次編號篩選。這次盤點沒有改動任何庫存資料。</p>`;
     }

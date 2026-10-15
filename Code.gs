@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.184';
+const BACKEND_VERSION = '2026-10-15.186';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8811,9 +8811,17 @@ function storeDef_(name){
   const want = String(name||'').trim();
   return STORE_DEFS.filter(function(d){ return d.name === want; })[0] || null;
 }
-// 盤完之後會把「庫存表說有、但現場沒掃到」的品項也列進差異表——那正是盤虧，
-// 不列出來等於盤了一半。但門市品項數不可控，設一個上限免得一次產生上萬列。
-const COUNT_UNSCANNED_MAX = 3000;
+// 「庫存表說有、但現場沒掃到」要不要列進差異表，預設「不要」。
+//
+// 本來預設是要的——理由是「不列出來等於盤了一半」。那個理由建立在「一次盤完整家店」
+// 的假設上，而 2026-10-15 實測把假設打掉了：中華門市有 23,489 個品項有庫存，
+// 士林 2,129、台中 3,886、台南 7,726。兩萬多個品項不可能一次盤完，所以在
+// 「掃到哪算哪」這個模式下，沒掃到的絕大多數是「不在這次範圍內」，不是盤虧。
+// 預設列出來的話，第一次盤完就會拿到一張兩萬多列、幾乎全是假盤虧的表——
+// 那比不列還糟，因為真正的差異會被埋在裡面。
+//
+// 所以改成由呼叫端明確指定 includeUnscanned。真的要做全店盤點時才勾。
+const COUNT_UNSCANNED_MAX = 25000;
 
 // 條碼→品號。掃槍掃到的多半是國際碼，不是品號。
 // 「條碼轉品號」分頁：B品號 C條碼 D品名（既有分頁，skuNameMap_ 也用它）。
@@ -8939,7 +8947,16 @@ function startCountSession(body){
 
   const sh = getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
   const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
-  const sessionId = store + '-' + Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmmss');
+  // 場次編號後面一定要有隨機碼。只用「門市＋到秒的時間戳」的話，同一家店在同一秒內
+  // 開兩個場次就會拿到同一個編號——有人連按兩下「開始盤點」就會發生。而 findCountSession_
+  // 是靠編號找的，撞號的後果是兩次盤點的資料混進同一場，比開不起來嚴重得多。
+  // 測試台用固定時間戳跑的時候當場撞出來了。
+  const rnd = Math.floor(Math.random() * 46656).toString(36).toUpperCase();   // 3 碼 36 進位
+  const sessionId = store + '-' + Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmmss')
+                  + '-' + ('000' + rnd).slice(-3);
+  if(findCountSession_(sessionId)){
+    return {ok:false, error:'場次編號撞號了，請再按一次'};   // 機率極低，但撞了就不要硬開
+  }
   const o = {sessionId: sessionId, countStore: store, counterId: counterId, counterName: counterName,
              startedAt: nowStamp_(), endedAt: '', countStatus: '盤點中',
              countScannedQty: 0, countItemCount: 0, countDiffCount: '', firstDetailRow: '', note: ''};
@@ -9066,6 +9083,7 @@ function setCountQty(body){
 // 庫存快照比較才講得通。
 function finishCountSession(body){
   const sessionId = String((body && body.sessionId) || '').trim();
+  const includeUnscanned = !!(body && body.includeUnscanned);
   if(!sessionId) return {ok:false, error:'缺少 sessionId'};
   const s = findCountSession_(sessionId);
   if(!s) return {ok:false, error:'找不到盤點場次 ' + sessionId};
@@ -9102,10 +9120,13 @@ function finishCountSession(body){
     }
   });
 
-  // 庫存表說有、現場沒掃到 → 盤虧。不列出來等於只盤了一半。
+  // 庫存表說有、現場沒掃到。只有全店盤點時才有意義（見 COUNT_UNSCANNED_MAX 上面的說明）。
   const missing = [];
+  let unscannedTotal = 0;
   snap.withStock.forEach(function(sku){
     if(scannedSku[sku]) return;
+    unscannedTotal++;
+    if(!includeUnscanned) return;
     if(missing.length >= COUNT_UNSCANNED_MAX) return;
     const info = snap.bySku[sku];
     const o = {sessionId: sessionId, countStore: store, sku: sku,
@@ -9114,7 +9135,7 @@ function finishCountSession(body){
                countResult: '未盤到', firstScanAt: '', lastScanAt: ''};
     missing.push(COUNT_DETAIL_HEADER.map(function(h){ return o[h]; }));
   });
-  const missingTruncated = snap.withStock.filter(function(sku){ return !scannedSku[sku]; }).length - missing.length;
+  const missingTruncated = includeUnscanned ? (unscannedTotal - missing.length) : 0;
   diffCount += missing.length;
 
   if(det.rows.length){
@@ -9132,17 +9153,23 @@ function finishCountSession(body){
   s.vals[s.c.endedAt] = nowStamp_();
   s.vals[s.c.countStatus] = '已完成';
   s.vals[s.c.countDiffCount] = diffCount;
+  const notes = [];
   if(missingTruncated > 0){
-    s.vals[s.c.note] = '未盤到的品項超過上限 ' + COUNT_UNSCANNED_MAX
-                     + ' 筆，還有 ' + missingTruncated + ' 筆沒列出來';
+    notes.push('未盤到的品項超過上限 ' + COUNT_UNSCANNED_MAX + ' 筆，還有 ' + missingTruncated + ' 筆沒列出來');
   }
+  if(!includeUnscanned && unscannedTotal > 0){
+    notes.push('庫存表還有 ' + unscannedTotal + ' 個品項沒被掃到，本次未列入（非全店盤點）');
+  }
+  if(notes.length) s.vals[s.c.note] = notes.join('；');
   s.sh.getRange(s.row, 1, 1, COUNT_SESSION_HEADER.length).setValues([s.vals]);
   SpreadsheetApp.flush();
 
   return {ok:true, sessionId: sessionId, store: store,
           掃到的品項: det.rows.length, 相符: okCount, 有差異: diffCount - missing.length,
           未盤到: missing.length, 庫存表查無此品號: unknownCount,
-          未列出的未盤到: Math.max(missingTruncated, 0)};
+          未列出的未盤到: Math.max(missingTruncated, 0),
+          有列出未盤到嗎: includeUnscanned,
+          庫存表中沒被掃到的品項總數: unscannedTotal};
 }
 
 // 讀一個場次現在的狀態。手持機當掉／換人接手時用這支把畫面接回來。
@@ -9249,15 +9276,31 @@ function diagnoseStoreStock(){
     out.實際使用的來源 = open.label + '（資料從第 ' + open.firstRow + ' 列起，共到第 ' + open.lastRow + ' 列）';
     out.來源表頭第2列 = src.getRange(open.firstRow - 1, 1, 1, 12).getValues()[0];
     out.資料第一列 = src.getRange(open.firstRow, 1, 1, 12).getValues()[0];
-    STORE_DEFS.forEach(function(d){
-      const got = d.cols.map(function(c){
-        return '第' + c + '欄=「' + String(out.來源表頭第2列[c - 1] || '') + '」';
+    // 整張讀一次就好。原本每家門市各呼叫一次 storeStockSnapshot_，四家就是把 38,374 列
+    // 讀四遍——實測整支跑了 30 秒，絕大部分花在這裡。
+    const n = open.lastRow - open.firstRow + 1;
+    const vals = src.getRange(open.firstRow, 1, n, 10).getValues();
+    const counts = {};
+    STORE_DEFS.forEach(function(d){ counts[d.name] = 0; });
+    const seen = {};
+    vals.forEach(function(r){
+      const sku = String(r[0]||'').trim();
+      if(!sku || seen[sku]) return;
+      seen[sku] = 1;
+      STORE_DEFS.forEach(function(d){
+        let q = 0;
+        d.cols.forEach(function(c){ q += countNum_(r[c - 1]); });
+        if(q > 0) counts[d.name]++;
       });
-      const snap = storeStockSnapshot_(d.name);
+    });
+    out.品號數 = Object.keys(seen).length;
+    STORE_DEFS.forEach(function(d){
       out['【' + d.name + '】'] = {
-        實際讀到的欄位: got,
+        實際讀到的欄位: d.cols.map(function(c){
+          return '第' + c + '欄=「' + String(out.來源表頭第2列[c - 1] || '') + '」';
+        }),
         預期應該是: d.from,
-        有庫存的品項數: snap.ok ? snap.withStock.length : ('失敗：' + snap.error)
+        有庫存的品項數: counts[d.name]
       };
     });
     out.結論 = '核對每一家門市「實際讀到的欄位」跟「預期應該是」是不是同一組名稱。'

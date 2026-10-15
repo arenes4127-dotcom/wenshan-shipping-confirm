@@ -73,13 +73,13 @@ const barcode = makeSheet('條碼轉品號', [
   ['', 'SKU-D', '4744444444444', '商品D'],
 ]);
 
-let BACKEND = null, CACHE_SS = null;
+let BACKEND = null, CACHE_SS = null, stampSeq = 1;
 const log = [];
 const sandbox = {
   console,
   Logger: { log: m => log.push(String(m)) },
   Session: { getEffectiveUser: () => ({ getEmail: () => 't@e.com' }) },
-  Utilities: { formatDate: (d,tz,f) => '20261015-101500', sleep(){} },
+  Utilities: { formatDate: (d,tz,f) => '20261015-1015' + String(stampSeq++).padStart(2,'0'), sleep(){} },
   CacheService: { getScriptCache: () => ({ get:()=>null, put(){}, remove(){}, getAll:()=>({}), putAll(){}, removeAll(){} }) },
   LockService: { getScriptLock: () => ({ tryLock:()=>true, releaseLock(){}, waitLock(){} }) },
   ScriptApp: { getProjectTriggers:()=>[], WeekDay:{MONDAY:1}, TriggerSource:{CLOCK:'CLOCK'} },
@@ -174,7 +174,7 @@ const gs = X.getCountSession({sessionId: SID});
 ck('讀得回來', gs.ok === true && gs.items.length === 3, gs.ok && gs.items.length);
 
 console.log('\n【結束盤點＋對帳】秀山莊-中華門市：A應5實3(盤虧2)、B應3實10(盤盈7)、D應4未盤到、9999查無');
-const fin = X.finishCountSession({sessionId: SID});
+const fin = X.finishCountSession({sessionId: SID, includeUnscanned: true});
 console.log('  回傳：', JSON.stringify(fin));
 ck('結束成功', fin.ok === true, fin);
 ck('未盤到 1 筆（SKU-D）', fin['未盤到'] === 1, fin['未盤到']);
@@ -201,7 +201,7 @@ ck('9999 標成查無此品號', detail['9999999999999'] && detail['999999999999
 console.log('\n【另一家門市分開對帳】ODM-台南門市 = H：A應2、C應7、D應1');
 const st2 = X.startCountSession({store:'ODM-台南門市', counterId:'02', counterName:'小華'});
 X.countScanBatch({sessionId: st2.sessionId, ops:[{code:'SKU-A', qty:2}]});
-const fin2 = X.finishCountSession({sessionId: st2.sessionId});
+const fin2 = X.finishCountSession({sessionId: st2.sessionId, includeUnscanned: true});
 console.log('  回傳：', JSON.stringify(fin2));
 const d2 = {};
 det._rows.slice(1).forEach(row=>{ if(row[0]===st2.sessionId && row[iSku]) d2[row[iSku]] = row; });
@@ -214,7 +214,21 @@ ck('台南 SKU-B 不該出現（H0 又沒掃）', !d2['SKU-B'], d2['SKU-B']);
 ck('兩場次互不干擾：中華那場 SKU-A 應有仍是 5', detail['SKU-A'][iEx]===5);
 
 const ls = X.listCountSessions({});
+ck('場次編號帶隨機碼（不會同秒撞號）', /-[0-9A-Z]{3}$/.test(SID), SID);
 ck('場次清單有兩筆、最新在前', ls.ok && ls.sessions.length===2 && ls.sessions[0].sessionId===st2.sessionId, ls.sessions && ls.sessions.length);
+
+console.log('\n【預設不列未盤到】只盤一區卻列出整店未盤到 = 一張假盤虧表');
+const st3 = X.startCountSession({store:'秀山莊-中華門市', counterId:'03', counterName:'小美'});
+X.countScanBatch({sessionId: st3.sessionId, ops:[{code:'SKU-A', qty:5}]});
+const fin3 = X.finishCountSession({sessionId: st3.sessionId});   // 不傳 includeUnscanned
+console.log('  回傳：', JSON.stringify(fin3));
+ck('預設不列未盤到', fin3['未盤到'] === 0, fin3['未盤到']);
+ck('但仍誠實回報有幾個沒掃到', fin3['庫存表中沒被掃到的品項總數'] === 2, fin3['庫存表中沒被掃到的品項總數']);
+ck('有列出未盤到嗎=false', fin3['有列出未盤到嗎'] === false);
+const d3 = {};
+det._rows.slice(1).forEach(row=>{ if(row[0]===st3.sessionId && row[iSku]) d3[row[iSku]] = row; });
+ck('明細只有掃到的那一筆', Object.keys(d3).length === 1 && d3['SKU-A'], Object.keys(d3));
+ck('掃到的那筆仍然有對帳（應5實5相符）', d3['SKU-A'][iEx]===5 && d3['SKU-A'][iRs]==='相符', d3['SKU-A']);
 
 console.log('\n【備援】主來源整個不見時要退回鏡像，而不是整個停擺');
 const savedStock = STOCK_SS;
