@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-14.178';
+const BACKEND_VERSION = '2026-10-15.180';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -102,6 +102,13 @@ const HEADER_LABELS = {
   orderDate:'訂單日期', waybill:'運單編號', staffId:'包貨人員工號', staffName:'包貨人員姓名',
   time:'完成時間', hadIssue:'曾觸發警示', hadManualEdit:'曾手動修改數量', importedExternal:'外部匯入',
   shipMethod:'寄送方式', note:'備註', id:'工號', name:'姓名',
+  // 門市盤點。刻意不重用 store/staffId/qty 這些已經有別的語意的 key，
+  // 撞名之後標題會在別的分頁上變成錯的字。
+  sessionId:'場次編號', countStore:'門市', counterId:'盤點人工號', counterName:'盤點人姓名',
+  startedAt:'開始時間', endedAt:'結束時間', countStatus:'狀態',
+  countScannedQty:'掃描件數', countItemCount:'品項數', countDiffCount:'差異品項數',
+  firstDetailRow:'明細起始列', countScanned:'實盤數', countExpected:'庫存表數量',
+  countDiff:'差異', countResult:'核對結果', firstScanAt:'首次掃描', lastScanAt:'最後掃描',
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
@@ -136,7 +143,8 @@ function doGet(e){
 // 讓查詢彼此、以及查詢跟寫入都能並行，不用排隊等同一把鎖。
 const NO_LOCK_ACTIONS = {
   lookupLocation: 1, lookupLocations: 1, getLocationVocab: 1, findSiblingSkus: 1,
-  listLocationContents: 1, getShopeePriceInfo: 1, getTransferPending: 1, __versioncheck__: 1
+  listLocationContents: 1, getShopeePriceInfo: 1, getTransferPending: 1, __versioncheck__: 1,
+  getCountSession: 1, listCountSessions: 1
 };
 
 // ---------------- 寫入鎖 ----------------
@@ -209,6 +217,12 @@ function doPost(e){
       case 'scanTransferBatch': result = scanTransferBatch(body.ops || []); break;
       case 'closeTransferItem': result = closeTransferItem(body); break;
       case 'refreshProductImages': result = importProductImages_(); break;
+      case 'startCountSession': result = startCountSession(body); break;
+      case 'countScanBatch': result = countScanBatch(body); break;
+      case 'setCountQty': result = setCountQty(body); break;
+      case 'finishCountSession': result = finishCountSession(body); break;
+      case 'getCountSession': result = getCountSession(body); break;
+      case 'listCountSessions': result = listCountSessions(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -304,6 +318,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   odmAppendRows_: (arg) => odmAppendRows_(arg && arg.rows),
   diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
   diagnoseTriggers_: () => diagnoseTriggers_(),
+  setupCountSheets_: () => setupCountSheets_(),
   peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
@@ -793,7 +808,8 @@ function systemSheetNotesMap_(){
   const notes = {};
   notes[SHEET_ORDERS] = ORDERS_SHEET_WARNING;
   notes[SHEET_STAFF] = STAFF_SHEET_WARNING;
-  [SHEET_LOG, SHEET_SYSLOG, SHEET_PICKLOG, SHEET_LOCLOG, SHEET_TRANSFER, SHEET_TRANSFERLOG]
+  [SHEET_LOG, SHEET_SYSLOG, SHEET_PICKLOG, SHEET_LOCLOG, SHEET_TRANSFER, SHEET_TRANSFERLOG,
+   SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL]
     .forEach(function(n){ notes[n] = SYSTEM_SHEET_WARNING; });
   // 這 5 張版面是自訂的（不是走 getSheet()），各自的建立函式裡本來就有各自的附註，
   // 這裡是給「回填」用的同一套文字，跟那幾個函式裡寫的內容一致。
@@ -8735,4 +8751,436 @@ function testShopeeUpdateStage_(){
     ck(targetSh.getLastRow() === beforeTargetRows, '目標表已清乾淨、列數還原');
   }
   return {全部通過: steps.every(function(x){ return x.indexOf('✅') === 0; }), 明細: steps};
+}
+
+// ================= 門市商品盤點 =================
+// 需求：兩家門市（中華門市倉、門外漢門市倉）現場清點，掃到哪算哪，盤完跟庫存表對帳
+// 產出差異表。刻意「不回寫」任何既有庫存欄位——盤點只負責呈現事實，要不要調整庫存
+// 是人的決定，而且「文山核對 工作區」使用者交代過唯讀。
+//
+// 門市庫存的來源：「山物倉地圖 / 庫存表」，欄位佈局
+//   A品號 B品名 C規格 D ODM士林倉 E三相之力 F山物獵人網購倉
+//   G中華門市倉 H門外漢門市倉 I網購庫存倉 J總倉 K商品在途倉 L總計
+// 不直接開那份外部試算表（實測開一次 350~570ms），改讀既有的鏡像分頁
+// LOC_SYNC_TAB「山物地圖(快取)」——它是同一套欄位佈局，現有的
+// LOC_SYNC_STOCK_COLS=[9,10]（I、J）正好可以互相驗證對照沒算錯。
+const SHEET_COUNT_SESSION = '盤點場次';
+const SHEET_COUNT_DETAIL  = '盤點明細';
+const COUNT_SESSION_HEADER = ['sessionId','countStore','counterId','counterName','startedAt','endedAt',
+  'countStatus','countScannedQty','countItemCount','countDiffCount','firstDetailRow','note'];
+const COUNT_DETAIL_HEADER = ['sessionId','countStore','sku','baseName','spec','countScanned',
+  'countExpected','countDiff','countResult','firstScanAt','lastScanAt'];
+// 庫存表的欄位名稱跟實際門市名稱不是一對一，對照由使用者提供：
+//   D ODM士林倉      → ODM-士林門市
+//   E 三相之力        → ODM-台中門市
+//   F 山物獵人網購倉  → ODM-網路倉庫        （倉庫，不是門市）
+//   G 中華門市倉      → 秀山莊-中華門市
+//   H 門外漢門市倉    → ODM-台中門市
+//   I 網購庫存倉      → 秀山莊通路-網路倉庫  （倉庫，不是門市）
+//   J 總倉            → 秀山莊通路-網路倉庫  （倉庫，不是門市）
+//
+// ⚠️ 注意「ODM-台中門市」對到兩個欄位（E 三相之力、H 門外漢門市倉）。所以門市不能
+// 只記一個欄號，必須是一組欄號、取總和——同一家店的貨分記在兩欄，只看一欄就會把
+// 另一欄的數量全部算成盤盈。這個加總行為是刻意的；如果其實只該算其中一欄，
+// 改 cols 就好，不用動其他程式。
+// 兩個「網路倉庫」不列進盤點選單：那是倉庫不是門市，這個功能是門市盤點。
+const STORE_DEFS = [
+  {name: 'ODM-士林門市',    cols: [4],    from: ['D ODM士林倉']},
+  {name: 'ODM-台中門市',    cols: [5, 8], from: ['E 三相之力', 'H 門外漢門市倉']},
+  {name: '秀山莊-中華門市', cols: [7],    from: ['G 中華門市倉']}
+];
+const STORE_LIST = STORE_DEFS.map(function(d){ return d.name; });
+function storeDef_(name){
+  const want = String(name||'').trim();
+  return STORE_DEFS.filter(function(d){ return d.name === want; })[0] || null;
+}
+// 盤完之後會把「庫存表說有、但現場沒掃到」的品項也列進差異表——那正是盤虧，
+// 不列出來等於盤了一半。但門市品項數不可控，設一個上限免得一次產生上萬列。
+const COUNT_UNSCANNED_MAX = 3000;
+
+// 條碼→品號。掃槍掃到的多半是國際碼，不是品號。
+// 「條碼轉品號」分頁：B品號 C條碼 D品名（既有分頁，skuNameMap_ 也用它）。
+// 兩邊都收進同一張表：掃國際碼或直接掃品號都要認得。
+function barcodeToSkuMap_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('條碼轉品號');
+  const map = {};
+  if(!sh) return map;
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return map;
+  const values = sh.getRange(2, 2, lastRow - 1, 3).getValues();
+  values.forEach(function(r){
+    const sku  = String(r[0]||'').trim();
+    const code = String(r[1]||'').trim();
+    const name = String(r[2]||'').trim();
+    if(code && !map[code]) map[code] = {sku: sku, name: name};
+    if(sku  && !map[sku])  map[sku]  = {sku: sku, name: name};
+  });
+  return map;
+}
+
+function countNum_(v){
+  const s = String(v == null ? '' : v).trim().replace(/,/g, '');
+  if(s === '') return 0;
+  const n = Number(s);
+  return isNaN(n) ? 0 : n;
+}
+
+// 把整張庫存快取的「某一家門市」讀成一份快照。
+// 一次 getRange 把 A~J 讀下來，不要每個品號各讀一列——盤完一次要查上百個品號，
+// 逐列讀就是上百次 RPC。而且「沒掃到但庫存說有」那段本來就得整欄看過。
+function storeStockSnapshot_(store){
+  const def = storeDef_(store);
+  if(!def) return {ok:false, error:'不認得的門市：' + store};
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
+  const src = ss.getSheetByName(LOC_SYNC_TAB);
+  if(!src) return {ok:false, error:'找不到「' + LOC_SYNC_TAB + '」分頁'};
+  const last = src.getLastRow();
+  const n = last - LOC_SYNC_FIRST_ROW + 1;
+  if(n < 1) return {ok:false, error:'庫存快取沒有資料列'};
+  const vals = src.getRange(LOC_SYNC_FIRST_ROW, 1, n, 10).getValues();
+  const bySku = {}, withStock = [];
+  vals.forEach(function(r){
+    const sku = String(r[0]||'').trim();
+    if(!sku || bySku[sku]) return;
+    let expected = 0;
+    def.cols.forEach(function(c){ expected += countNum_(r[c - 1]); });
+    bySku[sku] = {baseName: String(r[1]||'').trim(), spec: String(r[2]||'').trim(), expected: expected};
+    if(expected > 0) withStock.push(sku);
+  });
+  return {ok:true, bySku: bySku, withStock: withStock, rowsScanned: vals.length,
+          store: store, cols: def.cols};
+}
+
+function countSessionCol_(){
+  const c = {};
+  COUNT_SESSION_HEADER.forEach(function(h){ c[h] = colOf(COUNT_SESSION_HEADER, h) - 1; });
+  return c;
+}
+function countDetailCol_(){
+  const c = {};
+  COUNT_DETAIL_HEADER.forEach(function(h){ c[h] = colOf(COUNT_DETAIL_HEADER, h) - 1; });
+  return c;
+}
+
+// 場次分頁很小（一天幾筆），整張讀沒問題，不需要像訂單那樣建索引。
+function findCountSession_(sessionId){
+  const sh = getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
+  const last = sh.getLastRow();
+  if(last < 2) return null;
+  const vals = sh.getRange(2, 1, last - 1, COUNT_SESSION_HEADER.length).getValues();
+  const c = countSessionCol_();
+  for(let i = 0; i < vals.length; i++){
+    if(String(vals[i][c.sessionId]||'').trim() === sessionId){
+      return {sh: sh, row: i + 2, vals: vals[i], c: c};
+    }
+  }
+  return null;
+}
+
+// 明細只讀「這個場次可能落在的範圍」：場次開始時記下 firstDetailRow，從那裡讀到最後一列。
+// 多家門市同時盤的話中間會夾到別場的列，用 sessionId 濾掉即可——仍然遠小於整張掃。
+function readCountDetail_(sessionId, firstDetailRow){
+  const sh = getSheet(SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER);
+  const last = sh.getLastRow();
+  const start = Math.max(Number(firstDetailRow) || 2, 2);
+  const out = {sh: sh, rows: [], c: countDetailCol_(), lastRow: last};
+  if(last < start) return out;
+  const vals = sh.getRange(start, 1, last - start + 1, COUNT_DETAIL_HEADER.length).getValues();
+  vals.forEach(function(v, i){
+    if(String(v[out.c.sessionId]||'').trim() === sessionId) out.rows.push({_row: start + i, v: v});
+  });
+  return out;
+}
+
+function startCountSession(body){
+  const store = String((body && body.store) || '').trim();
+  if(STORE_LIST.indexOf(store) < 0){
+    return {ok:false, error:'請選擇門市（' + STORE_LIST.join('、') + '）'};
+  }
+  const counterId = String((body && body.counterId) || '').trim();
+  const counterName = String((body && body.counterName) || '').trim();
+  if(!counterId && !counterName) return {ok:false, error:'請先選擇盤點人'};
+
+  const sh = getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const sessionId = store + '-' + Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmmss');
+  const o = {sessionId: sessionId, countStore: store, counterId: counterId, counterName: counterName,
+             startedAt: nowStamp_(), endedAt: '', countStatus: '盤點中',
+             countScannedQty: 0, countItemCount: 0, countDiffCount: '', firstDetailRow: '', note: ''};
+  const row = sh.getLastRow() + 1;
+  sh.getRange(row, 1, 1, COUNT_SESSION_HEADER.length)
+    .setValues([COUNT_SESSION_HEADER.map(function(h){ return o[h]; })]);
+  return {ok:true, sessionId: sessionId, store: store, startedAt: o.startedAt};
+}
+
+// 批次收掃描。前端是樂觀渲染＋背景送出，所以這裡一次會收到好幾筆。
+function countScanBatch(body){
+  const sessionId = String((body && body.sessionId) || '').trim();
+  const ops = (body && body.ops) || [];
+  if(!sessionId) return {ok:false, error:'缺少 sessionId'};
+  if(!ops.length) return {ok:true, results:[]};
+
+  const s = findCountSession_(sessionId);
+  if(!s) return {ok:false, error:'找不到盤點場次 ' + sessionId};
+  if(String(s.vals[s.c.countStatus]||'').trim() !== '盤點中'){
+    return {ok:false, error:'這個場次已經結束了，不能再掃'};
+  }
+  const store = String(s.vals[s.c.countStore]||'').trim();
+
+  const codeMap = barcodeToSkuMap_();
+  const det = readCountDetail_(sessionId, s.vals[s.c.firstDetailRow]);
+  const dc = det.c;
+  const bySku = {};
+  det.rows.forEach(function(r){ bySku[String(r.v[dc.sku]||'').trim()] = r; });
+
+  const results = [], appended = [];
+  const touched = {};
+  ops.forEach(function(op){
+    const code = String((op && op.code) || '').trim();
+    if(!code) return;
+    const qty = countNum_(op && op.qty) || 1;
+    const at = String((op && op.at) || '') || nowStamp_();
+    const hit = codeMap[code];
+    const sku = hit ? hit.sku : code;        // 查不到就原樣當品號記著，盤完對帳時會標出來
+    const name = hit ? hit.name : '';
+
+    const exist = bySku[sku];
+    if(exist){
+      exist.v[dc.countScanned] = countNum_(exist.v[dc.countScanned]) + qty;
+      exist.v[dc.lastScanAt] = at;
+      if(!String(exist.v[dc.baseName]||'').trim() && name) exist.v[dc.baseName] = name;
+      // 只有「本來就在表上」的列才需要回寫。同一批次裡重複掃同一個碼時，exist 會是
+      // 這批剛建的暫存列（_row 還是 null，等一下才一起 append），把它混進 touched
+      // 會讓 touched[null] 變成 NaN 列號。測試台抓到的第一個 bug 就是這個。
+      if(exist._row) touched[exist._row] = exist;
+      results.push({code: code, sku: sku, name: String(exist.v[dc.baseName]||''),
+                    total: countNum_(exist.v[dc.countScanned]), known: !!hit});
+    } else {
+      const o = {sessionId: sessionId, countStore: store, sku: sku, baseName: name, spec: '',
+                 countScanned: qty, countExpected: '', countDiff: '', countResult: '',
+                 firstScanAt: at, lastScanAt: at};
+      const rowVals = COUNT_DETAIL_HEADER.map(function(h){ return o[h]; });
+      const stub = {_row: null, v: rowVals};
+      bySku[sku] = stub;
+      appended.push(stub);
+      results.push({code: code, sku: sku, name: name, total: qty, known: !!hit});
+    }
+  });
+
+  // 已存在的列：用 min..max 一次讀寫，不要每列各寫一次
+  const touchedRows = Object.keys(touched).map(Number).sort(function(a,b){ return a-b; });
+  if(touchedRows.length){
+    const minR = touchedRows[0], maxR = touchedRows[touchedRows.length - 1];
+    const span = det.sh.getRange(minR, 1, maxR - minR + 1, COUNT_DETAIL_HEADER.length).getValues();
+    touchedRows.forEach(function(r){ span[r - minR] = touched[r].v; });
+    det.sh.getRange(minR, 1, span.length, COUNT_DETAIL_HEADER.length).setValues(span);
+  }
+  let firstDetailRow = Number(s.vals[s.c.firstDetailRow]) || 0;
+  if(appended.length){
+    const start = det.sh.getLastRow() + 1;
+    det.sh.getRange(start, 1, appended.length, COUNT_DETAIL_HEADER.length)
+          .setValues(appended.map(function(a){ return a.v; }));
+    appended.forEach(function(a, i){ a._row = start + i; });
+    if(!firstDetailRow) firstDetailRow = start;
+  }
+
+  // 場次上的累計數字（純粹給人看進度，不是對帳依據）
+  let totalQty = 0, itemCount = 0;
+  Object.keys(bySku).forEach(function(k){
+    totalQty += countNum_(bySku[k].v[dc.countScanned]); itemCount++;
+  });
+  s.vals[s.c.countScannedQty] = totalQty;
+  s.vals[s.c.countItemCount] = itemCount;
+  s.vals[s.c.firstDetailRow] = firstDetailRow || '';
+  s.sh.getRange(s.row, 1, 1, COUNT_SESSION_HEADER.length).setValues([s.vals]);
+
+  return {ok:true, results: results, scannedQty: totalQty, itemCount: itemCount};
+}
+
+// 手動改數量：整箱的東西不會一件一件掃，現場一定要能直接填。
+function setCountQty(body){
+  const sessionId = String((body && body.sessionId) || '').trim();
+  const sku = String((body && body.sku) || '').trim();
+  if(!sessionId || !sku) return {ok:false, error:'缺少 sessionId 或 sku'};
+  const qty = countNum_(body && body.qty);
+  if(qty < 0) return {ok:false, error:'數量不能是負數'};
+
+  const s = findCountSession_(sessionId);
+  if(!s) return {ok:false, error:'找不到盤點場次 ' + sessionId};
+  if(String(s.vals[s.c.countStatus]||'').trim() !== '盤點中'){
+    return {ok:false, error:'這個場次已經結束了，不能再改'};
+  }
+  const det = readCountDetail_(sessionId, s.vals[s.c.firstDetailRow]);
+  const dc = det.c;
+  const hit = det.rows.filter(function(r){ return String(r.v[dc.sku]||'').trim() === sku; })[0];
+  if(!hit) return {ok:false, error:'這個場次裡沒有品號 ' + sku};
+  hit.v[dc.countScanned] = qty;
+  hit.v[dc.lastScanAt] = nowStamp_();
+  det.sh.getRange(hit._row, 1, 1, COUNT_DETAIL_HEADER.length).setValues([hit.v]);
+
+  let totalQty = 0;
+  det.rows.forEach(function(r){ totalQty += countNum_(r.v[dc.countScanned]); });
+  s.vals[s.c.countScannedQty] = totalQty;
+  s.sh.getRange(s.row, 1, 1, COUNT_SESSION_HEADER.length).setValues([s.vals]);
+  return {ok:true, sku: sku, qty: qty, scannedQty: totalQty};
+}
+
+// 結束盤點：這時候才去跟庫存表對帳。
+// 刻意不在掃描當下對帳——掃描要快，而且現場邊掃邊進貨的話，用同一個時間點的
+// 庫存快照比較才講得通。
+function finishCountSession(body){
+  const sessionId = String((body && body.sessionId) || '').trim();
+  if(!sessionId) return {ok:false, error:'缺少 sessionId'};
+  const s = findCountSession_(sessionId);
+  if(!s) return {ok:false, error:'找不到盤點場次 ' + sessionId};
+  if(String(s.vals[s.c.countStatus]||'').trim() !== '盤點中'){
+    return {ok:false, error:'這個場次已經結束過了'};
+  }
+  const store = String(s.vals[s.c.countStore]||'').trim();
+  const snap = storeStockSnapshot_(store);
+  if(!snap.ok) return {ok:false, error:'讀不到門市庫存：' + snap.error};
+
+  const det = readCountDetail_(sessionId, s.vals[s.c.firstDetailRow]);
+  const dc = det.c;
+  const scannedSku = {};
+  let diffCount = 0, okCount = 0, unknownCount = 0;
+
+  det.rows.forEach(function(r){
+    const sku = String(r.v[dc.sku]||'').trim();
+    scannedSku[sku] = 1;
+    const info = snap.bySku[sku];
+    const scanned = countNum_(r.v[dc.countScanned]);
+    if(!info){
+      r.v[dc.countExpected] = '';
+      r.v[dc.countDiff] = '';
+      r.v[dc.countResult] = '庫存表查無此品號';
+      unknownCount++;
+    } else {
+      if(!String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = info.baseName;
+      if(!String(r.v[dc.spec]||'').trim()) r.v[dc.spec] = info.spec;
+      r.v[dc.countExpected] = info.expected;
+      const d = scanned - info.expected;
+      r.v[dc.countDiff] = d;
+      r.v[dc.countResult] = d === 0 ? '相符' : (d > 0 ? '盤盈' : '盤虧');
+      if(d === 0) okCount++; else diffCount++;
+    }
+  });
+
+  // 庫存表說有、現場沒掃到 → 盤虧。不列出來等於只盤了一半。
+  const missing = [];
+  snap.withStock.forEach(function(sku){
+    if(scannedSku[sku]) return;
+    if(missing.length >= COUNT_UNSCANNED_MAX) return;
+    const info = snap.bySku[sku];
+    const o = {sessionId: sessionId, countStore: store, sku: sku,
+               baseName: info.baseName, spec: info.spec,
+               countScanned: 0, countExpected: info.expected, countDiff: -info.expected,
+               countResult: '未盤到', firstScanAt: '', lastScanAt: ''};
+    missing.push(COUNT_DETAIL_HEADER.map(function(h){ return o[h]; }));
+  });
+  const missingTruncated = snap.withStock.filter(function(sku){ return !scannedSku[sku]; }).length - missing.length;
+  diffCount += missing.length;
+
+  if(det.rows.length){
+    const rowsAsc = det.rows.slice().sort(function(a,b){ return a._row - b._row; });
+    const minR = rowsAsc[0]._row, maxR = rowsAsc[rowsAsc.length - 1]._row;
+    const span = det.sh.getRange(minR, 1, maxR - minR + 1, COUNT_DETAIL_HEADER.length).getValues();
+    rowsAsc.forEach(function(r){ span[r._row - minR] = r.v; });
+    det.sh.getRange(minR, 1, span.length, COUNT_DETAIL_HEADER.length).setValues(span);
+  }
+  if(missing.length){
+    det.sh.getRange(det.sh.getLastRow() + 1, 1, missing.length, COUNT_DETAIL_HEADER.length)
+          .setValues(missing);
+  }
+
+  s.vals[s.c.endedAt] = nowStamp_();
+  s.vals[s.c.countStatus] = '已完成';
+  s.vals[s.c.countDiffCount] = diffCount;
+  if(missingTruncated > 0){
+    s.vals[s.c.note] = '未盤到的品項超過上限 ' + COUNT_UNSCANNED_MAX
+                     + ' 筆，還有 ' + missingTruncated + ' 筆沒列出來';
+  }
+  s.sh.getRange(s.row, 1, 1, COUNT_SESSION_HEADER.length).setValues([s.vals]);
+  SpreadsheetApp.flush();
+
+  return {ok:true, sessionId: sessionId, store: store,
+          掃到的品項: det.rows.length, 相符: okCount, 有差異: diffCount - missing.length,
+          未盤到: missing.length, 庫存表查無此品號: unknownCount,
+          未列出的未盤到: Math.max(missingTruncated, 0)};
+}
+
+// 讀一個場次現在的狀態。手持機當掉／換人接手時用這支把畫面接回來。
+function getCountSession(body){
+  const sessionId = String((body && body.sessionId) || '').trim();
+  if(!sessionId) return {ok:false, error:'缺少 sessionId'};
+  const s = findCountSession_(sessionId);
+  if(!s) return {ok:false, error:'找不到盤點場次 ' + sessionId};
+  const det = readCountDetail_(sessionId, s.vals[s.c.firstDetailRow]);
+  const dc = det.c;
+  const items = det.rows.map(function(r){
+    return {sku: String(r.v[dc.sku]||''), baseName: String(r.v[dc.baseName]||''),
+            spec: String(r.v[dc.spec]||''), scanned: countNum_(r.v[dc.countScanned]),
+            expected: r.v[dc.countExpected], diff: r.v[dc.countDiff],
+            result: String(r.v[dc.countResult]||''), lastScanAt: String(r.v[dc.lastScanAt]||'')};
+  });
+  const o = {};
+  COUNT_SESSION_HEADER.forEach(function(h){ o[h] = s.vals[s.c[h]]; });
+  return {ok:true, session: o, items: items};
+}
+
+// 最近的場次清單。預設只給最近 30 筆，不要把整張搬到手持機上。
+function listCountSessions(body){
+  const limit = Math.max(1, Math.min(Number((body && body.limit) || 30), 200));
+  const sh = getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
+  const last = sh.getLastRow();
+  if(last < 2) return {ok:true, sessions: [], stores: STORE_LIST};
+  const start = Math.max(2, last - limit + 1);
+  const vals = sh.getRange(start, 1, last - start + 1, COUNT_SESSION_HEADER.length).getValues();
+  const c = countSessionCol_();
+  const sessions = vals.map(function(v){
+    const o = {};
+    COUNT_SESSION_HEADER.forEach(function(h){ o[h] = v[c[h]]; });
+    return o;
+  }).reverse();
+  return {ok:true, sessions: sessions, stores: STORE_LIST};
+}
+
+// 一次性設定：建好兩張分頁並附上系統警語。
+function setupCountSheets_(){
+  getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
+  getSheet(SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER);
+  return {已建立: [SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL], 門市: STORE_LIST};
+}
+
+// 唯讀診斷：確認門市庫存欄對到的是不是真的那一欄。
+// 欄位對錯整個盤點就沒有意義，而且錯了不會拋錯、只會默默算出一堆假差異——
+// 所以上線前一定要用真資料看一眼。
+function diagnoseStoreStock(){
+  const out = {快取分頁: LOC_SYNC_TAB,
+               門市欄位對照: STORE_DEFS.map(function(d){
+                 return d.name + ' ← ' + d.from.join(' ＋ ');
+               })};
+  try{
+    const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
+    const src = ss.getSheetByName(LOC_SYNC_TAB);
+    if(!src){ out.結論 = '找不到快取分頁'; Logger.log(JSON.stringify(out,null,2)); return JSON.stringify(out,null,2); }
+    // 第2列是來源庫存表自己的表頭（見 LOC_SYNC_FIRST_ROW 的說明）
+    out.來源表頭第2列 = src.getRange(2, 1, 1, 12).getValues()[0];
+    out.資料第一列 = src.getRange(LOC_SYNC_FIRST_ROW, 1, 1, 12).getValues()[0];
+    STORE_DEFS.forEach(function(d){
+      const got = d.cols.map(function(c){
+        return '第' + c + '欄=「' + String(out.來源表頭第2列[c - 1] || '') + '」';
+      });
+      const snap = storeStockSnapshot_(d.name);
+      out['【' + d.name + '】'] = {
+        實際讀到的欄位: got,
+        預期應該是: d.from,
+        有庫存的品項數: snap.ok ? snap.withStock.length : ('失敗：' + snap.error)
+      };
+    });
+    out.結論 = '核對每一家門市「實際讀到的欄位」跟「預期應該是」是不是同一組名稱。'
+             + '對不上就是欄位位移了——欄位錯不會拋錯，只會默默算出一整張假的差異表。';
+  }catch(err){ out.結論 = '拋錯：' + err; }
+  Logger.log(JSON.stringify(out, null, 2));
+  return JSON.stringify(out, null, 2);
 }
