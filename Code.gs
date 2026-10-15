@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.187';
+const BACKEND_VERSION = '2026-10-15.189';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -108,7 +108,8 @@ const HEADER_LABELS = {
   startedAt:'開始時間', endedAt:'結束時間', countStatus:'狀態',
   countScannedQty:'掃描件數', countItemCount:'品項數', countDiffCount:'差異品項數',
   firstDetailRow:'明細起始列', countScanned:'實盤數', countExpected:'庫存表數量',
-  countDiff:'差異', countResult:'核對結果', firstScanAt:'首次掃描', lastScanAt:'最後掃描',
+  countDiff:'差異', countResult:'核對結果',
+  firstScanAt:'首次掃描', lastScanAt:'最後掃描', otherStock:'其他據點庫存',
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
@@ -8769,8 +8770,11 @@ const SHEET_COUNT_SESSION = '盤點場次';
 const SHEET_COUNT_DETAIL  = '盤點明細';
 const COUNT_SESSION_HEADER = ['sessionId','countStore','counterId','counterName','startedAt','endedAt',
   'countStatus','countScannedQty','countItemCount','countDiffCount','firstDetailRow','note'];
+// otherStock 刻意加在「最後面」而不是插在 countResult 後面。
+// 插在中間的話，既有資料列的欄位會整排錯位——表頭往後移了，但舊列沒有動，
+// 於是舊列的「首次掃描」會出現在「其他據點庫存」底下。加在尾端，舊列只是這一欄空白。
 const COUNT_DETAIL_HEADER = ['sessionId','countStore','sku','baseName','spec','countScanned',
-  'countExpected','countDiff','countResult','firstScanAt','lastScanAt'];
+  'countExpected','countDiff','countResult','firstScanAt','lastScanAt','otherStock'];
 // 庫存表的欄位名稱跟實際門市名稱不是一對一，對照由使用者提供：
 //   D ODM士林倉      → ODM-士林門市
 //   E 三相之力        → ODM-台中門市
@@ -8800,6 +8804,31 @@ const STORE_STOCK_FIRST_ROW = 2;
 // 鏡像還留著當備援：來源那份是別人的試算表（owner ec@outdoorman.co），
 // 哪天被收回權限或改名時，至少還有一條路可以走，而不是整個功能停擺。
 const STORE_STOCK_FALLBACK = {id: LOCMAP_SOURCE_ID, tab: LOC_SYNC_TAB, firstRow: LOC_SYNC_FIRST_ROW};
+
+// 「這個品號在哪裡有貨」要看完整的 8 個庫存欄位，不是只有門市那 4 欄。
+// I 網購庫存倉 與 J 總倉 的對照名稱相同（都是秀山莊通路-網路倉庫），所以顯示時
+// 一律附上原始欄名，否則同一個名字出現兩次會看不懂是哪一欄。
+// K 商品在途倉、P 台南總倉 使用者沒給對照，用原欄名並註明。
+const LOCATION_DEFS = [
+  {col: 4,  raw: 'ODM士林倉',      name: 'ODM-士林門市'},
+  {col: 5,  raw: '三相之力',        name: 'ODM-台中門市'},
+  {col: 6,  raw: '山物獵人網購倉',  name: 'ODM-網路倉庫'},
+  {col: 7,  raw: '中華門市倉',      name: '秀山莊-中華門市'},
+  {col: 8,  raw: '門外漢門市倉',    name: 'ODM-台南門市'},
+  {col: 9,  raw: '網購庫存倉',      name: '秀山莊通路-網路倉庫'},
+  {col: 10, raw: '總倉',            name: '秀山莊通路-網路倉庫'},
+  {col: 11, raw: '商品在途倉',      name: '商品在途倉'},
+  {col: 16, raw: '台南總倉',        name: '台南總倉'}
+];
+const STOCK_READ_COLS = 16;   // 讀到 P 欄，才涵蓋得到台南總倉
+
+// 品號正規化：去掉空白與連字號、轉大寫。
+// 「庫存表查無此品號」有一部分其實是格式差異造成的假陰性（大小寫、多一個空白），
+// 那種情況下硬說「查無」等於把人引到錯的方向。先精準比對，比不到才用正規化再試一次，
+// 並在結果裡註明是靠正規化對上的——不要讓人以為兩邊的品號長得一模一樣。
+function normSku_(v){
+  return String(v == null ? '' : v).replace(/[\s\-_]/g, '').toUpperCase();
+}
 
 const STORE_DEFS = [
   {name: 'ODM-士林門市',    cols: [4], from: ['D ODM士林倉']},
@@ -8882,18 +8911,29 @@ function storeStockSnapshot_(store){
   if(!open.ok) return {ok:false, error: open.error};
   const src = open.sh;
   const n = open.lastRow - open.firstRow + 1;
-  const vals = src.getRange(open.firstRow, 1, n, 10).getValues();
-  const bySku = {}, withStock = [];
+  const vals = src.getRange(open.firstRow, 1, n, STOCK_READ_COLS).getValues();
+  const bySku = {}, withStock = [], normIndex = {};
   vals.forEach(function(r){
     const sku = String(r[0]||'').trim();
     if(!sku || bySku[sku]) return;
     let expected = 0;
     def.cols.forEach(function(c){ expected += countNum_(r[c - 1]); });
-    bySku[sku] = {baseName: String(r[1]||'').trim(), spec: String(r[2]||'').trim(), expected: expected};
+    // 這個品號在各據點各有多少（只留有數量的）。給「我這家店帳上沒有，那它在哪」用。
+    const locs = [];
+    LOCATION_DEFS.forEach(function(L){
+      const q = countNum_(r[L.col - 1]);
+      // 對照名稱跟原欄名一樣時不要印兩次（「台南總倉（台南總倉）4」很蠢）。
+      // 不一樣才附上原欄名——I 網購庫存倉與 J 總倉的對照名相同，不附的話會看不出是哪一欄。
+      if(q > 0) locs.push(L.name === L.raw ? (L.name + ' ' + q) : (L.name + '（' + L.raw + '）' + q));
+    });
+    bySku[sku] = {baseName: String(r[1]||'').trim(), spec: String(r[2]||'').trim(),
+                  expected: expected, locs: locs};
+    const nk = normSku_(sku);
+    if(nk && !normIndex[nk]) normIndex[nk] = sku;
     if(expected > 0) withStock.push(sku);
   });
-  return {ok:true, bySku: bySku, withStock: withStock, rowsScanned: vals.length,
-          store: store, cols: def.cols, source: open.label};
+  return {ok:true, bySku: bySku, withStock: withStock, normIndex: normIndex,
+          rowsScanned: vals.length, store: store, cols: def.cols, source: open.label};
 }
 
 function countSessionCol_(){
@@ -9012,7 +9052,7 @@ function countScanBatch(body){
     } else {
       const o = {sessionId: sessionId, countStore: store, sku: sku, baseName: name, spec: '',
                  countScanned: qty, countExpected: '', countDiff: '', countResult: '',
-                 firstScanAt: at, lastScanAt: at};
+                 otherStock: '', firstScanAt: at, lastScanAt: at};
       const rowVals = COUNT_DETAIL_HEADER.map(function(h){ return o[h]; });
       const stub = {_row: null, v: rowVals};
       bySku[sku] = stub;
@@ -9098,17 +9138,32 @@ function finishCountSession(body){
   const det = readCountDetail_(sessionId, s.vals[s.c.firstDetailRow]);
   const dc = det.c;
   const scannedSku = {};
-  let diffCount = 0, okCount = 0, unknownCount = 0;
+  let diffCount = 0, okCount = 0, unknownCount = 0, rescuedCount = 0;
+  // 查無此品號時用來補品名（B品號 C條碼 D品名）
+  const codeMap = barcodeToSkuMap_();
 
   det.rows.forEach(function(r){
     const sku = String(r.v[dc.sku]||'').trim();
     scannedSku[sku] = 1;
-    const info = snap.bySku[sku];
+    let info = snap.bySku[sku];
+    let matchedBy = '';
+    if(!info){
+      // 精準比不到，用正規化（去空白與連字號、轉大寫）再試一次。
+      // 「查無此品號」有一部分是格式差異造成的假陰性，那種情況硬說查無會把人引到錯的方向。
+      const alt = snap.normIndex[normSku_(sku)];
+      if(alt && snap.bySku[alt]){ info = snap.bySku[alt]; matchedBy = alt; scannedSku[alt] = 1; rescuedCount++; }
+    }
     const scanned = countNum_(r.v[dc.countScanned]);
     if(!info){
+      // 庫存表真的完全沒有這個品號。品名改從「條碼轉品號」補，至少讓人看得懂掃到什麼。
+      const hit = codeMap[sku];
+      if(hit && hit.name && !String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = hit.name;
       r.v[dc.countExpected] = '';
       r.v[dc.countDiff] = '';
       r.v[dc.countResult] = '庫存表查無此品號';
+      r.v[dc.otherStock] = hit
+        ? '條碼轉品號查得到（' + (hit.name || '無品名') + '），但庫存表沒有任何一列 → 各據點都沒有庫存紀錄'
+        : '條碼轉品號與庫存表都查不到，請確認是掃錯條碼還是尚未建檔';
       unknownCount++;
     } else {
       if(!String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = info.baseName;
@@ -9118,6 +9173,12 @@ function finishCountSession(body){
       r.v[dc.countDiff] = d;
       r.v[dc.countResult] = d === 0 ? '相符' : (d > 0 ? '盤盈' : '盤虧');
       if(d === 0) okCount++; else diffCount++;
+      // 這家店帳上是 0、或是靠正規化才對上的——兩種都代表「人站在現場，但帳對不起來」，
+      // 這時最該回答的是「那它在哪」。有貨的據點全部列出來，直接看得出要跟誰調。
+      if(info.expected === 0 || matchedBy){
+        const where = info.locs.length ? info.locs.join('、') : '所有據點都沒有庫存';
+        r.v[dc.otherStock] = (matchedBy ? '庫存表登記的品號是「' + matchedBy + '」（靠正規化對上）／' : '') + where;
+      }
     }
   });
 
@@ -9133,7 +9194,7 @@ function finishCountSession(body){
     const o = {sessionId: sessionId, countStore: store, sku: sku,
                baseName: info.baseName, spec: info.spec,
                countScanned: 0, countExpected: info.expected, countDiff: -info.expected,
-               countResult: '未盤到', firstScanAt: '', lastScanAt: ''};
+               countResult: '未盤到', otherStock: '', firstScanAt: '', lastScanAt: ''};
     missing.push(COUNT_DETAIL_HEADER.map(function(h){ return o[h]; }));
   });
   const missingTruncated = includeUnscanned ? (unscannedTotal - missing.length) : 0;
@@ -9170,7 +9231,8 @@ function finishCountSession(body){
           未盤到: missing.length, 庫存表查無此品號: unknownCount,
           未列出的未盤到: Math.max(missingTruncated, 0),
           有列出未盤到嗎: includeUnscanned,
-          庫存表中沒被掃到的品項總數: unscannedTotal};
+          庫存表中沒被掃到的品項總數: unscannedTotal,
+          靠正規化才對上的品號: rescuedCount};
 }
 
 // 讀一個場次現在的狀態。手持機當掉／換人接手時用這支把畫面接回來。
@@ -9252,14 +9314,14 @@ function setupCountDiffSheet_(){
   sh.getRange('D4').setValue('未盤到');        sh.getRange('E4').setFormula(cnt('未盤到'));
   sh.getRange('D5').setValue('庫存表查無此品號'); sh.getRange('E5').setFormula(cnt('庫存表查無此品號'));
 
-  const head = ['品號','品名','規格','實盤數','庫存表數量','差異','核對結果'];
+  const head = ['品號','品名','規格','實盤數','庫存表數量','差異','核對結果','其他據點庫存'];
   sh.getRange(7, 1, 1, head.length).setValues([head]);
 
   // order by H asc：差異最負的（盤虧最嚴重）排最前面，那是最該先看的
   sh.getRange('A8').setFormula(
     '=IF($B$1="","← 請先在 B1 選一個場次編號",' +
-    'IFERROR(QUERY(' + q + '$A$2:$K,' +
-    '"select C,D,E,F,G,H,I where A = \'"&$B$1&"\'"&' +
+    'IFERROR(QUERY(' + q + '$A$2:$L,' +
+    '"select C,D,E,F,G,H,I,L where A = \'"&$B$1&"\'"&' +
     'IF($B$2="是"," and I <> \'相符\'","")&" order by H asc",0),' +
     '"（這個場次沒有符合條件的資料）"))');
 
@@ -9276,6 +9338,7 @@ function setupCountDiffSheet_(){
   sh.getRange(7, 1, 1, head.length).setFontWeight('bold');
   sh.setFrozenRows(7);
   sh.setColumnWidth(1, 180); sh.setColumnWidth(2, 320); sh.setColumnWidth(3, 160);
+  sh.setColumnWidth(8, 420);   // 其他據點庫存會是一長串，不給寬度就看不到
   sh.getRange('A1').setNote([SYSTEM_SHEET_WARNING, '',
     '這頁除了 B1／B2 兩個下拉選單以外全部是公式，手動改任何一格都會把公式蓋掉、',
     '那一格就不會再自動更新。要還原的話重跑一次 setupCount 就會整頁重建。',

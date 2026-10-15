@@ -71,14 +71,20 @@ function makeSS(name, sheets){
 //   A品號 B品名 C規格 D ODM士林倉 E三相之力 F山物獵人網購倉
 //   G中華門市倉 H門外漢門市倉 I網購庫存倉 J總倉
 const CACHE_HEADER2 = ['品號','品名','規格','ODM士林倉','三相之力','山物獵人網購倉',
-                       '中華門市倉','門外漢門市倉','網購庫存倉','總倉'];
+                       '中華門市倉','門外漢門市倉','網購庫存倉','總倉','商品在途倉','總計',
+                       '定價','特惠價','1015更','台南總倉'];
 const cacheRows = [CACHE_HEADER2];   // 山物倉地圖／庫存表：第1列表頭、第2列起資料
-// 門市對照（使用者提供）：D=士林、E=台中、G=中華、H=台南
-//            品號     品名    規格   D  E  F  G  H   I   J
-cacheRows.push(['SKU-A','商品A','紅', 0, 1, 0, 5, 2, 10,  3]);  // 中華5、台南2、台中1
-cacheRows.push(['SKU-B','商品B','藍', 0, 0, 0, 3, 0,  0,  0]);  // 中華3、台南0
-cacheRows.push(['SKU-C','商品C','黑', 0, 0, 0, 0, 7,  0,  0]);  // 中華0、台南7
-cacheRows.push(['SKU-D','商品D','白', 0, 1, 0, 4, 1,  0,  0]);  // 中華4、台南1
+// 門市對照（使用者提供）：D=士林、E=台中、G=中華、H=台南；另有 I/J 網路倉、K 在途、P 台南總倉
+const row16 = (sku,name,spec,D,E,F,G,H,I,J,K,P) =>
+  [sku,name,spec,D,E,F,G,H,I,J,K,'','','','',P];
+cacheRows.push(row16('SKU-A','商品A','紅', 0,1,0, 5,2, 10,3, 0, 0));  // 中華5、台南2、台中1
+cacheRows.push(row16('SKU-B','商品B','藍', 0,0,0, 3,0,  0,0, 0, 0));  // 中華3
+cacheRows.push(row16('SKU-C','商品C','黑', 0,0,0, 0,7,  0,0, 0, 0));  // 中華0、台南7
+cacheRows.push(row16('SKU-D','商品D','白', 0,1,0, 4,1,  0,0, 0, 0));  // 中華4、台南1
+// 中華帳上是 0，但別的據點有貨 → 掃到它要能看出「那它在哪」
+cacheRows.push(row16('SKU-E','商品E','黃', 9,0,0, 0,0,  0,0, 2, 4));  // 士林9、在途2、台南總倉4
+// 品號在庫存表裡帶連字號，現場掃到的是沒有連字號的寫法 → 要靠正規化救回來
+cacheRows.push(row16('SKU-G1','商品G','綠',0,0,0, 6,0,  0,0, 0, 0));  // 中華6
 const stock = makeSheet('庫存表', cacheRows);
 // 現場實測：鏡像分頁「山物地圖(快取)」是空的（分頁在、但沒有資料列）。
 // 這正是「分頁存在不等於有資料」那個坑，測試要重現它。
@@ -91,6 +97,9 @@ const barcode = makeSheet('條碼轉品號', [
   ['', 'SKU-B', '4722222222222', '商品B'],
   ['', 'SKU-C', '4733333333333', '商品C'],
   ['', 'SKU-D', '4744444444444', '商品D'],
+  ['', 'SKU-E', '4755555555555', '商品E'],
+  // 條碼轉品號有、但庫存表完全沒有 → 品名要能補上
+  ['', 'SKU-X', '4766666666666', '商品X（庫存表沒有）'],
 ]);
 
 let BACKEND = null, CACHE_SS = null, stampSeq = 1;
@@ -154,7 +163,7 @@ console.log('   用到的來源：', open1.label, '| 試過：', JSON.stringify(
 ck('挑到山物倉地圖／庫存表', open1.ok && open1.label === '山物倉地圖／庫存表', open1.label);
 ck('資料從第2列起', open1.firstRow === 2, open1.firstRow);
 const snapChk = X.storeStockSnapshot_('秀山莊-中華門市');
-ck('讀得到庫存（不是空的）', snapChk.ok && snapChk.withStock.length === 3, snapChk.ok && snapChk.withStock);
+ck('讀得到庫存（不是空的）', snapChk.ok && snapChk.withStock.length === 4, snapChk.ok && snapChk.withStock);
 
 console.log('\n【開場次】');
 ck('門市沒選會被擋', X.startCountSession({counterId:'01'}).ok === false);
@@ -199,7 +208,7 @@ console.log('\n【結束盤點＋對帳】秀山莊-中華門市：A應5實3(盤
 const fin = X.finishCountSession({sessionId: SID, includeUnscanned: true});
 console.log('  回傳：', JSON.stringify(fin));
 ck('結束成功', fin.ok === true, fin);
-ck('未盤到 1 筆（SKU-D）', fin['未盤到'] === 1, fin['未盤到']);
+ck('未盤到 3 筆（SKU-D/SKU-E 不算 0、SKU-G1）', fin['未盤到'] === 2, fin['未盤到']);
 ck('查無此品號 1 筆', fin['庫存表查無此品號'] === 1, fin['庫存表查無此品號']);
 ck('有差異 2 筆（A盤虧、B盤盈）', fin['有差異'] === 2, fin['有差異']);
 ck('不能重複結束', X.finishCountSession({sessionId: SID}).ok === false);
@@ -239,13 +248,39 @@ const ls = X.listCountSessions({});
 ck('場次編號帶隨機碼（不會同秒撞號）', /-[0-9A-Z]{3}$/.test(SID), SID);
 ck('場次清單有兩筆、最新在前', ls.ok && ls.sessions.length===2 && ls.sessions[0].sessionId===st2.sessionId, ls.sessions && ls.sessions.length);
 
+console.log('\n【查無此品號／帳上為0】要補品名、要指出哪裡有貨');
+const st4 = X.startCountSession({store:'秀山莊-中華門市', counterId:'04', counterName:'阿忠'});
+X.countScanBatch({sessionId: st4.sessionId, ops:[
+  {code:'SKU-E', qty:1},     // 中華帳上0，但士林9、在途2、台南總倉4
+  {code:'SKU-X', qty:2},     // 條碼轉品號有、庫存表沒有
+  {code:'8888888888888', qty:1}, // 兩邊都沒有
+  {code:'skug1', qty:6},     // 庫存表是 SKU-G1，靠正規化對上
+]});
+const fin4 = X.finishCountSession({sessionId: st4.sessionId});
+console.log('  回傳：', JSON.stringify(fin4));
+const iOs = H.indexOf('otherStock'), iNm = H.indexOf('baseName');
+const d4 = {};
+det._rows.slice(1).forEach(row=>{ if(row[0]===st4.sessionId && row[iSku]) d4[row[iSku]] = row; });
+Object.keys(d4).forEach(k=>console.log('   ', k, '|', d4[k][iNm], '|', d4[k][iRs], '|', d4[k][iOs]));
+ck('SKU-E 帳上0 → 列出士林/在途/台南總倉', /ODM-士林門市/.test(d4['SKU-E'][iOs]) && /台南總倉/.test(d4['SKU-E'][iOs]) && /商品在途倉/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
+ck('名稱與原欄名相同時不重複印', !/台南總倉（台南總倉）/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
+ck('名稱與原欄名不同時要附原欄名', /ODM-士林門市（ODM士林倉）/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
+ck('otherStock 是最後一欄（既有資料不會錯位）', H[H.length-1] === 'otherStock', H[H.length-1]);
+ck('SKU-E 不應列出中華（數量0）', !/秀山莊-中華門市/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
+ck('SKU-X 查無此品號但品名有補上', d4['SKU-X'][iRs]==='庫存表查無此品號' && /商品X/.test(d4['SKU-X'][iNm]), [d4['SKU-X'][iRs], d4['SKU-X'][iNm]]);
+ck('SKU-X 說明「條碼轉品號查得到、庫存表沒有」', /條碼轉品號查得到/.test(d4['SKU-X'][iOs]), d4['SKU-X'][iOs]);
+ck('8888… 兩邊都查不到時明講', /都查不到/.test(d4['8888888888888'][iOs]), d4['8888888888888'][iOs]);
+ck('skug1 靠正規化對上 SKU-G1 且相符', d4['skug1'][iEx]===6 && d4['skug1'][iRs]==='相符', [d4['skug1'][iEx], d4['skug1'][iRs]]);
+ck('正規化對上時要註明原本的品號', /SKU-G1/.test(d4['skug1'][iOs]), d4['skug1'][iOs]);
+ck('回傳有統計靠正規化救回幾筆', fin4['靠正規化才對上的品號'] === 1, fin4['靠正規化才對上的品號']);
+
 console.log('\n【預設不列未盤到】只盤一區卻列出整店未盤到 = 一張假盤虧表');
 const st3 = X.startCountSession({store:'秀山莊-中華門市', counterId:'03', counterName:'小美'});
 X.countScanBatch({sessionId: st3.sessionId, ops:[{code:'SKU-A', qty:5}]});
 const fin3 = X.finishCountSession({sessionId: st3.sessionId});   // 不傳 includeUnscanned
 console.log('  回傳：', JSON.stringify(fin3));
 ck('預設不列未盤到', fin3['未盤到'] === 0, fin3['未盤到']);
-ck('但仍誠實回報有幾個沒掃到', fin3['庫存表中沒被掃到的品項總數'] === 2, fin3['庫存表中沒被掃到的品項總數']);
+ck('但仍誠實回報有幾個沒掃到', fin3['庫存表中沒被掃到的品項總數'] === 3, fin3['庫存表中沒被掃到的品項總數']);
 ck('有列出未盤到嗎=false', fin3['有列出未盤到嗎'] === false);
 const d3 = {};
 det._rows.slice(1).forEach(row=>{ if(row[0]===st3.sessionId && row[iSku]) d3[row[iSku]] = row; });
