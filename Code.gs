@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.194';
+const BACKEND_VERSION = '2026-10-15.195';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8875,6 +8875,77 @@ function barcodeToSkuMap_(){
   return map;
 }
 
+// 庫存表的「品號 → 列號」索引，掃描當下要拿品名用。
+//
+// 為什麼需要這個：條碼轉品號那張表只收「有建條碼對照的商品」。門市庫存裡有三萬多個
+// 品號，絕大多數不在那張表上——手持機掃的如果是標籤上的品號本身（不是國際條碼），
+// codeMap 就整個查不到，畫面上三十幾項全部顯示「查不到品名」。現場等於盲掃，
+// 掃錯一整排貨架也看不出來。品名其實一直都在庫存表 B 欄，只是以前要等結束對帳才讀。
+//
+// 為什麼存「列號」不存「品名」：三萬八千筆品名序列化大約 2MB，塞 CacheService 太肥；
+// 只存列號大約 850KB，分 20 片每片 42KB，安穩落在單片 100KB 上限內。
+// 代價是每個沒命中的品號要多讀一列，但一批掃描通常只有幾個新品號。
+const STOCK_SKU_INDEX_SHARDS = 20;
+const STOCK_SKU_INDEX_TTL_SEC = 1800;
+const STOCK_SKU_INDEX_PREFIX = 'stockIdxV1_';
+const STOCK_NAME_LOOKUP_MAX = 50;   // 單一批次最多查幾個新品號，避免極端情況拖垮掃描
+
+function stockSkuIndex_(open, forceRebuild){
+  if(!forceRebuild){
+    try{
+      const cached = shardedCacheGet_(STOCK_SKU_INDEX_PREFIX, STOCK_SKU_INDEX_SHARDS);
+      if(cached) return cached;
+    }catch(err){ /* 快取讀不到就重建，不是錯誤 */ }
+  }
+  const n = open.lastRow - open.firstRow + 1;
+  const col = open.sh.getRange(open.firstRow, 1, n, 1).getValues();
+  const idx = {};
+  for(let i = 0; i < col.length; i++){
+    const k = String(col[i][0]||'').trim();
+    if(k && idx[k] === undefined) idx[k] = open.firstRow + i;
+  }
+  try{ shardedCacheSet_(STOCK_SKU_INDEX_PREFIX, STOCK_SKU_INDEX_SHARDS, idx, STOCK_SKU_INDEX_TTL_SEC); }
+  catch(err){ /* 存不進去只是這次沒加速到 */ }
+  return idx;
+}
+
+// 從庫存表撈這幾個品號的品名與規格。查不到的就不回傳，呼叫端自己決定怎麼顯示。
+//
+// 索引是快取的，庫存表如果在這 30 分鐘內插刪過列，列號會對到別人身上。所以讀回來
+// 一定要驗 A 欄是不是我們要的品號；對不上就重建索引再試一次。驗這一下很便宜，
+// 而「安靜地顯示別人的品名」是現場最不該發生的事——人會照著錯的品名去改貨架。
+function stockNamesForSkus_(skus){
+  const out = {};
+  if(!skus || !skus.length) return out;
+  let open;
+  try{ open = openStoreStockSheet_(); }catch(err){ return out; }
+  if(!open || !open.ok) return out;
+
+  const want = skus.slice(0, STOCK_NAME_LOOKUP_MAX);
+  let idx;
+  try{ idx = stockSkuIndex_(open, false); }catch(err){ return out; }
+  let rebuilt = false;
+
+  for(let i = 0; i < want.length; i++){
+    const sku = want[i];
+    let row = idx[sku];
+    if(!row) continue;
+    let v;
+    try{ v = open.sh.getRange(row, 1, 1, 3).getValues()[0]; }catch(err){ continue; }
+    if(String(v[0]||'').trim() !== sku){
+      if(rebuilt) continue;                     // 重建過還是對不上就放棄這一個
+      rebuilt = true;
+      try{ idx = stockSkuIndex_(open, true); }catch(err){ return out; }
+      row = idx[sku];
+      if(!row) continue;
+      try{ v = open.sh.getRange(row, 1, 1, 3).getValues()[0]; }catch(err){ continue; }
+      if(String(v[0]||'').trim() !== sku) continue;
+    }
+    out[sku] = {baseName: String(v[1]||'').trim(), spec: String(v[2]||'').trim()};
+  }
+  return out;
+}
+
 function countNum_(v){
   const s = String(v == null ? '' : v).trim().replace(/,/g, '');
   if(s === '') return 0;
@@ -9065,7 +9136,7 @@ function countScanBatch(body){
       // 會讓 touched[null] 變成 NaN 列號。測試台抓到的第一個 bug 就是這個。
       if(exist._row) touched[exist._row] = exist;
       results.push({code: code, sku: sku, name: String(exist.v[dc.baseName]||''),
-                    total: countNum_(exist.v[dc.countScanned]), known: !!hit});
+                    total: countNum_(exist.v[dc.countScanned]), known: !!hit, _ref: exist});
     } else {
       const o = {sessionId: sessionId, countStore: store, sku: sku, baseName: name, spec: '',
                  countScanned: qty, countExpected: '', countDiff: '', countResult: '',
@@ -9074,9 +9145,36 @@ function countScanBatch(body){
       const stub = {_row: null, v: rowVals};
       bySku[sku] = stub;
       appended.push(stub);
-      results.push({code: code, sku: sku, name: name, total: qty, known: !!hit});
+      results.push({code: code, sku: sku, name: name, total: qty, known: !!hit, _ref: stub});
     }
   });
+
+  // 條碼轉品號查不到品名的，再去庫存表補一次。
+  // 以前只查條碼轉品號，門市那三萬多個沒建條碼對照的品號就一律「查不到品名」，
+  // 現場是盲掃的。品名一直都在庫存表 B 欄，只是以前要等結束對帳才讀得到。
+  // 放在迴圈後面一次處理：同一批掃到好幾個新品號時，不要每個都各跑一次開表。
+  const needName = [];
+  results.forEach(function(r){
+    if(String(r.name||'').trim()) return;
+    if(needName.indexOf(r.sku) < 0) needName.push(r.sku);
+  });
+  if(needName.length){
+    // 這一段純粹是為了「畫面上看得懂掃到什麼」。查不到、或整個庫存表開不起來，
+    // 都不可以讓掃描失敗——現場數過的東西比品名重要得多。
+    let found = {};
+    try{ found = stockNamesForSkus_(needName); }catch(err){ found = {}; }
+    results.forEach(function(r){
+      const f = found[r.sku];
+      if(!f || !f.baseName) return;
+      r.name = f.baseName;
+      if(r._ref){
+        if(!String(r._ref.v[dc.baseName]||'').trim()) r._ref.v[dc.baseName] = f.baseName;
+        if(!String(r._ref.v[dc.spec]||'').trim() && f.spec) r._ref.v[dc.spec] = f.spec;
+        if(r._ref._row) touched[r._ref._row] = r._ref;
+      }
+    });
+  }
+  results.forEach(function(r){ delete r._ref; });   // 內部用的參照不要送回前端
 
   // 已存在的列：用 min..max 一次讀寫，不要每列各寫一次
   const touchedRows = Object.keys(touched).map(Number).sort(function(a,b){ return a-b; });
@@ -9377,6 +9475,23 @@ function getCountSession(body){
             expected: r.v[dc.countExpected], diff: r.v[dc.countDiff],
             result: String(r.v[dc.countResult]||''), lastScanAt: String(r.v[dc.lastScanAt]||'')};
   });
+  // 掃描當下還沒補到品名的（例如這個修正上線前就已經在掃的場次），這裡補給畫面看。
+  // 只改回應、不回寫試算表：getCountSession 列在 NO_LOCK_ACTIONS 裡，是不拿鎖的讀取動作，
+  // 在這裡寫明細會跟同時在掃的人搶同幾列，掃描的數字可能被這支蓋掉。
+  // 試算表上的品名由結束對帳時的 reconcileDetailRow_ 補，那時候是有鎖的。
+  const blank = [];
+  items.forEach(function(x){
+    if(String(x.baseName||'').trim() || !x.sku) return;
+    if(blank.indexOf(x.sku) < 0) blank.push(x.sku);
+  });
+  if(blank.length){
+    let found = {};
+    try{ found = stockNamesForSkus_(blank); }catch(err){ found = {}; }
+    items.forEach(function(x){
+      const f = found[x.sku];
+      if(f && f.baseName && !String(x.baseName||'').trim()) x.baseName = f.baseName;
+    });
+  }
   const o = {};
   COUNT_SESSION_HEADER.forEach(function(h){ o[h] = s.vals[s.c[h]]; });
   return {ok:true, session: o, items: items};

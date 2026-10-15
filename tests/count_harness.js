@@ -83,6 +83,9 @@ cacheRows.push(row16('SKU-C','商品C','黑', 0,0,0, 0,7,  0,0, 0, 0));  // 中�
 cacheRows.push(row16('SKU-D','商品D','白', 0,1,0, 4,1,  0,0, 0, 0));  // 中華4、台南1
 // 中華帳上是 0，但別的據點有貨 → 掃到它要能看出「那它在哪」
 cacheRows.push(row16('SKU-E','商品E','黃', 9,0,0, 0,0,  0,0, 2, 4));  // 士林9、在途2、台南總倉4
+// 庫存表有、條碼轉品號沒有（門市三萬多個品號的常態）。
+// 中華與台南都給 0，不要動到其他測試的「未盤到」筆數。
+cacheRows.push(row16('SKU-F','商品F（條碼表沒有）','綠', 6,0,0, 0,0,  0,0, 0, 0));  // 只有士林6
 // 品號在庫存表裡帶連字號，現場掃到的是沒有連字號的寫法 → 要靠正規化救回來
 cacheRows.push(row16('SKU-G1','商品G','綠',0,0,0, 6,0,  0,0, 0, 0));  // 中華6
 const stock = makeSheet('庫存表', cacheRows);
@@ -133,7 +136,7 @@ vm.createContext(sandbox);
 const src = fs.readFileSync(process.argv[2],'utf8')
   + "\n;globalThis.__x = {startCountSession, countScanBatch, setCountQty, finishCountSession,"
   + " getCountSession, listCountSessions, cancelCountSession, STORE_LIST, STORE_DEFS, storeDef_,"
-  + " openStoreStockSheet_, storeStockSnapshot_, _ssMemo_,"
+  + " openStoreStockSheet_, storeStockSnapshot_, stockNamesForSkus_, _ssMemo_,"
   + " setupCountDiffSheet_, SHEET_COUNT_DIFF, recheckCountSession, recheckAllCountSessions,"
   + " SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER, COUNT_SESSION_HEADER};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
@@ -386,5 +389,52 @@ const lsC = X.listCountSessions({limit: 50});
 const rowC = (lsC.sessions||[]).filter(function(x){ return x.sessionId === stC.sessionId; })[0];
 ck('清單裡有這場且標為已作廢', !!rowC && String(rowC.countStatus) === '已作廢', rowC);
 
-console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、作廢場次、來源挑選與備援');
+console.log('\n【掃描當下的品名】條碼轉品號只收有建條碼對照的，門市三萬多個品號大多不在上面');
+// 現場截圖：31 項全部顯示「查不到品名」，等於盲掃。品名一直在庫存表 B 欄。
+ck('庫存表查得到、條碼表沒有的也要有品名',
+   (X.stockNamesForSkus_(['SKU-F'])['SKU-F']||{}).baseName === '商品F（條碼表沒有）',
+   X.stockNamesForSkus_(['SKU-F']));
+ck('規格也一併帶回來', (X.stockNamesForSkus_(['SKU-F'])['SKU-F']||{}).spec === '綠');
+ck('兩邊都沒有的就不要編一個出來', X.stockNamesForSkus_(['沒這個品號'])['沒這個品號'] === undefined);
+ck('空陣列不會爆掉', JSON.stringify(X.stockNamesForSkus_([])) === '{}');
+
+const stN = X.startCountSession({store:'秀山莊-中華門市', counterId:'06', counterName:'掃品名'});
+const rN = X.countScanBatch({sessionId: stN.sessionId, ops:[{code:'SKU-F', qty:1}, {code:'SKU-A', qty:1}]});
+const byCodeN = {};
+(rN.results||[]).forEach(function(r){ byCodeN[r.code] = r; });
+ck('掃描回應帶回庫存表的品名', (byCodeN['SKU-F']||{}).name === '商品F（條碼表沒有）', byCodeN['SKU-F']);
+ck('條碼表查得到的不受影響', (byCodeN['SKU-A']||{}).name === '商品A', byCodeN['SKU-A']);
+ck('內部參照不要送回前端', (byCodeN['SKU-F']||{})._ref === undefined);
+// 品名也要落到試算表上，不是只給畫面看看
+const gotN = X.getCountSession({sessionId: stN.sessionId});
+const detF = (gotN.items||[]).filter(function(x){ return x.sku === 'SKU-F'; })[0];
+ck('盤點明細裡也寫了品名', !!detF && detF.baseName === '商品F（條碼表沒有）', detF);
+// 兩邊都查不到的，要誠實留空，不能隨便填一個
+X.countScanBatch({sessionId: stN.sessionId, ops:[{code:'完全沒見過的碼', qty:1}]});
+const gotN2 = X.getCountSession({sessionId: stN.sessionId});
+const detU = (gotN2.items||[]).filter(function(x){ return x.sku === '完全沒見過的碼'; })[0];
+ck('真的查不到就留空', !!detU && !String(detU.baseName||'').trim(), detU);
+// 這個修正上線前已經在掃的場次，明細列上的品名是空的。
+// getCountSession 要能把畫面補滱，不然現場按「接續」回來還是一片「查不到品名」。
+const dsh2 = BACKEND.getSheetByName(X.SHEET_COUNT_DETAIL);
+const bnCol = X.COUNT_DETAIL_HEADER.indexOf('baseName') + 1;
+const skuCol = X.COUNT_DETAIL_HEADER.indexOf('sku') + 1;
+for(let i = 2; i <= dsh2.getLastRow(); i++){
+  if(String(dsh2.getRange(i, skuCol, 1, 1).getValue()||'').trim() === 'SKU-F'){
+    dsh2.getRange(i, bnCol, 1, 1).setValue('');      // 模擬舊資料：品名是空的
+  }
+}
+const gotN3 = X.getCountSession({sessionId: stN.sessionId});
+const detF3 = (gotN3.items||[]).filter(function(x){ return x.sku === 'SKU-F'; })[0];
+ck('舊場次接回來時也要補上品名', !!detF3 && detF3.baseName === '商品F（條碼表沒有）', detF3);
+// 但不可以順手回寫試算表——這支是不拿鎖的讀取動作
+let stillBlank = false;
+for(let i = 2; i <= dsh2.getLastRow(); i++){
+  if(String(dsh2.getRange(i, skuCol, 1, 1).getValue()||'').trim() === 'SKU-F'
+     && !String(dsh2.getRange(i, bnCol, 1, 1).getValue()||'').trim()) stillBlank = true;
+}
+ck('不拿鎖的讀取不會回寫明細', stillBlank);
+X.cancelCountSession({sessionId: stN.sessionId});
+
+console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、作廢場次、掃描當下補品名、來源挑選與備援');
 process.exit(fail?1:0);
