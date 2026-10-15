@@ -132,7 +132,7 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 const src = fs.readFileSync(process.argv[2],'utf8')
   + "\n;globalThis.__x = {startCountSession, countScanBatch, setCountQty, finishCountSession,"
-  + " getCountSession, listCountSessions, STORE_LIST, STORE_DEFS, storeDef_,"
+  + " getCountSession, listCountSessions, cancelCountSession, STORE_LIST, STORE_DEFS, storeDef_,"
   + " openStoreStockSheet_, storeStockSnapshot_, _ssMemo_,"
   + " setupCountDiffSheet_, SHEET_COUNT_DIFF, recheckCountSession, recheckAllCountSessions,"
   + " SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER, COUNT_SESSION_HEADER};\n";
@@ -363,5 +363,28 @@ ck('五種核對結果都有計數', ['R1C5','R2C5','R3C5','R4C5','R5C5'].every(
 console.log('   B5 的場次摘要：', f['R5C2']);
 ck('摘要指到盤點場次', (f['R5C2']||'').indexOf("'盤點場次'!") > 0, f['R5C2']);
 
-console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、來源挑選與備援');
+console.log('\n【作廢場次】現場會誤按「開始盤點」開出空場次，要有路把它收掉、又不能算成已對帳');
+const stC = X.startCountSession({store:'秀山莊-中華門市', counterId:'05', counterName:'誤按的'});
+ck('開得起來', stC.ok === true, stC);
+X.countScanBatch({sessionId: stC.sessionId, ops:[{code:'SKU-A', qty:2}]});
+const cx = X.cancelCountSession({sessionId: stC.sessionId});
+ck('作廢成功', cx.ok === true && cx['狀態'] === '已作廢', cx);
+const gotC = X.getCountSession({sessionId: stC.sessionId});
+ck('狀態改成已作廢', String(gotC.session.countStatus) === '已作廢', gotC.session.countStatus);
+ck('有註記說未對帳', /未對帳/.test(String(gotC.session.note||'')), gotC.session.note);
+// 明細列不删：那是現場真的數過的紀錄，刪掉就查不回來
+ck('已經掃的明細還在', gotC.items.length === 1 && gotC.items[0].scanned === 2, gotC.items);
+ck('作廢後不能再掃', X.countScanBatch({sessionId: stC.sessionId, ops:[{code:'SKU-A', qty:1}]}).ok === false);
+ck('作廢後不能結束對帳', X.finishCountSession({sessionId: stC.sessionId}).ok === false);
+ck('重複作廢不會爆掉', X.cancelCountSession({sessionId: stC.sessionId}).ok === true);
+ck('找不到的場次要誠實回報', X.cancelCountSession({sessionId:'沒這個'}).ok === false);
+ck('沒給 sessionId 要擋下來', X.cancelCountSession({}).ok === false);
+// 已完成的不能追作廢：它已經對過帳、差異表也發出去了
+ck('已完成的不能作廢', X.cancelCountSession({sessionId: SID}).ok === false, SID);
+// 清單要看得到作廢的場次（前端靠它判斷要不要出「接續」按鈕）
+const lsC = X.listCountSessions({limit: 50});
+const rowC = (lsC.sessions||[]).filter(function(x){ return x.sessionId === stC.sessionId; })[0];
+ck('清單裡有這場且標為已作廢', !!rowC && String(rowC.countStatus) === '已作廢', rowC);
+
+console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、作廢場次、來源挑選與備援');
 process.exit(fail?1:0);

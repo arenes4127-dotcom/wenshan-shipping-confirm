@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.193';
+const BACKEND_VERSION = '2026-10-15.194';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -225,6 +225,7 @@ function doPost(e){
       case 'getCountSession': result = getCountSession(body); break;
       case 'listCountSessions': result = listCountSessions(body); break;
       case 'recheckCountSession': result = recheckCountSession(body); break;
+      case 'cancelCountSession': result = cancelCountSession(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -9014,6 +9015,10 @@ function startCountSession(body){
              startedAt: nowStamp_(), endedAt: '', countStatus: '盤點中',
              countScannedQty: 0, countItemCount: 0, countDiffCount: '', firstDetailRow: '', note: ''};
   const row = sh.getLastRow() + 1;
+  // 時間欄位先設成純文字格式。不設的話 Sheets 會把 'yyyy/MM/dd HH:mm:ss' 自動轉成
+  // 日期型別，讀回來變成 Date 物件、JSON 化之後是 UTC 的 ISO 字串——現場畫面上就會
+  // 看到「2026-10-15T05:32:43.000Z」這種跟當地時間差八小時的東西。
+  sh.getRange(row, colOf(COUNT_SESSION_HEADER, 'startedAt'), 1, 2).setNumberFormat('@');
   sh.getRange(row, 1, 1, COUNT_SESSION_HEADER.length)
     .setValues([COUNT_SESSION_HEADER.map(function(h){ return o[h]; })]);
   return {ok:true, sessionId: sessionId, store: store, startedAt: o.startedAt};
@@ -9332,6 +9337,30 @@ function finishCountSession(body){
           有列出未盤到嗎: includeUnscanned,
           庫存表中沒被掃到的品項總數: unscannedTotal,
           靠正規化才對上的品號: rescuedCount};
+}
+
+// 作廢一個還沒結束的場次。
+// 現場會誤按「開始盤點」開出空場次（截圖裡就有三個 0 件 0 項的），那些不該被當成
+// 「已完成」——已完成代表「盤過、也對過帳」，把誤開的混進去會讓之後看紀錄的人
+// 分不出哪些是真的盤過。所以另立「已作廢」狀態。
+// 已經掃了東西的場次也可以作廢（例如盤到一半決定重來），明細列留著不刪：
+// 那是現場真的數過的紀錄，刪掉就查不回來了，狀態講清楚就好。
+function cancelCountSession(body){
+  const sessionId = String((body && body.sessionId) || '').trim();
+  if(!sessionId) return {ok:false, error:'缺少 sessionId'};
+  const s = findCountSession_(sessionId);
+  if(!s) return {ok:false, error:'找不到盤點場次 ' + sessionId};
+  const cur = String(s.vals[s.c.countStatus]||'').trim();
+  if(cur === '已完成') return {ok:false, error:'已完成的場次不能作廢（它已經對過帳了）'};
+  if(cur === '已作廢') return {ok:true, sessionId: sessionId, 已經是作廢狀態: true};
+  s.vals[s.c.countStatus] = '已作廢';
+  s.vals[s.c.endedAt] = nowStamp_();
+  const note = String(s.vals[s.c.note]||'').trim();
+  s.vals[s.c.note] = (note ? note + '；' : '') + '人工作廢，未對帳';
+  s.sh.getRange(s.row, colOf(COUNT_SESSION_HEADER, 'startedAt'), 1, 2).setNumberFormat('@');
+  s.sh.getRange(s.row, 1, 1, COUNT_SESSION_HEADER.length).setValues([s.vals]);
+  SpreadsheetApp.flush();
+  return {ok:true, sessionId: sessionId, 狀態: '已作廢'};
 }
 
 // 讀一個場次現在的狀態。手持機當掉／換人接手時用這支把畫面接回來。

@@ -5758,18 +5758,108 @@ function loadCountStores(){
   });
 }
 
+// 試算表會把「2026/10/15 13:32:43」這種字串自動轉成日期型別，
+// getValues() 拿回來就是 Date，JSON 一序列化就變成 UTC 的 ISO
+// （2026-10-15T05:32:43.000Z），現場看了只會以為機器時間壞了。
+// 新開的場次已經把欄位設成純文字不會再被轉，舊資料還在，所以兩種都要接。
+function fmtCountStamp_(v){
+  const s = String(v == null ? '' : v).trim();
+  if(!s) return '';
+  if(!/^\d{4}-\d{2}-\d{2}T/.test(s)) return s;
+  const d = new Date(s);
+  if(isNaN(d.getTime())) return s;
+  const p = n => String(n).padStart(2,'0');
+  return d.getFullYear()+'/'+p(d.getMonth()+1)+'/'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+}
+
 function renderCountSessionList(sessions){
   const box = document.getElementById('countSessionList');
   if(!box) return;
   if(!sessions.length){ box.innerHTML = '<p class="hint">還沒有任何盤點紀錄。</p>'; return; }
   box.innerHTML = sessions.map(function(x){
-    const done = String(x.countStatus||'') === '已完成';
-    const diff = done ? `差異 ${x.countDiffCount} 項` : '進行中';
+    const st = String(x.countStatus||'');
+    const done = st === '已完成';
+    const voided = st === '已作廢';
+    const open = !done && !voided;
+    const tail = done ? `差異 ${x.countDiffCount} 項` : (voided ? '未對帳' : '進行中');
+    // 「接續」「作廢」只給還沒結束的場次。手持機當掉、換人接手、或是誤按
+    // 「開始盤點」開出空場次，那些場次會一直卡在「盤點中」，沒有入口就回不去。
+    const sid = escapeHtml(String(x.sessionId||'')).replace(/'/g, "\\'");
+    const btns = open
+      ? `<div style="margin-top:6px;text-align:right;">
+          <button class="btn sm" style="margin-right:6px;" onclick="resumeCountSession('${sid}')">接續</button>
+          <button class="btn gray sm" onclick="voidCountSession('${sid}')">作廢</button>
+        </div>`
+      : '';
     return `<div class="row"><div><strong>${x.countStore||''}</strong>
-      <div class="hint">${x.startedAt||''}　${x.counterName||''}</div></div>
-      <div style="text-align:right;"><span class="tag${done?'':' danger'}">${x.countStatus||''}</span>
-      <div class="hint">${x.countScannedQty||0} 件 / ${x.countItemCount||0} 項　${diff}</div></div></div>`;
+      <div class="hint">${fmtCountStamp_(x.startedAt)}　${x.counterName||''}</div></div>
+      <div style="text-align:right;"><span class="tag${open?' danger':''}">${st}</span>
+      <div class="hint">${x.countScannedQty||0} 件 / ${x.countItemCount||0} 項　${tail}</div>
+      ${btns}</div></div>`;
   }).join('');
+}
+
+// 接續一個還沒結束的場次。不從清單那一列的字串拼，直接跟後端要權威資料：
+// 那一列可能是幾分鐘前載的，期間別台機器可能已經又掃了東西。
+function resumeCountSession(sessionId){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線才能接續','要跟後端拿這場已經掃的紀錄', 2200); return; }
+  if(countSession && countSession.sessionId === sessionId){ resyncCountSession(); return; }
+  if(countSession && !confirm('目前正在盤「' + countSession.store + '」。\n要離開它、改接續這一場嗎？\n（未送出的掃描會先送完）')) return;
+  const pull = function(){
+    return apiPost('getCountSession', {sessionId: sessionId}).then(function(res){
+      if(!res || !res.ok){ errorBeep(); flash('err','接不回來', (res && res.error) || '', 2500); return; }
+      const s = res.session || {};
+      const st = String(s.countStatus||'');
+      if(st !== '盤點中'){
+        errorBeep(); flash('err','這場已經結束了', st + '，不能接續', 2500);
+        loadCountStores();
+        return;
+      }
+      countSession = {sessionId: sessionId, store: String(s.countStore||''),
+                      counterId: String(s.counterId||''), counterName: String(s.counterName||'')};
+      countItems = (res.items || []).map(function(x){
+        return {key: x.sku, sku: x.sku, name: x.baseName, qty: x.scanned, at: x.lastScanAt, pending: false};
+      }).reverse();
+      countQueue = [];
+      saveCountState_();
+      renderCount();
+      okBeep();
+      flash('ok','接回這場盤點', countSession.store + '　已有 ' + countItems.length + ' 項', 2200);
+      setTimeout(function(){ const el = document.getElementById('countScanInput'); if(el) el.focus(); }, 40);
+    });
+  };
+  // 舊場次還沒送出的掃描先送完再走，不然下一行 countQueue = [] 就把它們丟了。
+  // 送不出去（斷線）就不要換場次，宁可留在原來那場等網路回來。
+  if(countSession && countQueue.length){
+    Promise.resolve(flushCountQueue()).then(function(){
+      if(countQueue.length){
+        errorBeep();
+        flash('err','還有 ' + countQueue.length + ' 筆掃描沒送出去','等同步完再換場次', 3000);
+        return;
+      }
+      return pull();
+    }).catch(function(err){ errorBeep(); flash('err','接不回來', err.message || '', 2500); });
+  } else {
+    pull().catch(function(err){ errorBeep(); flash('err','接不回來', err.message || '', 2500); });
+  }
+}
+
+// 作廢：誤開的空場次、或是盤到一半決定重來的場次。
+// 不用「結束」是因為結束會跟庫存表對帳、產出一堆假的「盤虧」。
+function voidCountSession(sessionId){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線才能作廢','', 2000); return; }
+  if(!confirm('把這場盤點標成「已作廢」？\n已經掃的明細會留著，但不會跟庫存表對帳。')) return;
+  apiPost('cancelCountSession', {sessionId: sessionId}).then(function(res){
+    if(!res || !res.ok){ errorBeep(); flash('err','作廢失敗', (res && res.error) || '', 3000); return; }
+    if(countSession && countSession.sessionId === sessionId){
+      countSession = null; countItems = []; countQueue = [];
+      saveCountState_();
+      renderCount();
+    }
+    okBeep();
+    flash('ok','已作廢','這場不會計入差異表', 1800);
+    loadCountStores();
+  }).catch(function(err){ errorBeep(); flash('err','作廢失敗', err.message || '', 2500); });
 }
 
 function renderCount(){
