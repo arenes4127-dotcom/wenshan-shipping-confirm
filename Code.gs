@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.189';
+const BACKEND_VERSION = '2026-10-15.191';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8918,9 +8918,12 @@ function storeStockSnapshot_(store){
     if(!sku || bySku[sku]) return;
     let expected = 0;
     def.cols.forEach(function(c){ expected += countNum_(r[c - 1]); });
-    // 這個品號在各據點各有多少（只留有數量的）。給「我這家店帳上沒有，那它在哪」用。
+    // 這個品號在「其他」據點各有多少（只留有數量的）。給「我這家店對不起來，那它在哪」用。
+    // 正在盤的這家店自己要排除——欄位叫「其他據點庫存」，而且這家店的數量「庫存表數量」
+    // 那一欄已經有了，再列一次只是讓人多讀一遍還讀到矛盾的字。
     const locs = [];
     LOCATION_DEFS.forEach(function(L){
+      if(def.cols.indexOf(L.col) >= 0) return;
       const q = countNum_(r[L.col - 1]);
       // 對照名稱跟原欄名一樣時不要印兩次（「台南總倉（台南總倉）4」很蠢）。
       // 不一樣才附上原欄名——I 網購庫存倉與 J 總倉的對照名相同，不附的話會看不出是哪一欄。
@@ -9173,10 +9176,15 @@ function finishCountSession(body){
       r.v[dc.countDiff] = d;
       r.v[dc.countResult] = d === 0 ? '相符' : (d > 0 ? '盤盈' : '盤虧');
       if(d === 0) okCount++; else diffCount++;
-      // 這家店帳上是 0、或是靠正規化才對上的——兩種都代表「人站在現場，但帳對不起來」，
-      // 這時最該回答的是「那它在哪」。有貨的據點全部列出來，直接看得出要跟誰調。
-      if(info.expected === 0 || matchedBy){
-        const where = info.locs.length ? info.locs.join('、') : '所有據點都沒有庫存';
+      // 只要對不起來就告訴人「那它在哪」——盤盈（現場有、帳上沒有或比較少）跟盤虧
+      // （現場比帳上少，少的那些可能根本在別店）問的是同一件事。相符的不填，
+      // 不然每一列都掛一長串，真正要看的反而被淹掉。
+      // 靠正規化才對上的也填，因為那一列要註明庫存表登記的品號是什麼。
+      //
+      // 「未盤到」那批不走這裡（它們是結束時另外補上的列）：那可能有好幾千筆，
+      // 每筆都掛一長串會把分頁撐爆，而且帳上本來就有貨，問「別處有沒有」意義不大。
+      if(d !== 0 || matchedBy){
+        const where = info.locs.length ? info.locs.join('、') : '其他據點都沒有庫存';
         r.v[dc.otherStock] = (matchedBy ? '庫存表登記的品號是「' + matchedBy + '」（靠正規化對上）／' : '') + where;
       }
     }

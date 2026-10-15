@@ -228,6 +228,13 @@ ck('SKU-B 實10 應3 差7 盤盈', detail['SKU-B'][iSc]===10 && detail['SKU-B'][
 ck('SKU-D 實0 應4 差-4 未盤到', detail['SKU-D'][iSc]===0 && detail['SKU-D'][iEx]===4 && detail['SKU-D'][iDf]===-4 && detail['SKU-D'][iRs]==='未盤到', detail['SKU-D']);
 ck('SKU-C 不該出現（中華庫存0、也沒掃）', !detail['SKU-C'], detail['SKU-C']);
 ck('9999 標成查無此品號', detail['9999999999999'] && detail['9999999999999'][iRs]==='庫存表查無此品號', detail['9999999999999']);
+const iOs0 = H.indexOf('otherStock');
+console.log('   盤虧/盤盈的「其他據點庫存」：');
+['SKU-A','SKU-B'].forEach(k=>console.log('    ', k, detail[k][iRs], '|', detail[k][iOs0]));
+ck('盤虧(SKU-A)也要列出哪裡有貨', /ODM-台南門市/.test(detail['SKU-A'][iOs0]) && /秀山莊通路-網路倉庫/.test(detail['SKU-A'][iOs0]), detail['SKU-A'][iOs0]);
+ck('不列出正在盤的這家店自己', !/秀山莊-中華門市/.test(detail['SKU-A'][iOs0]), detail['SKU-A'][iOs0]);
+ck('盤盈(SKU-B)其他據點都沒貨時明講', /其他據點都沒有庫存/.test(detail['SKU-B'][iOs0]), detail['SKU-B'][iOs0]);
+ck('未盤到(SKU-D)不掛長字串', !detail['SKU-D'][iOs0], detail['SKU-D'][iOs0]);
 
 console.log('\n【另一家門市分開對帳】ODM-台南門市 = H：A應2、C應7、D應1');
 const st2 = X.startCountSession({store:'ODM-台南門市', counterId:'02', counterName:'小華'});
@@ -266,12 +273,14 @@ ck('SKU-E 帳上0 → 列出士林/在途/台南總倉', /ODM-士林門市/.test
 ck('名稱與原欄名相同時不重複印', !/台南總倉（台南總倉）/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
 ck('名稱與原欄名不同時要附原欄名', /ODM-士林門市（ODM士林倉）/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
 ck('otherStock 是最後一欄（既有資料不會錯位）', H[H.length-1] === 'otherStock', H[H.length-1]);
-ck('SKU-E 不應列出中華（數量0）', !/秀山莊-中華門市/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
+ck('SKU-E 不應列出中華（正在盤的就是這家）', !/秀山莊-中華門市/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
 ck('SKU-X 查無此品號但品名有補上', d4['SKU-X'][iRs]==='庫存表查無此品號' && /商品X/.test(d4['SKU-X'][iNm]), [d4['SKU-X'][iRs], d4['SKU-X'][iNm]]);
 ck('SKU-X 說明「條碼轉品號查得到、庫存表沒有」', /條碼轉品號查得到/.test(d4['SKU-X'][iOs]), d4['SKU-X'][iOs]);
 ck('8888… 兩邊都查不到時明講', /都查不到/.test(d4['8888888888888'][iOs]), d4['8888888888888'][iOs]);
+ck('相符且非正規化對上的不填（SKU-A台南場相符）', !d2['SKU-A'][iOs], d2['SKU-A'][iOs]);
 ck('skug1 靠正規化對上 SKU-G1 且相符', d4['skug1'][iEx]===6 && d4['skug1'][iRs]==='相符', [d4['skug1'][iEx], d4['skug1'][iRs]]);
 ck('正規化對上時要註明原本的品號', /SKU-G1/.test(d4['skug1'][iOs]), d4['skug1'][iOs]);
+ck('skug1 其他據點沒貨（只有中華有，而中華就是本場）', /其他據點都沒有庫存/.test(d4['skug1'][iOs]), d4['skug1'][iOs]);
 ck('回傳有統計靠正規化救回幾筆', fin4['靠正規化才對上的品號'] === 1, fin4['靠正規化才對上的品號']);
 
 console.log('\n【預設不列未盤到】只盤一區卻列出整店未盤到 = 一張假盤虧表');
