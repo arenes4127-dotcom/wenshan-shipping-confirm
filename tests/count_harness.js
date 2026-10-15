@@ -134,7 +134,7 @@ const src = fs.readFileSync(process.argv[2],'utf8')
   + "\n;globalThis.__x = {startCountSession, countScanBatch, setCountQty, finishCountSession,"
   + " getCountSession, listCountSessions, STORE_LIST, STORE_DEFS, storeDef_,"
   + " openStoreStockSheet_, storeStockSnapshot_, _ssMemo_,"
-  + " setupCountDiffSheet_, SHEET_COUNT_DIFF,"
+  + " setupCountDiffSheet_, SHEET_COUNT_DIFF, recheckCountSession, recheckAllCountSessions,"
   + " SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER, COUNT_SESSION_HEADER};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
 const X = sandbox.__x;
@@ -295,6 +295,29 @@ const d3 = {};
 det._rows.slice(1).forEach(row=>{ if(row[0]===st3.sessionId && row[iSku]) d3[row[iSku]] = row; });
 ck('明細只有掃到的那一筆', Object.keys(d3).length === 1 && d3['SKU-A'], Object.keys(d3));
 ck('掃到的那筆仍然有對帳（應5實5相符）', d3['SKU-A'][iEx]===5 && d3['SKU-A'][iRs]==='相符', d3['SKU-A']);
+
+console.log('\n【重算既有場次】新增欄位後要能補齊舊場次，不必重掃真的貨');
+// 模擬「這些列是舊版本結束的」：把其他據點庫存清空
+const detSheet = BACKEND.getSheetByName(X.SHEET_COUNT_DETAIL);
+const iOs2 = H.indexOf('otherStock');
+let cleared = 0;
+detSheet._rows.forEach((row,i)=>{ if(i>0 && row[0]===SID && row[iOs2]){ row[iOs2]=''; cleared++; } });
+console.log('   先清掉中華那場的「其他據點庫存」共', cleared, '格');
+ck('有東西可以清（不然這個測試沒意義）', cleared > 0, cleared);
+const before未盤到 = detSheet._rows.filter(r=>r[0]===SID && r[iRs]==='未盤到').length;
+const rc = X.recheckCountSession({sessionId: SID});
+console.log('   重算回傳：', JSON.stringify(rc));
+ck('重算成功', rc.ok === true, rc);
+const after = {};
+detSheet._rows.slice(1).forEach(row=>{ if(row[0]===SID && row[iSku]) after[row[iSku]] = row; });
+ck('盤虧列的其他據點庫存補回來了', /ODM-台南門市/.test(after['SKU-A'][iOs2]), after['SKU-A'][iOs2]);
+ck('查無此品號列也補回來了', /都查不到|條碼轉品號查得到/.test(after['9999999999999'][iOs2]), after['9999999999999'][iOs2]);
+ck('未盤到沒有被改判成盤虧', after['SKU-D'][iRs] === '未盤到', after['SKU-D'][iRs]);
+ck('未盤到的列數沒有變', detSheet._rows.filter(r=>r[0]===SID && r[iRs]==='未盤到').length === before未盤到);
+ck('實盤數沒有被動到（那是現場數出來的事實）', after['SKU-A'][iSc] === 3, after['SKU-A'][iSc]);
+ck('不會產生新列', Object.keys(after).length === 5, Object.keys(after));
+const rcAll = X.recheckAllCountSessions();
+ck('批次重算只處理已完成的場次', /重算了 \d+ 個已完成的場次/.test(rcAll), String(rcAll).slice(0,40));
 
 console.log('\n【備援】主來源整個不見時要退回鏡像，而不是整個停擺');
 const savedStock = STOCK_SS;

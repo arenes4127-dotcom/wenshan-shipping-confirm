@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.191';
+const BACKEND_VERSION = '2026-10-15.192';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -224,6 +224,7 @@ function doPost(e){
       case 'finishCountSession': result = finishCountSession(body); break;
       case 'getCountSession': result = getCountSession(body); break;
       case 'listCountSessions': result = listCountSessions(body); break;
+      case 'recheckCountSession': result = recheckCountSession(body); break;
       // 部署腳本用來確認「doPost 這條路徑」也真的更新到新版了。
       // 只看 doGet 回報的版本號不夠：兩邊的更新有時差，doGet 已經是新版但 doPost
       // 還在跑舊程式碼的情況實際發生過好幾次，結果就是部署完馬上執行一次性函式時
@@ -9122,6 +9123,122 @@ function setCountQty(body){
   return {ok:true, sku: sku, qty: qty, scannedQty: totalQty};
 }
 
+// 逐列對帳。抽出來是為了「結束盤點」與「重算既有場次」走同一套邏輯——
+// 兩邊各寫一份的話，之後改了一邊忘了另一邊，重算出來的結果會跟當初結束時不一樣，
+// 而那種不一致沒有人看得出來。
+// 只動傳進來的那一列，不產生新列（「未盤到」那批由呼叫端自己補）。
+function reconcileDetailRow_(r, dc, snap, codeMap){
+    const sku = String(r.v[dc.sku]||'').trim();
+    let info = snap.bySku[sku];
+    let matchedBy = '';
+    if(!info){
+      // 精準比不到，用正規化（去空白與連字號、轉大寫）再試一次。
+      // 「查無此品號」有一部分是格式差異造成的假陰性，那種情況硬說查無會把人引到錯的方向。
+      const alt = snap.normIndex[normSku_(sku)];
+      if(alt && snap.bySku[alt]){ info = snap.bySku[alt]; matchedBy = alt; }
+    }
+    const scanned = countNum_(r.v[dc.countScanned]);
+    if(!info){
+      // 庫存表真的完全沒有這個品號。品名改從「條碼轉品號」補，至少讓人看得懂掃到什麼。
+      const hit = codeMap[sku];
+      if(hit && hit.name && !String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = hit.name;
+      r.v[dc.countExpected] = '';
+      r.v[dc.countDiff] = '';
+      r.v[dc.countResult] = '庫存表查無此品號';
+      r.v[dc.otherStock] = hit
+        ? '條碼轉品號查得到（' + (hit.name || '無品名') + '），但庫存表沒有任何一列 → 各據點都沒有庫存紀錄'
+        : '條碼轉品號與庫存表都查不到，請確認是掃錯條碼還是尚未建檔';
+      return {sku: sku, unknown: true};
+    } else {
+      if(!String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = info.baseName;
+      if(!String(r.v[dc.spec]||'').trim()) r.v[dc.spec] = info.spec;
+      r.v[dc.countExpected] = info.expected;
+      const d = scanned - info.expected;
+      r.v[dc.countDiff] = d;
+      r.v[dc.countResult] = d === 0 ? '相符' : (d > 0 ? '盤盈' : '盤虧');
+      // 只要對不起來就告訴人「那它在哪」——盤盈（現場有、帳上沒有或比較少）跟盤虧
+      // （現場比帳上少，少的那些可能根本在別店）問的是同一件事。相符的不填，
+      // 不然每一列都掛一長串，真正要看的反而被淹掉。
+      // 靠正規化才對上的也填，因為那一列要註明庫存表登記的品號是什麼。
+      //
+      // 「未盤到」那批不走這裡（它們是結束時另外補上的列）：那可能有好幾千筆，
+      // 每筆都掛一長串會把分頁撐爆，而且帳上本來就有貨，問「別處有沒有」意義不大。
+      if(d !== 0 || matchedBy){
+        const where = info.locs.length ? info.locs.join('、') : '其他據點都沒有庫存';
+        r.v[dc.otherStock] = (matchedBy ? '庫存表登記的品號是「' + matchedBy + '」（靠正規化對上）／' : '') + where;
+      }
+      return {sku: sku, altSku: matchedBy, rescued: !!matchedBy, same: d === 0};
+    }
+}
+
+// 重算一個「已完成」場次的對帳結果，只更新既有的列、不產生任何新列。
+// 用途有兩個：一是新增「其他據點庫存」這類欄位之後，把先前結束的場次補齊，
+// 不必為了看新欄位去重掃一次真的貨；二是庫存表事後更新了，想用新數字重對一次。
+// 不碰「掃描件數」——那是現場數出來的事實，重算只動「庫存表那一側」的欄位。
+function recheckCountSession(body){
+  const sessionId = String((body && body.sessionId) || '').trim();
+  if(!sessionId) return {ok:false, error:'缺少 sessionId'};
+  const s = findCountSession_(sessionId);
+  if(!s) return {ok:false, error:'找不到盤點場次 ' + sessionId};
+  const store = String(s.vals[s.c.countStore]||'').trim();
+  const snap = storeStockSnapshot_(store);
+  if(!snap.ok) return {ok:false, error:'讀不到門市庫存：' + snap.error};
+  const det = readCountDetail_(sessionId, s.vals[s.c.firstDetailRow]);
+  const dc = det.c;
+  if(!det.rows.length) return {ok:true, sessionId: sessionId, 重算: 0, 說明:'這個場次沒有明細列'};
+  const codeMap = barcodeToSkuMap_();
+
+  let diffCount = 0, okCount = 0, unknownCount = 0, rescuedCount = 0, skipped = 0;
+  det.rows.forEach(function(r){
+    // 「未盤到」是結束時依當時的庫存表補出來的列，不是現場掃出來的。
+    // 重算時只更新它的庫存表數量與差異，不重新判定——否則它會被算成盤虧，
+    // 跟「現場真的少了」混在一起就分不出來了。
+    if(String(r.v[dc.countResult]||'').trim() === '未盤到'){
+      const info = snap.bySku[String(r.v[dc.sku]||'').trim()];
+      if(info){ r.v[dc.countExpected] = info.expected; r.v[dc.countDiff] = -info.expected; }
+      skipped++;
+      return;
+    }
+    const res = reconcileDetailRow_(r, dc, snap, codeMap);
+    if(res.rescued) rescuedCount++;
+    if(res.unknown) unknownCount++; else if(res.same) okCount++; else diffCount++;
+  });
+
+  const rowsAsc = det.rows.slice().sort(function(a,b){ return a._row - b._row; });
+  const minR = rowsAsc[0]._row, maxR = rowsAsc[rowsAsc.length - 1]._row;
+  const span = det.sh.getRange(minR, 1, maxR - minR + 1, COUNT_DETAIL_HEADER.length).getValues();
+  rowsAsc.forEach(function(r){ span[r._row - minR] = r.v; });
+  det.sh.getRange(minR, 1, span.length, COUNT_DETAIL_HEADER.length).setValues(span);
+  s.vals[s.c.countDiffCount] = diffCount + skipped;
+  s.sh.getRange(s.row, 1, 1, COUNT_SESSION_HEADER.length).setValues([s.vals]);
+  SpreadsheetApp.flush();
+
+  return {ok:true, sessionId: sessionId, store: store, 重算幾列: det.rows.length,
+          相符: okCount, 有差異: diffCount, 庫存表查無此品號: unknownCount,
+          未盤到只更新數字: skipped, 靠正規化才對上的品號: rescuedCount};
+}
+
+// 把所有「已完成」的場次重算一遍。名字不帶底線，編輯器選單選得到。
+// 同一家門市只讀一次庫存快照——每場各讀一次的話，38,374 列會被讀好幾遍。
+function recheckAllCountSessions(){
+  const sh = getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
+  const last = sh.getLastRow();
+  if(last < 2) return '還沒有任何盤點場次。';
+  const c = countSessionCol_();
+  const vals = sh.getRange(2, 1, last - 1, COUNT_SESSION_HEADER.length).getValues();
+  const out = [];
+  vals.forEach(function(v){
+    if(String(v[c.countStatus]||'').trim() !== '已完成') return;
+    const r = recheckCountSession({sessionId: String(v[c.sessionId]||'').trim()});
+    out.push(r);
+  });
+  const text = out.length
+    ? '重算了 ' + out.length + ' 個已完成的場次：\n' + JSON.stringify(out, null, 2)
+    : '沒有「已完成」的場次需要重算（進行中的場次要先結束才會對帳）。';
+  Logger.log(text);
+  return text;
+}
+
 // 結束盤點：這時候才去跟庫存表對帳。
 // 刻意不在掃描當下對帳——掃描要快，而且現場邊掃邊進貨的話，用同一個時間點的
 // 庫存快照比較才講得通。
@@ -9146,49 +9263,15 @@ function finishCountSession(body){
   const codeMap = barcodeToSkuMap_();
 
   det.rows.forEach(function(r){
-    const sku = String(r.v[dc.sku]||'').trim();
-    scannedSku[sku] = 1;
-    let info = snap.bySku[sku];
-    let matchedBy = '';
-    if(!info){
-      // 精準比不到，用正規化（去空白與連字號、轉大寫）再試一次。
-      // 「查無此品號」有一部分是格式差異造成的假陰性，那種情況硬說查無會把人引到錯的方向。
-      const alt = snap.normIndex[normSku_(sku)];
-      if(alt && snap.bySku[alt]){ info = snap.bySku[alt]; matchedBy = alt; scannedSku[alt] = 1; rescuedCount++; }
-    }
-    const scanned = countNum_(r.v[dc.countScanned]);
-    if(!info){
-      // 庫存表真的完全沒有這個品號。品名改從「條碼轉品號」補，至少讓人看得懂掃到什麼。
-      const hit = codeMap[sku];
-      if(hit && hit.name && !String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = hit.name;
-      r.v[dc.countExpected] = '';
-      r.v[dc.countDiff] = '';
-      r.v[dc.countResult] = '庫存表查無此品號';
-      r.v[dc.otherStock] = hit
-        ? '條碼轉品號查得到（' + (hit.name || '無品名') + '），但庫存表沒有任何一列 → 各據點都沒有庫存紀錄'
-        : '條碼轉品號與庫存表都查不到，請確認是掃錯條碼還是尚未建檔';
-      unknownCount++;
-    } else {
-      if(!String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = info.baseName;
-      if(!String(r.v[dc.spec]||'').trim()) r.v[dc.spec] = info.spec;
-      r.v[dc.countExpected] = info.expected;
-      const d = scanned - info.expected;
-      r.v[dc.countDiff] = d;
-      r.v[dc.countResult] = d === 0 ? '相符' : (d > 0 ? '盤盈' : '盤虧');
-      if(d === 0) okCount++; else diffCount++;
-      // 只要對不起來就告訴人「那它在哪」——盤盈（現場有、帳上沒有或比較少）跟盤虧
-      // （現場比帳上少，少的那些可能根本在別店）問的是同一件事。相符的不填，
-      // 不然每一列都掛一長串，真正要看的反而被淹掉。
-      // 靠正規化才對上的也填，因為那一列要註明庫存表登記的品號是什麼。
-      //
-      // 「未盤到」那批不走這裡（它們是結束時另外補上的列）：那可能有好幾千筆，
-      // 每筆都掛一長串會把分頁撐爆，而且帳上本來就有貨，問「別處有沒有」意義不大。
-      if(d !== 0 || matchedBy){
-        const where = info.locs.length ? info.locs.join('、') : '其他據點都沒有庫存';
-        r.v[dc.otherStock] = (matchedBy ? '庫存表登記的品號是「' + matchedBy + '」（靠正規化對上）／' : '') + where;
-      }
-    }
+    const res = reconcileDetailRow_(r, dc, snap, codeMap);
+    scannedSku[res.sku] = 1;
+    if(res.altSku) scannedSku[res.altSku] = 1;
+    if(res.rescued) rescuedCount++;
+    if(res.unknown) unknownCount++;
+    else if(res.same) okCount++;
+    else diffCount++;
   });
+
 
   // 庫存表說有、現場沒掃到。只有全店盤點時才有意義（見 COUNT_UNSCANNED_MAX 上面的說明）。
   const missing = [];
