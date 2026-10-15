@@ -52,14 +52,17 @@ function makeSS(name, sheets){
 //   G中華門市倉 H門外漢門市倉 I網購庫存倉 J總倉
 const CACHE_HEADER2 = ['品號','品名','規格','ODM士林倉','三相之力','山物獵人網購倉',
                        '中華門市倉','門外漢門市倉','網購庫存倉','總倉'];
-const cacheRows = [new Array(10).fill(''), CACHE_HEADER2];
+const cacheRows = [CACHE_HEADER2];   // 山物倉地圖／庫存表：第1列表頭、第2列起資料
 // 門市對照（使用者提供）：D=士林、E=台中、G=中華、H=台南
 //            品號     品名    規格   D  E  F  G  H   I   J
 cacheRows.push(['SKU-A','商品A','紅', 0, 1, 0, 5, 2, 10,  3]);  // 中華5、台南2、台中1
 cacheRows.push(['SKU-B','商品B','藍', 0, 0, 0, 3, 0,  0,  0]);  // 中華3、台南0
 cacheRows.push(['SKU-C','商品C','黑', 0, 0, 0, 0, 7,  0,  0]);  // 中華0、台南7
 cacheRows.push(['SKU-D','商品D','白', 0, 1, 0, 4, 1,  0,  0]);  // 中華4、台南1
-const cache = makeSheet('山物地圖(快取)', cacheRows);
+const stock = makeSheet('庫存表', cacheRows);
+// 現場實測：鏡像分頁「山物地圖(快取)」是空的（分頁在、但沒有資料列）。
+// 這正是「分頁存在不等於有資料」那個坑，測試要重現它。
+const emptyCache = makeSheet('山物地圖(快取)', [[], []]);
 
 // 「條碼轉品號」：A? B品號 C條碼 D品名
 const barcode = makeSheet('條碼轉品號', [
@@ -88,7 +91,8 @@ const sandbox = {
   SpreadsheetApp: {
     getActiveSpreadsheet: () => BACKEND,
     setActiveSpreadsheet: s => { BACKEND = s; },
-    openById: id => (String(id).indexOf('1hZ6') === 0 ? CACHE_SS : BACKEND),
+    openById: id => (String(id).indexOf('1rVA') === 0 ? STOCK_SS
+                 : String(id).indexOf('1hZ6') === 0 ? CACHE_SS : BACKEND),
     flush(){}, create: n => makeSS(n, {}),
     ProtectionType:{SHEET:'SHEET',RANGE:'RANGE'},
     newDataValidation: ()=>({ requireValueInList: ()=>({ setAllowInvalid: ()=>({ build: ()=>({}) }) }) }),
@@ -99,11 +103,13 @@ vm.createContext(sandbox);
 const src = fs.readFileSync(process.argv[2],'utf8')
   + "\n;globalThis.__x = {startCountSession, countScanBatch, setCountQty, finishCountSession,"
   + " getCountSession, listCountSessions, STORE_LIST, STORE_DEFS, storeDef_,"
+  + " openStoreStockSheet_, storeStockSnapshot_, _ssMemo_,"
   + " SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER, COUNT_SESSION_HEADER};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
 const X = sandbox.__x;
 
-CACHE_SS = makeSS('文山地圖', {'山物地圖(快取)': cache});
+let STOCK_SS = makeSS('山物倉地圖', {'庫存表': stock});
+CACHE_SS = makeSS('文山地圖', {'山物地圖(快取)': emptyCache});
 BACKEND  = makeSS('文山出貨確認系統-後端', {'條碼轉品號': barcode});
 
 let fail = 0;
@@ -119,6 +125,14 @@ ck('ODM-士林門市 = D(4)', JSON.stringify(X.storeDef_('ODM-士林門市').col
 ck('快取第7欄表頭是中華門市倉', CACHE_HEADER2[6] === '中華門市倉', CACHE_HEADER2[6]);
 ck('快取第5欄表頭是三相之力', CACHE_HEADER2[4] === '三相之力', CACHE_HEADER2[4]);
 ck('快取第8欄表頭是門外漢門市倉', CACHE_HEADER2[7] === '門外漢門市倉', CACHE_HEADER2[7]);
+
+console.log('\n【來源挑選】鏡像是空的，必須自己退回去讀真的那一份');
+const open1 = X.openStoreStockSheet_();
+console.log('   用到的來源：', open1.label, '| 試過：', JSON.stringify(open1.tried));
+ck('挑到山物倉地圖／庫存表', open1.ok && open1.label === '山物倉地圖／庫存表', open1.label);
+ck('資料從第2列起', open1.firstRow === 2, open1.firstRow);
+const snapChk = X.storeStockSnapshot_('秀山莊-中華門市');
+ck('讀得到庫存（不是空的）', snapChk.ok && snapChk.withStock.length === 3, snapChk.ok && snapChk.withStock);
 
 console.log('\n【開場次】');
 ck('門市沒選會被擋', X.startCountSession({counterId:'01'}).ok === false);
@@ -202,5 +216,25 @@ ck('兩場次互不干擾：中華那場 SKU-A 應有仍是 5', detail['SKU-A'][
 const ls = X.listCountSessions({});
 ck('場次清單有兩筆、最新在前', ls.ok && ls.sessions.length===2 && ls.sessions[0].sessionId===st2.sessionId, ls.sessions && ls.sessions.length);
 
-console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離');
+console.log('\n【備援】主來源整個不見時要退回鏡像，而不是整個停擺');
+const savedStock = STOCK_SS;
+// openSheetMemo_ 會把開過的試算表記在 _ssMemo_ 裡（同一次執行內重用，省開檔成本）。
+// 測試中途換掉來源的話一定要先清掉，不然它根本不會重新開檔——這是測試自己的陷阱，
+// 不是被測程式的問題。
+const clearMemo = () => Object.keys(X._ssMemo_).forEach(k => { delete X._ssMemo_[k]; });
+clearMemo();
+STOCK_SS = makeSS('山物倉地圖', {});                       // 分頁被改名／權限被收回
+CACHE_SS._sheets['山物地圖(快取)'] = makeSheet('山物地圖(快取)',
+  [[], CACHE_HEADER2, ['SKU-A','商品A','紅',0,1,0,5,2,10,3]]);   // 鏡像這次有資料
+const open2 = X.openStoreStockSheet_();
+console.log('   用到的來源：', open2.label, '| 試過：', JSON.stringify(open2.tried));
+ck('退回鏡像備援', open2.ok && open2.label === '鏡像備援', open2.label);
+ck('備援的資料從第3列起', open2.firstRow === 3, open2.firstRow);
+CACHE_SS._sheets['山物地圖(快取)'] = makeSheet('山物地圖(快取)', [[], []]);
+clearMemo();
+const open3 = X.openStoreStockSheet_();
+ck('兩個來源都沒資料時誠實回報失敗', open3.ok === false && /沒有資料列|找不到/.test(open3.error||''), open3.error);
+STOCK_SS = savedStock; clearMemo();
+
+console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、來源挑選與備援');
 process.exit(fail?1:0);

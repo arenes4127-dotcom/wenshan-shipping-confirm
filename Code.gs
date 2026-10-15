@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.183';
+const BACKEND_VERSION = '2026-10-15.184';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8788,6 +8788,18 @@ const COUNT_DETAIL_HEADER = ['sessionId','countStore','sku','baseName','spec','c
 // 記錄是隨時可能發生的事（第一版對照表就曾經把 E 和 H 都指向台中），留著加總能力
 // 不用付任何代價，真的發生時改這一行就好。
 // 兩個「網路倉庫」不列進盤點選單：那是倉庫不是門市，這個功能是門市盤點。
+// 直接讀使用者指定的來源，不走鏡像。
+// 原本為了省「開外部試算表 350~570ms」而讀既有的鏡像分頁「山物地圖(快取)」，
+// 但 2026-10-15 實測那個鏡像是空的（getLastRow() < 3），對帳會整個算不出來。
+// 盤點一次只在「結束盤點」時讀一次庫存，半秒換不到這個風險。
+// 山物倉地圖／庫存表：第1列表頭、第2列起資料，欄位佈局跟上面那張對照表一致。
+const STORE_STOCK_SOURCE_ID = '1rVAAGPeTc3p4m0xpKLnByteYELW1imuhLPhJhTmbI_8';
+const STORE_STOCK_TAB = '庫存表';
+const STORE_STOCK_FIRST_ROW = 2;
+// 鏡像還留著當備援：來源那份是別人的試算表（owner ec@outdoorman.co），
+// 哪天被收回權限或改名時，至少還有一條路可以走，而不是整個功能停擺。
+const STORE_STOCK_FALLBACK = {id: LOCMAP_SOURCE_ID, tab: LOC_SYNC_TAB, firstRow: LOC_SYNC_FIRST_ROW};
+
 const STORE_DEFS = [
   {name: 'ODM-士林門市',    cols: [4], from: ['D ODM士林倉']},
   {name: 'ODM-台中門市',    cols: [5], from: ['E 三相之力']},
@@ -8833,16 +8845,35 @@ function countNum_(v){
 // 把整張庫存快取的「某一家門市」讀成一份快照。
 // 一次 getRange 把 A~J 讀下來，不要每個品號各讀一列——盤完一次要查上百個品號，
 // 逐列讀就是上百次 RPC。而且「沒掃到但庫存說有」那段本來就得整欄看過。
+// 回傳第一個「真的有資料」的來源。只找得到分頁不算數——鏡像那張分頁一直都在，
+// 只是裡面是空的，而「分頁存在但沒資料」正是會讓對帳安靜地算出一堆假差異的情況。
+function openStoreStockSheet_(){
+  const tried = [];
+  const candidates = [
+    {id: STORE_STOCK_SOURCE_ID, tab: STORE_STOCK_TAB, firstRow: STORE_STOCK_FIRST_ROW, label: '山物倉地圖／庫存表'},
+    {id: STORE_STOCK_FALLBACK.id, tab: STORE_STOCK_FALLBACK.tab, firstRow: STORE_STOCK_FALLBACK.firstRow, label: '鏡像備援'}
+  ];
+  for(let i = 0; i < candidates.length; i++){
+    const c = candidates[i];
+    try{
+      const sh = openSheetMemo_(c.id).getSheetByName(c.tab);
+      if(!sh){ tried.push(c.label + '：找不到「' + c.tab + '」分頁'); continue; }
+      const last = sh.getLastRow();
+      if(last - c.firstRow + 1 < 1){ tried.push(c.label + '：分頁在但沒有資料列'); continue; }
+      return {ok:true, sh: sh, firstRow: c.firstRow, label: c.label, lastRow: last, tried: tried};
+    }catch(err){ tried.push(c.label + '：' + err); }
+  }
+  return {ok:false, error: tried.join('；'), tried: tried};
+}
+
 function storeStockSnapshot_(store){
   const def = storeDef_(store);
   if(!def) return {ok:false, error:'不認得的門市：' + store};
-  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
-  const src = ss.getSheetByName(LOC_SYNC_TAB);
-  if(!src) return {ok:false, error:'找不到「' + LOC_SYNC_TAB + '」分頁'};
-  const last = src.getLastRow();
-  const n = last - LOC_SYNC_FIRST_ROW + 1;
-  if(n < 1) return {ok:false, error:'庫存快取沒有資料列'};
-  const vals = src.getRange(LOC_SYNC_FIRST_ROW, 1, n, 10).getValues();
+  const open = openStoreStockSheet_();
+  if(!open.ok) return {ok:false, error: open.error};
+  const src = open.sh;
+  const n = open.lastRow - open.firstRow + 1;
+  const vals = src.getRange(open.firstRow, 1, n, 10).getValues();
   const bySku = {}, withStock = [];
   vals.forEach(function(r){
     const sku = String(r[0]||'').trim();
@@ -8853,7 +8884,7 @@ function storeStockSnapshot_(store){
     if(expected > 0) withStock.push(sku);
   });
   return {ok:true, bySku: bySku, withStock: withStock, rowsScanned: vals.length,
-          store: store, cols: def.cols};
+          store: store, cols: def.cols, source: open.label};
 }
 
 function countSessionCol_(){
@@ -9204,17 +9235,20 @@ function setupCount(){
 // 欄位對錯整個盤點就沒有意義，而且錯了不會拋錯、只會默默算出一堆假差異——
 // 所以上線前一定要用真資料看一眼。
 function diagnoseStoreStock(){
-  const out = {快取分頁: LOC_SYNC_TAB,
-               門市欄位對照: STORE_DEFS.map(function(d){
+  const out = {門市欄位對照: STORE_DEFS.map(function(d){
                  return d.name + ' ← ' + d.from.join(' ＋ ');
                })};
   try{
-    const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
-    const src = ss.getSheetByName(LOC_SYNC_TAB);
-    if(!src){ out.結論 = '找不到快取分頁'; Logger.log(JSON.stringify(out,null,2)); return JSON.stringify(out,null,2); }
-    // 第2列是來源庫存表自己的表頭（見 LOC_SYNC_FIRST_ROW 的說明）
-    out.來源表頭第2列 = src.getRange(2, 1, 1, 12).getValues()[0];
-    out.資料第一列 = src.getRange(LOC_SYNC_FIRST_ROW, 1, 1, 12).getValues()[0];
+    const open = openStoreStockSheet_();
+    out.試過的來源 = open.tried.length ? open.tried : ['（第一個來源就成功）'];
+    if(!open.ok){
+      out.結論 = '兩個來源都讀不到資料：' + open.error;
+      Logger.log(JSON.stringify(out,null,2)); return JSON.stringify(out,null,2);
+    }
+    const src = open.sh;
+    out.實際使用的來源 = open.label + '（資料從第 ' + open.firstRow + ' 列起，共到第 ' + open.lastRow + ' 列）';
+    out.來源表頭第2列 = src.getRange(open.firstRow - 1, 1, 1, 12).getValues()[0];
+    out.資料第一列 = src.getRange(open.firstRow, 1, 1, 12).getValues()[0];
     STORE_DEFS.forEach(function(d){
       const got = d.cols.map(function(c){
         return '第' + c + '欄=「' + String(out.來源表頭第2列[c - 1] || '') + '」';
