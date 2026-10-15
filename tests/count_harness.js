@@ -231,8 +231,11 @@ ck('9999 標成查無此品號', detail['9999999999999'] && detail['999999999999
 const iOs0 = H.indexOf('otherStock');
 console.log('   盤虧/盤盈的「其他據點庫存」：');
 ['SKU-A','SKU-B'].forEach(k=>console.log('    ', k, detail[k][iRs], '|', detail[k][iOs0]));
-ck('盤虧(SKU-A)也要列出哪裡有貨', /ODM-台南門市/.test(detail['SKU-A'][iOs0]) && /秀山莊通路-網路倉庫/.test(detail['SKU-A'][iOs0]), detail['SKU-A'][iOs0]);
+ck('盤虧(SKU-A)也要列出哪裡有貨', /ODM-台南門市 2/.test(detail['SKU-A'][iOs0]) && /秀山莊通路-網路倉庫/.test(detail['SKU-A'][iOs0]), detail['SKU-A'][iOs0]);
 ck('不列出正在盤的這家店自己', !/秀山莊-中華門市/.test(detail['SKU-A'][iOs0]), detail['SKU-A'][iOs0]);
+ck('不顯示括弧裡的原始欄名', !/（/.test(detail['SKU-A'][iOs0]), detail['SKU-A'][iOs0]);
+ck('同名的倉要合併相加（網購庫存倉10＋總倉3=13）', /秀山莊通路-網路倉庫 13/.test(detail['SKU-A'][iOs0]), detail['SKU-A'][iOs0]);
+ck('同名的倉只出現一次', (detail['SKU-A'][iOs0].match(/秀山莊通路-網路倉庫/g)||[]).length === 1, detail['SKU-A'][iOs0]);
 ck('盤盈(SKU-B)其他據點都沒貨時明講', /其他據點都沒有庫存/.test(detail['SKU-B'][iOs0]), detail['SKU-B'][iOs0]);
 ck('未盤到(SKU-D)不掛長字串', !detail['SKU-D'][iOs0], detail['SKU-D'][iOs0]);
 
@@ -270,8 +273,7 @@ const d4 = {};
 det._rows.slice(1).forEach(row=>{ if(row[0]===st4.sessionId && row[iSku]) d4[row[iSku]] = row; });
 Object.keys(d4).forEach(k=>console.log('   ', k, '|', d4[k][iNm], '|', d4[k][iRs], '|', d4[k][iOs]));
 ck('SKU-E 帳上0 → 列出士林/在途/台南總倉', /ODM-士林門市/.test(d4['SKU-E'][iOs]) && /台南總倉/.test(d4['SKU-E'][iOs]) && /商品在途倉/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
-ck('名稱與原欄名相同時不重複印', !/台南總倉（台南總倉）/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
-ck('名稱與原欄名不同時要附原欄名', /ODM-士林門市（ODM士林倉）/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
+ck('只顯示對照後的名稱', /ODM-士林門市 9/.test(d4['SKU-E'][iOs]) && !/（/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
 ck('otherStock 是最後一欄（既有資料不會錯位）', H[H.length-1] === 'otherStock', H[H.length-1]);
 ck('SKU-E 不應列出中華（正在盤的就是這家）', !/秀山莊-中華門市/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
 ck('SKU-X 查無此品號但品名有補上', d4['SKU-X'][iRs]==='庫存表查無此品號' && /商品X/.test(d4['SKU-X'][iNm]), [d4['SKU-X'][iRs], d4['SKU-X'][iNm]]);

@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.192';
+const BACKEND_VERSION = '2026-10-15.193';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8922,14 +8922,22 @@ function storeStockSnapshot_(store){
     // 這個品號在「其他」據點各有多少（只留有數量的）。給「我這家店對不起來，那它在哪」用。
     // 正在盤的這家店自己要排除——欄位叫「其他據點庫存」，而且這家店的數量「庫存表數量」
     // 那一欄已經有了，再列一次只是讓人多讀一遍還讀到矛盾的字。
-    const locs = [];
+    // 只顯示對照後的名稱，不顯示原始欄名——現場看的是「哪一間店有貨」，
+    // 「山物獵人網購倉」這種內部欄名對他們沒有意義，只是把字擠長。
+    //
+    // 但不能只是把括弧刪掉：I 網購庫存倉與 J 總倉的對照名稱是同一個
+    //（秀山莊通路-網路倉庫），兩欄都有貨時會變成同一個名字出現兩次。
+    // 同名的合併相加，那也比較接近人看這張表的方式——他們想知道「那個倉有幾件」，
+    // 不是「那個倉在庫存表裡拆成幾欄記」。
+    const byName = {}, nameOrder = [];
     LOCATION_DEFS.forEach(function(L){
       if(def.cols.indexOf(L.col) >= 0) return;
       const q = countNum_(r[L.col - 1]);
-      // 對照名稱跟原欄名一樣時不要印兩次（「台南總倉（台南總倉）4」很蠢）。
-      // 不一樣才附上原欄名——I 網購庫存倉與 J 總倉的對照名相同，不附的話會看不出是哪一欄。
-      if(q > 0) locs.push(L.name === L.raw ? (L.name + ' ' + q) : (L.name + '（' + L.raw + '）' + q));
+      if(q <= 0) return;
+      if(byName[L.name] === undefined){ byName[L.name] = 0; nameOrder.push(L.name); }
+      byName[L.name] += q;
     });
+    const locs = nameOrder.map(function(n){ return n + ' ' + byName[n]; });
     bySku[sku] = {baseName: String(r[1]||'').trim(), spec: String(r[2]||'').trim(),
                   expected: expected, locs: locs};
     const nk = normSku_(sku);
