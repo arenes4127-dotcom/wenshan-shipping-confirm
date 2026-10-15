@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.186';
+const BACKEND_VERSION = '2026-10-15.187';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -319,6 +319,7 @@ const ONE_TIME_SETUP_FUNCTIONS = {
   diagnoseArchiveBacklog_: () => diagnoseArchiveBacklog_(),
   diagnoseTriggers_: () => diagnoseTriggers_(),
   setupCountSheets_: () => setupCountSheets_(),
+  setupCountDiffSheet_: () => setupCountDiffSheet_(),
   peekTransferStage_: () => peekTransferStage_(),
   mirrorTransferToWorkspace_: () => mirrorTransferToWorkspace_(),
   checkProductImageCoverage_: () => checkProductImageCoverage_(),
@@ -9208,11 +9209,89 @@ function listCountSessions(body){
   return {ok:true, sessions: sessions, stores: STORE_LIST};
 }
 
-// 一次性設定：建好兩張分頁並附上系統警語。
+// 盤點差異表：在試算表裡直接用下拉選單挑場次，底下自動帶出那一場的明細。
+//
+// 為什麼用公式而不是腳本產生：挑一個場次就要去執行一次函式，現場不會想這樣用，
+// 而且跑完的結果是死的，重新挑又要再跑一次。公式選完就變，也不需要任何權限。
+// 代價是這一整頁都是公式、手動改一格就會把公式蓋掉——所以 A1 掛了警語。
+//
+// 下拉選單綁的是「盤點場次」A欄的整欄範圍，新場次一開就自動出現在選單裡，
+// 不用回頭重建這張表。
+const SHEET_COUNT_DIFF = '盤點差異表';
+function setupCountDiffSheet_(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_COUNT_DIFF);
+  if(!sh) sh = ss.insertSheet(SHEET_COUNT_DIFF);
+  sh.clear();            // 整頁都是公式，重建就整張重寫
+  sh.clearConditionalFormatRules();
+
+  const q = "'" + SHEET_COUNT_DETAIL + "'!";
+  const qs = "'" + SHEET_COUNT_SESSION + "'!";
+  // 盤點明細：A場次 B門市 C品號 D品名 E規格 F實盤 G庫存表 H差異 I核對結果
+  // 盤點場次：A場次 B門市 C工號 D姓名 E開始 F結束 G狀態 H件數 I品項 J差異項
+  const look = function(col){
+    return '=IF($B$1="","",IFERROR(INDEX(' + qs + col + ':' + col + ',MATCH($B$1,' + qs + 'A:A,0)),""))';
+  };
+  const cnt = function(result){
+    return '=IF($B$1="","",COUNTIFS(' + q + 'A:A,$B$1,' + q + 'I:I,"' + result + '"))';
+  };
+
+  sh.getRange('A1').setValue('場次編號');
+  sh.getRange('A2').setValue('只看有差異');
+  sh.getRange('A3').setValue('門市');
+  sh.getRange('A4').setValue('盤點人');
+  sh.getRange('A5').setValue('狀態／時間');
+  sh.getRange('B3').setFormula(look('B'));
+  sh.getRange('B4').setFormula(look('D'));
+  sh.getRange('B5').setFormula('=IF($B$1="","",IFERROR(INDEX(' + qs + 'G:G,MATCH($B$1,' + qs
+    + 'A:A,0))&"　"&INDEX(' + qs + 'E:E,MATCH($B$1,' + qs + 'A:A,0)),""))');
+
+  sh.getRange('D1').setValue('相符');          sh.getRange('E1').setFormula(cnt('相符'));
+  sh.getRange('D2').setValue('盤盈');          sh.getRange('E2').setFormula(cnt('盤盈'));
+  sh.getRange('D3').setValue('盤虧');          sh.getRange('E3').setFormula(cnt('盤虧'));
+  sh.getRange('D4').setValue('未盤到');        sh.getRange('E4').setFormula(cnt('未盤到'));
+  sh.getRange('D5').setValue('庫存表查無此品號'); sh.getRange('E5').setFormula(cnt('庫存表查無此品號'));
+
+  const head = ['品號','品名','規格','實盤數','庫存表數量','差異','核對結果'];
+  sh.getRange(7, 1, 1, head.length).setValues([head]);
+
+  // order by H asc：差異最負的（盤虧最嚴重）排最前面，那是最該先看的
+  sh.getRange('A8').setFormula(
+    '=IF($B$1="","← 請先在 B1 選一個場次編號",' +
+    'IFERROR(QUERY(' + q + '$A$2:$K,' +
+    '"select C,D,E,F,G,H,I where A = \'"&$B$1&"\'"&' +
+    'IF($B$2="是"," and I <> \'相符\'","")&" order by H asc",0),' +
+    '"（這個場次沒有符合條件的資料）"))');
+
+  // 下拉選單：場次編號綁整欄，新場次自動出現；「只看有差異」是是/否
+  sh.getRange('B1').setDataValidation(SpreadsheetApp.newDataValidation()
+    .requireValueInRange(ss.getSheetByName(SHEET_COUNT_SESSION).getRange('A2:A'), true)
+    .setAllowInvalid(false).build());
+  sh.getRange('B2').setDataValidation(SpreadsheetApp.newDataValidation()
+    .requireValueInList(['是','否'], true).setAllowInvalid(false).build());
+  if(!sh.getRange('B2').getValue()) sh.getRange('B2').setValue('是');
+
+  sh.getRange('A1:A5').setFontWeight('bold');
+  sh.getRange('D1:D5').setFontWeight('bold');
+  sh.getRange(7, 1, 1, head.length).setFontWeight('bold');
+  sh.setFrozenRows(7);
+  sh.setColumnWidth(1, 180); sh.setColumnWidth(2, 320); sh.setColumnWidth(3, 160);
+  sh.getRange('A1').setNote([SYSTEM_SHEET_WARNING, '',
+    '這頁除了 B1／B2 兩個下拉選單以外全部是公式，手動改任何一格都會把公式蓋掉、',
+    '那一格就不會再自動更新。要還原的話重跑一次 setupCount 就會整頁重建。',
+    '',
+    '用法：B1 選場次編號 → 底下自動列出那一場的明細。',
+    'B2 選「是」只看有差異的（相符的不列），選「否」看全部。'].join('\n'));
+  return {分頁: SHEET_COUNT_DIFF, 用法: 'B1 選場次編號，B2 選要不要只看有差異的'};
+}
+
+// 一次性設定：建好分頁並附上系統警語。
 function setupCountSheets_(){
   getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
   getSheet(SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER);
-  return {已建立: [SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL], 門市: STORE_LIST};
+  const diff = setupCountDiffSheet_();
+  return {已建立: [SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, SHEET_COUNT_DIFF],
+          門市: STORE_LIST, 差異表用法: diff.用法};
 }
 
 // 門市盤點的唯一上線入口。名字不帶底線，所以編輯器的函式下拉選單選得到——

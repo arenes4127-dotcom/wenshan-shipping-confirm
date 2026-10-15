@@ -19,6 +19,18 @@ function makeSheet(name, rows){
     appendRow(vals){ this._rows.push(vals.slice()); },
     getDataRange(){ return this.getRange(1,1,this._rows.length,this.getLastColumn()); },
     getRange(r,c,nr,nc){
+      // 支援 A1 位址寫法（'A1'、'A1:A5'、'A2:A'）。Apps Script 兩種都收，
+      // 盤點差異表那段用的是 A1 寫法。
+      if(typeof r === 'string'){
+        const col = t => { let n=0; for(const ch of t) n = n*26 + (ch.charCodeAt(0)-64); return n; };
+        const parts = r.split(':');
+        const m1 = /^([A-Z]+)(\d*)$/.exec(parts[0]);
+        const m2 = parts[1] ? /^([A-Z]+)(\d*)$/.exec(parts[1]) : null;
+        const r1 = m1[2] ? parseInt(m1[2],10) : 1, c1 = col(m1[1]);
+        const r2 = m2 ? (m2[2] ? parseInt(m2[2],10) : Math.max(this.getLastRow(), r1)) : r1;
+        const c2 = m2 ? col(m2[1]) : c1;
+        r = r1; c = c1; nr = Math.max(r2 - r1 + 1, 1); nc = Math.max(c2 - c1 + 1, 1);
+      }
       nr = nr==null?1:nr; nc = nc==null?1:nc;
       const sh = this;
       return {
@@ -26,15 +38,23 @@ function makeSheet(name, rows){
           for(let j=0;j<nc;j++) t.push(row[c-1+j]===undefined?'':row[c-1+j]); o.push(t);} return o; },
         getValue(){ return this.getValues()[0][0]; },
         setValues(vals){ for(let i=0;i<vals.length;i++){ while(sh._rows.length < r-1+i+1) sh._rows.push([]);
+          if(!sh._rows[r-1+i]) sh._rows[r-1+i] = [];
           for(let j=0;j<vals[i].length;j++) sh._rows[r-1+i][c-1+j]=vals[i][j]; } return this; },
         setValue(v){ return this.setValues([[v]]); },
         clearContent(){ for(let i=0;i<nr;i++){ const row=sh._rows[r-1+i]; if(!row) continue;
           for(let j=0;j<nc;j++) row[c-1+j]=''; } return this; },
         setNumberFormat(){ return this; }, setNote(){ return this; },
+        setFontWeight(){ return this; }, setDataValidation(){ return this; },
+        setFormula(f){ sh._formulas['R'+r+'C'+c] = f; return this; },
+        getA1Notation(){ return 'R'+r+'C'+c; },
       };
     },
     deleteRows(st,n){ this._rows.splice(st-1, n==null?1:n); },
     setName(n){ this._name=n; }, getSheetId(){ return 1; }, getProtections(){ return []; },
+    // 盤點差異表是整頁公式，建表時會用到這些；記下設過的公式讓測試檢查
+    _formulas: {},
+    clear(){ this._rows = []; this._formulas = {}; },
+    clearConditionalFormatRules(){}, setFrozenRows(){}, setColumnWidth(){},
   };
 }
 function makeSS(name, sheets){
@@ -89,13 +109,14 @@ const sandbox = {
   DriveApp: { getFolderById:()=>({ getFilesByName:()=>({hasNext:()=>false}), addFile(){} }),
               getFileById:()=>({ setTrashed(){} }), getRootFolder:()=>({ removeFile(){} }) },
   SpreadsheetApp: {
+    newDataValidation: () => ({ requireValueInRange: () => ({ setAllowInvalid: () => ({ build: () => ({}) }) }),
+                                requireValueInList:  () => ({ setAllowInvalid: () => ({ build: () => ({}) }) }) }),
     getActiveSpreadsheet: () => BACKEND,
     setActiveSpreadsheet: s => { BACKEND = s; },
     openById: id => (String(id).indexOf('1rVA') === 0 ? STOCK_SS
                  : String(id).indexOf('1hZ6') === 0 ? CACHE_SS : BACKEND),
     flush(){}, create: n => makeSS(n, {}),
     ProtectionType:{SHEET:'SHEET',RANGE:'RANGE'},
-    newDataValidation: ()=>({ requireValueInList: ()=>({ setAllowInvalid: ()=>({ build: ()=>({}) }) }) }),
   },
 };
 sandbox.globalThis = sandbox;
@@ -104,6 +125,7 @@ const src = fs.readFileSync(process.argv[2],'utf8')
   + "\n;globalThis.__x = {startCountSession, countScanBatch, setCountQty, finishCountSession,"
   + " getCountSession, listCountSessions, STORE_LIST, STORE_DEFS, storeDef_,"
   + " openStoreStockSheet_, storeStockSnapshot_, _ssMemo_,"
+  + " setupCountDiffSheet_, SHEET_COUNT_DIFF,"
   + " SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER, COUNT_SESSION_HEADER};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
 const X = sandbox.__x;
@@ -249,6 +271,28 @@ clearMemo();
 const open3 = X.openStoreStockSheet_();
 ck('兩個來源都沒資料時誠實回報失敗', open3.ok === false && /沒有資料列|找不到/.test(open3.error||''), open3.error);
 STOCK_SS = savedStock; clearMemo();
+
+console.log('\n【盤點差異表】整頁公式，引號寫錯只會在試算表裡變 #ERROR、不會拋錯');
+const diffInfo = X.setupCountDiffSheet_();
+const dsh = BACKEND.getSheetByName(X.SHEET_COUNT_DIFF);
+ck('分頁建出來了', !!dsh, diffInfo);
+const f = dsh._formulas;
+const qf = f['R8C1'];
+console.log('   A8 的 QUERY 公式：');
+console.log('   ', qf);
+ck('A8 有 QUERY 公式', !!qf && qf.indexOf('QUERY') > 0, qf);
+ck('引號成對（單引號偶數個）', (qf.match(/'/g)||[]).length % 2 === 0, (qf.match(/'/g)||[]).length);
+ck('雙引號成對', (qf.match(/"/g)||[]).length % 2 === 0, (qf.match(/"/g)||[]).length);
+ck('指到盤點明細', qf.indexOf("'盤點明細'!") > 0, qf.slice(0,60));
+ck('有 where 條件綁 B1', qf.indexOf('where A = ') > 0 && qf.indexOf('$B$1') > 0);
+ck('有「只看有差異」的條件', qf.indexOf("I <> ") > 0 && qf.indexOf('$B$2') > 0);
+ck('最負的差異排前面', qf.indexOf('order by H asc') > 0);
+ck('空場次時給提示而不是 #ERROR', qf.indexOf('請先在 B1 選一個場次編號') > 0);
+console.log('   E1 的計數公式：', f['R1C5']);
+ck('相符計數綁場次與結果欄', (f['R1C5']||'').indexOf("'盤點明細'!I:I") > 0 && (f['R1C5']||'').indexOf('$B$1') > 0, f['R1C5']);
+ck('五種核對結果都有計數', ['R1C5','R2C5','R3C5','R4C5','R5C5'].every(k=>!!f[k]));
+console.log('   B5 的場次摘要：', f['R5C2']);
+ck('摘要指到盤點場次', (f['R5C2']||'').indexOf("'盤點場次'!") > 0, f['R5C2']);
 
 console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、來源挑選與備援');
 process.exit(fail?1:0);
