@@ -321,6 +321,19 @@
     display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
   .confirm-box input[type=number]{width:100%;font-size:20px;text-align:center;margin-bottom:12px;}
 
+  /* ---- 盤點數量鍵盤 ----
+     現場用手持機單手操作，prompt() 的系統輸入框又小又難按，還會把掃描焦點搶走。
+     按鍵做大（最小 60px 高），指頭戴手套也按得到。 */
+  .keypad-cur{font-size:13px;color:var(--muted);margin:0 0 6px;}
+  .keypad-display{background:var(--bg);border:1px solid var(--border);border-radius:8px;
+    padding:14px 16px;font-size:34px;font-weight:700;text-align:right;letter-spacing:1px;
+    min-height:62px;line-height:1.1;margin-bottom:12px;}
+  .keypad-display.empty{color:var(--muted2);}
+  .keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;}
+  .keypad button{min-height:60px;font-size:24px;font-weight:600;background:var(--panel2);
+    color:var(--text);border:1px solid var(--border);border-radius:10px;}
+  .keypad button:active{background:var(--border);}
+  .keypad button.wide{font-size:19px;}
   /* ---- flash overlay ---- */
   .flash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;
     z-index:999;pointer-events:none;opacity:0;transition:opacity .08s;text-align:center;padding:20px;}
@@ -358,6 +371,33 @@
     <div class="badge" id="pendingBadge">0 張待出貨</div>
     <div class="staff-chip">包貨：<b id="headerStaffName">未選擇</b></div>
   </header>
+
+  <div class="confirm-mask" id="countQtyMask">
+    <div class="confirm-box">
+      <h3 id="countQtyTitle">修改數量</h3>
+      <div class="meta" id="countQtySku"></div>
+      <p class="keypad-cur" id="countQtyCur"></p>
+      <div class="keypad-display empty" id="countQtyDisplay">0</div>
+      <div class="keypad">
+        <button type="button" data-k="1">1</button>
+        <button type="button" data-k="2">2</button>
+        <button type="button" data-k="3">3</button>
+        <button type="button" data-k="4">4</button>
+        <button type="button" data-k="5">5</button>
+        <button type="button" data-k="6">6</button>
+        <button type="button" data-k="7">7</button>
+        <button type="button" data-k="8">8</button>
+        <button type="button" data-k="9">9</button>
+        <button type="button" class="wide" data-k="clear">清除</button>
+        <button type="button" data-k="0">0</button>
+        <button type="button" class="wide" data-k="back">⌫</button>
+      </div>
+      <div class="row">
+        <button type="button" class="btn gray" id="countQtyCancel">取消</button>
+        <button type="button" class="btn" id="countQtyOk">確認</button>
+      </div>
+    </div>
+  </div>
 
   <div class="confirm-mask" id="confirmMask">
     <div class="confirm-box">
@@ -5784,6 +5824,7 @@ function startCount(){
       renderCount();
       okBeep();
       flash('ok','盤點開始', store + '　' + who.name, 1500);
+      loadCountStores();   // 把剛開的這場帶進「最近的盤點場次」，否則會一直顯示「還沒有任何盤點紀錄」
       setTimeout(function(){ const el = document.getElementById('countScanInput'); if(el) el.focus(); }, 40);
     })
     .catch(function(err){ errorBeep(); flash('err','開不了場次', err.message || '', 2500); });
@@ -5862,15 +5903,41 @@ function countReconcile_(results){
   });
 }
 
+// 數量鍵盤。刻意「從空的開始」而不是帶入目前數量——帶入的話第一下按鍵到底是
+// 接在後面還是取代掉，現場猜不到，猜錯就是把 3 改成 35。空的開始沒有歧義，
+// 目前數量另外顯示在上面給人對照。
+let countQtyTarget = null, countQtyBuf = '';
 function promptCountQty(sku){
   if(!countSession) return;
   const hit = countItems.filter(function(x){ return (x.sku || x.key) === sku; })[0];
   if(!hit) return;
-  const v = prompt('「' + (hit.name || sku) + '」實際盤到幾件？', String(hit.qty));
-  if(v === null) return;
-  const qty = Number(String(v).trim());
-  if(isNaN(qty) || qty < 0){ errorBeep(); flash('err','數量不對','請輸入 0 或正整數', 1800); return; }
   if(!hit.sku){ errorBeep(); flash('err','這筆還沒同步完','等「待同步」歸零之後再改', 2000); return; }
+  countQtyTarget = hit; countQtyBuf = '';
+  document.getElementById('countQtySku').innerHTML =
+    '<b>' + (hit.sku || '') + '</b><br>' + (hit.name || '（查不到品名）');
+  document.getElementById('countQtyCur').textContent = '目前已盤 ' + hit.qty + ' 件';
+  renderCountQtyPad();
+  document.getElementById('countQtyMask').classList.add('show');
+}
+function renderCountQtyPad(){
+  const d = document.getElementById('countQtyDisplay');
+  if(!d) return;
+  d.textContent = countQtyBuf === '' ? '0' : countQtyBuf;
+  d.classList.toggle('empty', countQtyBuf === '');
+}
+function closeCountQtyPad(){
+  document.getElementById('countQtyMask').classList.remove('show');
+  countQtyTarget = null; countQtyBuf = '';
+  // 關掉之後把焦點還給掃描框，不然下一刷會掉在沒有輸入框的地方
+  setTimeout(function(){ const el = document.getElementById('countScanInput'); if(el) el.focus(); }, 40);
+}
+function commitCountQty(){
+  const hit = countQtyTarget;
+  if(!hit) return;
+  if(countQtyBuf === ''){ errorBeep(); flash('err','還沒輸入數量','按數字鍵，或按取消離開', 1600); return; }
+  const qty = Number(countQtyBuf);
+  if(isNaN(qty) || qty < 0){ errorBeep(); flash('err','數量不對','請輸入 0 或正整數', 1800); return; }
+  closeCountQtyPad();
   // 先把還沒送出的掃描送完，不然後端那邊的累計值會蓋掉這次手改的數字
   Promise.resolve(flushCountQueue()).then(function(){
     return apiPost('setCountQty', {sessionId: countSession.sessionId, sku: hit.sku, qty: qty});
@@ -5957,6 +6024,17 @@ countItems = loadJSON(LS.countItems, []);
 countQueue = loadJSON(LS.countQueue, []);
 if(countQueue.length) scheduleCountFlush();
 wireScanInput(document.getElementById('countScanInput'), countScan);
+document.querySelectorAll('#countQtyMask .keypad button').forEach(function(b){
+  b.addEventListener('click', function(){
+    const k = b.dataset.k;
+    if(k === 'clear') countQtyBuf = '';
+    else if(k === 'back') countQtyBuf = countQtyBuf.slice(0, -1);
+    else if(countQtyBuf.length < 5) countQtyBuf = (countQtyBuf === '0' ? '' : countQtyBuf) + k;
+    renderCountQtyPad();
+  });
+});
+document.getElementById('countQtyCancel').addEventListener('click', closeCountQtyPad);
+document.getElementById('countQtyOk').addEventListener('click', commitCountQty);
 document.getElementById('countStartBtn').addEventListener('click', startCount);
 document.getElementById('countFinishBtn').addEventListener('click', finishCount);
 document.getElementById('countAbandonBtn').addEventListener('click', function(){
