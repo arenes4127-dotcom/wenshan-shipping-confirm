@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.181';
+const BACKEND_VERSION = '2026-10-15.182';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -9155,6 +9155,24 @@ function setupCountSheets_(){
   getSheet(SHEET_COUNT_SESSION, COUNT_SESSION_HEADER);
   getSheet(SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER);
   return {已建立: [SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL], 門市: STORE_LIST};
+}
+
+// 門市盤點的唯一上線入口。名字不帶底線，所以編輯器的函式下拉選單選得到——
+// setupCountSheets_ 和 diagnoseStoreStock 分成兩支、其中一支還是底線結尾，
+// 等於要現場自己記住順序又選不到其中一支。這種事我已經犯過兩次了，合併成一支。
+//
+// 做兩件事：建好兩張分頁，然後立刻把門市欄位對照印出來讓人核對。
+// 欄位核對不是可選步驟——欄位錯不會拋任何錯，只會默默算出一整張假的差異表，
+// 所以把它綁在同一支裡，不給人跳過的機會。
+function setupCount(){
+  const made = setupCountSheets_();
+  const check = diagnoseStoreStock();
+  const text = '【已建立分頁】' + JSON.stringify(made, null, 2)
+             + '\n\n【門市欄位核對】' + check
+             + '\n\n請逐家核對「實際讀到的欄位」跟「預期應該是」是不是同一組名稱。'
+             + '\n對不上就先別拿去盤——欄位錯不會報錯，只會產出一整張假的差異表。';
+  Logger.log(text);
+  return text;
 }
 
 // 唯讀診斷：確認門市庫存欄對到的是不是真的那一欄。
