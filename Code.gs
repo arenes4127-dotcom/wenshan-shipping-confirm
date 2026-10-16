@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-16.196';
+const BACKEND_VERSION = '2026-10-16.197';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -6182,6 +6182,14 @@ function skuNameMap_(){
     const sku = String(r[0]||'').trim();
     if(sku && !map[sku]) map[sku] = String(r[2]||'').trim();
   });
+  // 跟 barcodeToSkuMap_ 同一個理由。兩支都要接，只改一支的話，
+  // 換貨號跟掃描兩邊會對同一個品號顯示不一樣的品名。
+  try{
+    const patch = namePatchMap_();
+    Object.keys(patch).forEach(function(k){
+      if(!map[k] && patch[k].name) map[k] = patch[k].name;
+    });
+  }catch(err){ /* 同上 */ }
   return map;
 }
 
@@ -8768,6 +8776,10 @@ function testShopeeUpdateStage_(){
 // 不直接開那份外部試算表（實測開一次 350~570ms），改讀既有的鏡像分頁
 // LOC_SYNC_TAB「山物地圖(快取)」——它是同一套欄位佈局，現有的
 // LOC_SYNC_STOCK_COLS=[9,10]（I、J）正好可以互相驗證對照沒算錯。
+// 上游「國際碼對照表」還沒收進去的品號，品名補在這張。詳見 namePatchMap_。
+const SHEET_NAME_PATCH = '品名補充';
+const NAME_PATCH_HEADER = ['品號','品名','規格','備註'];
+
 const SHEET_COUNT_SESSION = '盤點場次';
 const SHEET_COUNT_DETAIL  = '盤點明細';
 const COUNT_SESSION_HEADER = ['sessionId','countStore','counterId','counterName','startedAt','endedAt',
@@ -8858,6 +8870,31 @@ const COUNT_UNSCANNED_MAX = 25000;
 // 條碼→品號。掃槍掃到的多半是國際碼，不是品號。
 // 「條碼轉品號」分頁：B品號 C條碼 D品名（既有分頁，skuNameMap_ 也用它）。
 // 兩邊都收進同一張表：掃國際碼或直接掃品號都要認得。
+// 「品名補充」分頁：A品號 B品名 C規格 D備註。
+//
+// 為什麼另開一張而不直接往「條碼轉品號」貼：那張是 IMPORTRANGE 鏡像
+//（A1 一條公式接到山物倉地圖的「國際碼對照表」），整張都是公式吐出來的陣列。
+// 手貼資料進去輕則被拒絕，重則等來源變長、陣列展開撞到手貼的那幾列，
+// 整張變 #REF!——而出貨掃描換貨號、揀貨、調撥驗收、盤點都轉這張表查品名，
+// 一壞就是全系統同時查不到。
+//
+// 用途：上游主檔還沒收進去、但現場已經在掃的新貨。中華門市那一排
+// Nalgene 水壶就是：ERP 有、貨在架上，但倉地圖還沒同步到。
+function namePatchMap_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME_PATCH);
+  const map = {};
+  if(!sh) return map;                 // 還沒建這張表就當沒有，不是錯誤
+  const last = sh.getLastRow();
+  if(last < 2) return map;
+  const vals = sh.getRange(2, 1, last - 1, 3).getValues();
+  vals.forEach(function(r){
+    const sku = String(r[0]||'').trim();
+    if(!sku || map[sku]) return;
+    map[sku] = {name: String(r[1]||'').trim(), spec: String(r[2]||'').trim()};
+  });
+  return map;
+}
+
 function barcodeToSkuMap_(){
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('條碼轉品號');
   const map = {};
@@ -8872,6 +8909,14 @@ function barcodeToSkuMap_(){
     if(code && !map[code]) map[code] = {sku: sku, name: name};
     if(sku  && !map[sku])  map[sku]  = {sku: sku, name: name};
   });
+  // 補充表只補鏡像沒有的。上游永遠優先——等「國際碼對照表」補齊了，
+  // 這裡的補充就自動退場，不會變成兩個版本的品名在打架。
+  try{
+    const patch = namePatchMap_();
+    Object.keys(patch).forEach(function(k){
+      if(!map[k] && patch[k].name) map[k] = {sku: k, name: patch[k].name};
+    });
+  }catch(err){ /* 補充表讀不到不能拖垮主流程 */ }
   return map;
 }
 
@@ -9637,6 +9682,21 @@ function withSheetRetry_(label, fn, tries){
     }
   }
   throw lastErr;
+}
+
+// 建「品名補充」分頁。只建表頭，資料自己貼——品名會變，不適合寫死在程式裡。
+// 沒有底線結尾：Apps Script 編輯器的函式下拉選單會把 name_ 藏起來（這個坑踩過兩次）。
+function setupNamePatch(){
+  const sh = getSheet(SHEET_NAME_PATCH, NAME_PATCH_HEADER);
+  sh.getRange(1, 1, 1, NAME_PATCH_HEADER.length).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  const n = Math.max(0, sh.getLastRow() - 1);
+  const text = '「' + SHEET_NAME_PATCH + '」分頁已就緒，目前 ' + n + ' 筆。\n'
+    + 'A欄品號、B欄品名、C欄規格（可空）、D欄備註（可空），從第 2 列開始貼。\n'
+    + '這張只補「條碼轉品號」鏡像沒有的品號；上游補齊了會自動以上游為準，\n'
+    + '所以貼進去的不用回頭清，放著也不會跟上游打架。';
+  Logger.log(text);
+  return text;
 }
 
 function setupCount(){

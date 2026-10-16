@@ -137,6 +137,7 @@ const src = fs.readFileSync(process.argv[2],'utf8')
   + "\n;globalThis.__x = {startCountSession, countScanBatch, setCountQty, finishCountSession,"
   + " getCountSession, listCountSessions, cancelCountSession, STORE_LIST, STORE_DEFS, storeDef_,"
   + " openStoreStockSheet_, storeStockSnapshot_, stockNamesForSkus_, _ssMemo_,"
+  + " namePatchMap_, barcodeToSkuMap_, SHEET_NAME_PATCH, NAME_PATCH_HEADER,"
   + " setupCountDiffSheet_, SHEET_COUNT_DIFF, recheckCountSession, recheckAllCountSessions,"
   + " SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER, COUNT_SESSION_HEADER};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
@@ -442,5 +443,30 @@ for(let i = 2; i <= dsh2.getLastRow(); i++){
 ck('不拿鎖的讀取不會回寫明細', stillBlank);
 X.cancelCountSession({sessionId: stN.sessionId});
 
-console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、作廢場次、掃描當下補品名、來源挑選與備援');
+console.log('\n【品名補充表】「條碼轉品號」是 IMPORTRANGE 鏡像，手貼會把整張打成 #REF!');
+// 所以新貨的品名另外放一張我們寫得了的表，疊在鏡像之後。
+BACKEND._sheets[X.SHEET_NAME_PATCH] = makeSheet(X.SHEET_NAME_PATCH, [
+  X.NAME_PATCH_HEADER,
+  ['SKU-NEW', '新貨商品（倉地圖還沒同步）', '紅', 'ERP 有'],
+  ['SKU-A',   '不該贏過上游的名字', '', '測優先序'],
+  ['',        '沒品號的列要被跳過', '', ''],
+]);
+const pm = X.namePatchMap_();
+ck('讀得到補充表', (pm['SKU-NEW']||{}).name === '新貨商品（倉地圖還沒同步）', pm['SKU-NEW']);
+ck('沒品號的列跳過', pm[''] === undefined);
+const bm = X.barcodeToSkuMap_();
+ck('鏡像沒有的從補充表補上', (bm['SKU-NEW']||{}).name === '新貨商品（倉地圖還沒同步）', bm['SKU-NEW']);
+// 上游優先：等「國際碼對照表」補齊了，補充表要自動退場，
+// 不然兩個版本的品名會打架，而且沒人會記得回頭清補充表。
+ck('上游有的不被補充表贏過', (bm['SKU-A']||{}).name === '商品A', bm['SKU-A']);
+// 實際掃一筆：條碼表、庫存表都沒有，只有補充表有
+const stP = X.startCountSession({store:'秀山莊-中華門市', counterId:'07', counterName:'新貨'});
+const rP = X.countScanBatch({sessionId: stP.sessionId, ops:[{code:'SKU-NEW', qty:1}]});
+ck('掃新貨時畫面上有品名',
+   ((rP.results||[])[0]||{}).name === '新貨商品（倉地圖還沒同步）', rP.results);
+X.cancelCountSession({sessionId: stP.sessionId});
+delete BACKEND._sheets[X.SHEET_NAME_PATCH];
+ck('沒建補充表時不會壞', JSON.stringify(X.namePatchMap_()) === '{}');
+
+console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、作廢場次、掃描當下補品名、品名補充表、來源挑選與備援');
 process.exit(fail?1:0);
