@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-15.195';
+const BACKEND_VERSION = '2026-10-16.196';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -9250,15 +9250,22 @@ function reconcileDetailRow_(r, dc, snap, codeMap){
     }
     const scanned = countNum_(r.v[dc.countScanned]);
     if(!info){
-      // 庫存表真的完全沒有這個品號。品名改從「條碼轉品號」補，至少讓人看得懂掃到什麼。
+      // 庫存表沒有這個品號。品名改從「條碼轉品號」補，至少讓人看得懂掃到什麼。
+      //
+      // 這裡只能講「庫存表裡沒有」這個事實，不能推論成「所以沒有庫存」。
+      // 原本寫的是「→ 各據點都沒有庫存紀錄」，實際踩到的反例：中華門市盤的
+      // 一排 Nalgene 水壶是真的在貨架上、ERP 也有，只是庫存表還沒同步到。
+      // 按那句話去做的人會以為是帳務錯誤或掃錯條碼，找錯方向。
       const hit = codeMap[sku];
       if(hit && hit.name && !String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = hit.name;
       r.v[dc.countExpected] = '';
       r.v[dc.countDiff] = '';
       r.v[dc.countResult] = '庫存表查無此品號';
       r.v[dc.otherStock] = hit
-        ? '條碼轉品號查得到（' + (hit.name || '無品名') + '），但庫存表沒有任何一列 → 各據點都沒有庫存紀錄'
-        : '條碼轉品號與庫存表都查不到，請確認是掃錯條碼還是尚未建檔';
+        ? '條碼轉品號查得到（' + (hit.name || '無品名') + '），但庫存表沒有這一列。'
+          + '可能是新進貨、庫存表還沒同步 → 請改查 ERP，不要當成沒庫存'
+        : '條碼轉品號與庫存表都沒有這個品號。'
+          + '可能是掃錯條碼、尚未建檔、或庫存表還沒同步 → 請改查 ERP';
       return {sku: sku, unknown: true};
     } else {
       if(!String(r.v[dc.baseName]||'').trim()) r.v[dc.baseName] = info.baseName;

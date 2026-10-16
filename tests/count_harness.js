@@ -281,7 +281,13 @@ ck('otherStock 是最後一欄（既有資料不會錯位）', H[H.length-1] ===
 ck('SKU-E 不應列出中華（正在盤的就是這家）', !/秀山莊-中華門市/.test(d4['SKU-E'][iOs]), d4['SKU-E'][iOs]);
 ck('SKU-X 查無此品號但品名有補上', d4['SKU-X'][iRs]==='庫存表查無此品號' && /商品X/.test(d4['SKU-X'][iNm]), [d4['SKU-X'][iRs], d4['SKU-X'][iNm]]);
 ck('SKU-X 說明「條碼轉品號查得到、庫存表沒有」', /條碼轉品號查得到/.test(d4['SKU-X'][iOs]), d4['SKU-X'][iOs]);
-ck('8888… 兩邊都查不到時明講', /都查不到/.test(d4['8888888888888'][iOs]), d4['8888888888888'][iOs]);
+ck('8888… 兩邊都沒有時明講、並指向 ERP',
+   /都沒有這個品號/.test(d4['8888888888888'][iOs]) && /ERP/.test(d4['8888888888888'][iOs]),
+   d4['8888888888888'][iOs]);
+// 不可以再寫成「各據點都沒有庫存」——那是推論不是事實，而且實際踩過反例（庫存表慢更）
+ck('不要把「庫存表沒有」講成「沒有庫存」',
+   !/各據點都沒有庫存/.test(d4['8888888888888'][iOs] + d4['SKU-X'][iOs]));
+ck('SKU-X 也要指向 ERP', /ERP/.test(d4['SKU-X'][iOs]), d4['SKU-X'][iOs]);
 ck('相符且非正規化對上的不填（SKU-A台南場相符）', !d2['SKU-A'][iOs], d2['SKU-A'][iOs]);
 ck('skug1 靠正規化對上 SKU-G1 且相符', d4['skug1'][iEx]===6 && d4['skug1'][iRs]==='相符', [d4['skug1'][iEx], d4['skug1'][iRs]]);
 ck('正規化對上時要註明原本的品號', /SKU-G1/.test(d4['skug1'][iOs]), d4['skug1'][iOs]);
@@ -316,7 +322,7 @@ ck('重算成功', rc.ok === true, rc);
 const after = {};
 detSheet._rows.slice(1).forEach(row=>{ if(row[0]===SID && row[iSku]) after[row[iSku]] = row; });
 ck('盤虧列的其他據點庫存補回來了', /ODM-台南門市/.test(after['SKU-A'][iOs2]), after['SKU-A'][iOs2]);
-ck('查無此品號列也補回來了', /都查不到|條碼轉品號查得到/.test(after['9999999999999'][iOs2]), after['9999999999999'][iOs2]);
+ck('查無此品號列也補回來了', /都沒有這個品號|條碼轉品號查得到/.test(after['9999999999999'][iOs2]), after['9999999999999'][iOs2]);
 ck('未盤到沒有被改判成盤虧', after['SKU-D'][iRs] === '未盤到', after['SKU-D'][iRs]);
 ck('未盤到的列數沒有變', detSheet._rows.filter(r=>r[0]===SID && r[iRs]==='未盤到').length === before未盤到);
 ck('實盤數沒有被動到（那是現場數出來的事實）', after['SKU-A'][iSc] === 3, after['SKU-A'][iSc]);
