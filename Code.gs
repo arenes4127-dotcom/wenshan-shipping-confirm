@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-16.197';
+const BACKEND_VERSION = '2026-10-16.198';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8844,12 +8844,61 @@ function normSku_(v){
   return String(v == null ? '' : v).replace(/[\s\-_]/g, '').toUpperCase();
 }
 
+// erpCsv：ERP 每日自動匯出的店別庫存檔，詳見 erpStockSnapshot_。
 const STORE_DEFS = [
-  {name: 'ODM-士林門市',    cols: [4], from: ['D ODM士林倉']},
-  {name: 'ODM-台中門市',    cols: [5], from: ['E 三相之力']},
-  {name: '秀山莊-中華門市', cols: [7], from: ['G 中華門市倉']},
-  {name: 'ODM-台南門市',    cols: [8], from: ['H 門外漢門市倉']}
+  {name: 'ODM-士林門市',    cols: [4], from: ['D ODM士林倉'],     erpCsv: 'odm_shilin.csv'},
+  {name: 'ODM-台中門市',    cols: [5], from: ['E 三相之力'],       erpCsv: 'odm_taichung.csv'},
+  {name: '秀山莊-中華門市', cols: [7], from: ['G 中華門市倉'],   erpCsv: 'xsz_zhonghua.csv'},
+  {name: 'ODM-台南門市',    cols: [8], from: ['H 門外漢門市倉'], erpCsv: 'odm_tainan.csv'}
 ];
+
+// ERP 每天自動把各店庫存匯成 CSV（sku,endQty）丟到這個資料夾。
+//
+// 為什麼需要它：山物倉地圖的庫存表約一週才更新一次。新進貨盤下去，
+// 庫存表根本還沒收到那些品號，整批會變「庫存表查無此品號」、一筆差異都算不出來。
+// 盤點的意義是當下抓出問題，等一週就沒用了。
+//
+// 誰新就信誰：兩邊的最後更新時間拿來比，用較新的那一份當帳上數量，
+// 並把用了哪個來源、兩邊各是什麼時間，寫進場次的備註。
+// 不預設哪一邊永遠對，是因為兩邊都壞過：庫存表慢更，而自動匯出也可能某天默默停掉
+//（這套系統就有一個排程默默壞了 12 天沒人發現的前科）。
+const ERP_STOCK_FOLDER_ID = '1bBMl_LcW3cm3SvYUg1fj_E7VtdaMcLoo';
+const ERP_STOCK_STALE_DAYS = 7;    // 每天跑的東西超過這個天數，就要在備註裡大聲講
+
+// 讀一家店的 ERP 匯出檔。讀不到一律回報失敗，絕不拋錯——
+// 對帳寧可退回只用庫存表，也不能因為一個輔助來源讓整個「結束盤點」挂掉。
+function erpStockSnapshot_(store){
+  const def = storeDef_(store);
+  if(!def || !def.erpCsv) return {ok:false, error:'這家店沒有對應的 ERP 匯出檔'};
+  try{
+    const it = DriveApp.getFolderById(ERP_STOCK_FOLDER_ID).getFilesByName(def.erpCsv);
+    if(!it.hasNext()) return {ok:false, error:'資料夾裡找不到 ' + def.erpCsv};
+    const file = it.next();
+    const rows = Utilities.parseCsv(file.getBlob().getDataAsString());
+    const bySku = {};
+    let n = 0;
+    for(let i = 0; i < rows.length; i++){
+      const sku = String((rows[i]||[])[0]||'').trim();
+      if(!sku || sku.toLowerCase() === 'sku') continue;      // 跳過表頭
+      if(bySku[sku] !== undefined) continue;                  // 重複只取第一筆
+      bySku[sku] = countNum_((rows[i]||[])[1]);
+      n++;
+    }
+    if(!n) return {ok:false, error:def.erpCsv + ' 裡沒有資料列'};
+    return {ok:true, bySku: bySku, rows: n, fileName: def.erpCsv,
+            updatedAt: file.getLastUpdated()};
+  }catch(err){
+    return {ok:false, error:String(err)};
+  }
+}
+
+function fileUpdatedAt_(id){
+  try{ return DriveApp.getFileById(id).getLastUpdated(); }catch(err){ return null; }
+}
+function daysAgo_(d){
+  if(!d) return null;
+  return Math.floor((Date.now() - d.getTime()) / 86400000);
+}
 const STORE_LIST = STORE_DEFS.map(function(d){ return d.name; });
 function storeDef_(name){
   const want = String(name||'').trim();
@@ -9016,7 +9065,8 @@ function openStoreStockSheet_(){
       if(!sh){ tried.push(c.label + '：找不到「' + c.tab + '」分頁'); continue; }
       const last = sh.getLastRow();
       if(last - c.firstRow + 1 < 1){ tried.push(c.label + '：分頁在但沒有資料列'); continue; }
-      return {ok:true, sh: sh, firstRow: c.firstRow, label: c.label, lastRow: last, tried: tried};
+      return {ok:true, sh: sh, firstRow: c.firstRow, label: c.label, lastRow: last,
+              id: c.id, tried: tried};
     }catch(err){ tried.push(c.label + '：' + err); }
   }
   return {ok:false, error: tried.join('；'), tried: tried};
@@ -9061,8 +9111,68 @@ function storeStockSnapshot_(store){
     if(nk && !normIndex[nk]) normIndex[nk] = sku;
     if(expected > 0) withStock.push(sku);
   });
+  // ---- ERP 匯出檔疊上來：誰新就信誰 ----
+  // 庫存表約一週更新一次，ERP 每天匯。所以常態是 ERP 較新，
+  // 但不寫死——自動匯出也可能某天默默停掉，那時庫存表反而是新的。
+  //
+  // CSV 只有 sku 跟數量，所以它只能覆寫「帳上數量」；
+  // 品名、規格、其他據點庫存還是只能從庫存表來。
+  const stockUpdatedAt = fileUpdatedAt_(open.id);
+  const erp = erpStockSnapshot_(store);
+  let expectedSource = open.label;
+  const sourceBits = ['庫存表（' + open.label + '）'
+    + (stockUpdatedAt ? ' 更新於 ' + stampOf_(stockUpdatedAt) : ' 更新時間不明')];
+
+  if(erp.ok){
+    sourceBits.push('ERP 匯出檔（' + erp.fileName + '）更新於 ' + stampOf_(erp.updatedAt)
+      + '，' + erp.rows + ' 筆');
+    const erpNewer = !stockUpdatedAt || (erp.updatedAt && erp.updatedAt.getTime() > stockUpdatedAt.getTime());
+    let over = 0, added = 0;
+    Object.keys(erp.bySku).forEach(function(sku){
+      const cur = bySku[sku];
+      if(cur){
+        // 庫存表有這個品號：只有 ERP 較新才蓋過去
+        if(!erpNewer) return;
+        if(cur.expected === erp.bySku[sku]) return;
+        cur.expected = erp.bySku[sku];
+        cur.fromErp = true;
+        over++;
+      } else {
+        // 庫存表根本沒這個品號（新進貨）——這種不管誰新都要補，
+        // 不補的話那一批永遠是「查無此品號」、一筆差異都算不出來。
+        // locs 留空：CSV 只有這一家店的數字，其他據點我們真的不知道。
+        bySku[sku] = {baseName: '', spec: '', expected: erp.bySku[sku], locs: [], fromErp: true};
+        const nk = normSku_(sku);
+        if(nk && !normIndex[nk]) normIndex[nk] = sku;
+        added++;
+      }
+      if(erp.bySku[sku] > 0 && withStock.indexOf(sku) < 0) withStock.push(sku);
+    });
+    expectedSource = erpNewer ? 'ERP 匯出檔（' + erp.fileName + '）' : open.label;
+    sourceBits.push(erpNewer
+      ? '→ 這次以 ERP 為準，覆寫 ' + over + ' 筆、補上庫存表沒有的 ' + added + ' 筆'
+      : '→ 這次以庫存表為準（它比較新），只從 ERP 補上庫存表沒有的 ' + added + ' 筆');
+    const age = daysAgo_(erpNewer ? erp.updatedAt : stockUpdatedAt);
+    if(age !== null && age > ERP_STOCK_STALE_DAYS){
+      sourceBits.push('⚠ 所用來源已經 ' + age + ' 天沒更新，差異數字請先當參考');
+    }
+  } else {
+    sourceBits.push('ERP 匯出檔沒用到：' + erp.error);
+  }
+
   return {ok:true, bySku: bySku, withStock: withStock, normIndex: normIndex,
-          rowsScanned: vals.length, store: store, cols: def.cols, source: open.label};
+          rowsScanned: vals.length, store: store, cols: def.cols, source: open.label,
+          expectedSource: expectedSource, sourceNote: sourceBits.join('；')};
+}
+
+// 把 Date 寫成人讀得懂的當地時間。直接丟 Date 進儲存格會被 Sheets 轉型，
+// 讀回來 JSON 化就成了 UTC 的 ISO（跟 nowStamp_ 踩過的是同一個坑）。
+function stampOf_(d){
+  if(!d) return '時間不明';
+  try{
+    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    return Utilities.formatDate(d, tz, 'yyyy/MM/dd HH:mm');
+  }catch(err){ return String(d); }
 }
 
 function countSessionCol_(){
@@ -9327,7 +9437,11 @@ function reconcileDetailRow_(r, dc, snap, codeMap){
       // 「未盤到」那批不走這裡（它們是結束時另外補上的列）：那可能有好幾千筆，
       // 每筆都掛一長串會把分頁撐爆，而且帳上本來就有貨，問「別處有沒有」意義不大。
       if(d !== 0 || matchedBy){
-        const where = info.locs.length ? info.locs.join('、') : '其他據點都沒有庫存';
+        // ERP 補上來的品號，CSV 只有這一家店的數字——其他據點我們是「不知道」，
+      // 不是「沒有」。兩者差很多：寫「都沒有」會讓人以為已經查過別家了。
+      const where = info.fromErp && !info.locs.length
+        ? '帳上數量來自 ERP 匯出檔，庫存表還沒收到這個品號 → 其他據點庫存不明，請改查 ERP'
+        : (info.locs.length ? info.locs.join('、') : '其他據點都沒有庫存');
         r.v[dc.otherStock] = (matchedBy ? '庫存表登記的品號是「' + matchedBy + '」（靠正規化對上）／' : '') + where;
       }
       return {sku: sku, altSku: matchedBy, rescued: !!matchedBy, same: d === 0};
@@ -9476,11 +9590,15 @@ function finishCountSession(body){
   if(!includeUnscanned && unscannedTotal > 0){
     notes.push('庫存表還有 ' + unscannedTotal + ' 個品項沒被掃到，本次未列入（非全店盤點）');
   }
+  // 哪個來源當的帳上數量要記下來。差異表是給沒參與盤點的人看的，
+  // 不說清楚的話，兩個來源數字不一樣時沒人追得回來當時是跟誰對的。
+  if(snap.sourceNote) notes.push('帳上數量來源：' + snap.sourceNote);
   if(notes.length) s.vals[s.c.note] = notes.join('；');
   s.sh.getRange(s.row, 1, 1, COUNT_SESSION_HEADER.length).setValues([s.vals]);
   SpreadsheetApp.flush();
 
   return {ok:true, sessionId: sessionId, store: store,
+          帳上數量來源: snap.expectedSource || '', 來源說明: snap.sourceNote || '',
           掃到的品項: det.rows.length, 相符: okCount, 有差異: diffCount - missing.length,
           未盤到: missing.length, 庫存表查無此品號: unknownCount,
           未列出的未盤到: Math.max(missingTruncated, 0),
@@ -9686,6 +9804,44 @@ function withSheetRetry_(label, fn, tries){
 
 // 建「品名補充」分頁。只建表頭，資料自己貼——品名會變，不適合寫死在程式裡。
 // 沒有底線結尾：Apps Script 編輯器的函式下拉選單會把 name_ 藏起來（這個坑踩過兩次）。
+// 上線前先用真資料驗一次：四家店的 ERP 匯出檔讀不讀得到、多舊、
+// 跟庫存表對起來差多少。不跑這支就直接信它，等於拿現場盤點當測試。
+// 只讀不寫。
+function diagnoseErpStock(){
+  const lines = ['ERP 匯出檔診斷　' + BACKEND_VERSION, ''];
+  STORE_DEFS.forEach(function(d){
+    lines.push('【' + d.name + '】' + (d.erpCsv || '（沒設定匯出檔）'));
+    const e = erpStockSnapshot_(d.name);
+    if(!e.ok){ lines.push('   ✗ ' + e.error); lines.push(''); return; }
+    const age = daysAgo_(e.updatedAt);
+    lines.push('   ✓ ' + e.rows + ' 筆，更新於 ' + stampOf_(e.updatedAt)
+      + '（' + (age === null ? '?' : age) + ' 天前）'
+      + (age !== null && age > ERP_STOCK_STALE_DAYS ? '  ⚠ 太舊了，自動匯出是不是停了？' : ''));
+    // 跟庫存表對一下，看兩邊差得多不多。差太多代表欄位對錯了，
+    // 而不是真的有那麼多貨變動——這種錯沒驗就會變成整表假差異。
+    const snap = storeStockSnapshot_(d.name);
+    if(snap.ok){
+      let both = 0, same = 0, diff = 0, onlyErp = 0;
+      Object.keys(e.bySku).forEach(function(sku){
+        const info = snap.bySku[sku];
+        if(!info){ onlyErp++; return; }
+        both++;
+        if(info.expected === e.bySku[sku]) same++; else diff++;
+      });
+      lines.push('   兩邊都有：' + both + '（數字相同 ' + same + '、不同 ' + diff + '）'
+        + '；只有 ERP 有：' + onlyErp);
+      lines.push('   來源判定：' + snap.expectedSource);
+      lines.push('   ' + snap.sourceNote);
+    } else {
+      lines.push('   庫存表讀不到：' + snap.error);
+    }
+    lines.push('');
+  });
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
+}
+
 function setupNamePatch(){
   const sh = getSheet(SHEET_NAME_PATCH, NAME_PATCH_HEADER);
   sh.getRange(1, 1, 1, NAME_PATCH_HEADER.length).setFontWeight('bold');

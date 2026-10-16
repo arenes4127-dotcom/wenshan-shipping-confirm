@@ -106,20 +106,37 @@ const barcode = makeSheet('條碼轉品號', [
 ]);
 
 let BACKEND = null, CACHE_SS = null, stampSeq = 1;
+// ERP 每日匯出檔的假資料。預設空的，要測的時候再塞——
+// 不要讓它影響到前面那些只看庫存表的測試。
+let ERP_FILES = {};
+let FILE_MTIME = {};
+const mkCsv = (text, updatedAt) => ({
+  getBlob: () => ({ getDataAsString: () => text }),
+  getLastUpdated: () => updatedAt
+});
 const log = [];
 const sandbox = {
   console,
   Logger: { log: m => log.push(String(m)) },
   Session: { getEffectiveUser: () => ({ getEmail: () => 't@e.com' }) },
-  Utilities: { formatDate: (d,tz,f) => '20261015-1015' + String(stampSeq++).padStart(2,'0'), sleep(){} },
+  Utilities: { formatDate: (d,tz,f) => '20261015-1015' + String(stampSeq++).padStart(2,'0'), sleep(){},
+    // 真的解 CSV，不要用假的——ERP 匯出檔是純文字，解錯了就會把帳上數量算錯
+    parseCsv: (t) => String(t||'').split(/\r?\n/).filter(l=>l!=='').map(l=>l.split(',')) },
   CacheService: { getScriptCache: () => ({ get:()=>null, put(){}, remove(){}, getAll:()=>({}), putAll(){}, removeAll(){} }) },
   LockService: { getScriptLock: () => ({ tryLock:()=>true, releaseLock(){}, waitLock(){} }) },
   ScriptApp: { getProjectTriggers:()=>[], WeekDay:{MONDAY:1}, TriggerSource:{CLOCK:'CLOCK'} },
   UrlFetchApp: { fetch: ()=>({ getContentText:()=>'{}', getResponseCode:()=>200 }) },
   ContentService: { createTextOutput: t=>({ setMimeType: ()=>t }), MimeType:{JSON:'json'} },
   HtmlService: {}, MimeType: { CSV:'text/csv', PLAIN_TEXT:'text/plain', HTML:'text/html' },
-  DriveApp: { getFolderById:()=>({ getFilesByName:()=>({hasNext:()=>false}), addFile(){} }),
-              getFileById:()=>({ setTrashed(){} }), getRootFolder:()=>({ removeFile(){} }) },
+  DriveApp: {
+    getFolderById:(id)=>({
+      getFilesByName:(name)=>{
+        const f = ERP_FILES[name];
+        let served = false;
+        return { hasNext:()=> !!f && !served, next:()=>{ served = true; return f; } };
+      }, addFile(){} }),
+    getFileById:(id)=>({ setTrashed(){}, getLastUpdated:()=> FILE_MTIME[id] || null }),
+    getRootFolder:()=>({ removeFile(){} }) },
   SpreadsheetApp: {
     newDataValidation: () => ({ requireValueInRange: () => ({ setAllowInvalid: () => ({ build: () => ({}) }) }),
                                 requireValueInList:  () => ({ setAllowInvalid: () => ({ build: () => ({}) }) }) }),
@@ -138,6 +155,7 @@ const src = fs.readFileSync(process.argv[2],'utf8')
   + " getCountSession, listCountSessions, cancelCountSession, STORE_LIST, STORE_DEFS, storeDef_,"
   + " openStoreStockSheet_, storeStockSnapshot_, stockNamesForSkus_, _ssMemo_,"
   + " namePatchMap_, barcodeToSkuMap_, SHEET_NAME_PATCH, NAME_PATCH_HEADER,"
+  + " erpStockSnapshot_, STORE_STOCK_SOURCE_ID, ERP_STOCK_STALE_DAYS,"
   + " setupCountDiffSheet_, SHEET_COUNT_DIFF, recheckCountSession, recheckAllCountSessions,"
   + " SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, COUNT_DETAIL_HEADER, COUNT_SESSION_HEADER};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
@@ -468,5 +486,75 @@ X.cancelCountSession({sessionId: stP.sessionId});
 delete BACKEND._sheets[X.SHEET_NAME_PATCH];
 ck('沒建補充表時不會壞', JSON.stringify(X.namePatchMap_()) === '{}');
 
-console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、作廢場次、掃描當下補品名、品名補充表、來源挑選與備援');
+console.log('\n【ERP 匯出檔】庫存表一週才更新一次，新進貨根本不在上面，對不了帳');
+const STOCK_ID = X.STORE_STOCK_SOURCE_ID;
+const D = (iso) => new Date(iso);
+// 庫存表說中華 SKU-A=5、SKU-B=3；ERP 說 SKU-A=7，另外有一個庫存表根本沒有的新貨
+ERP_FILES['xsz_zhonghua.csv'] = mkCsv(
+  'sku,endQty\nSKU-A,7\nSKU-B,3\nSKU-ERPNEW,9\n', D('2026-10-16T04:15:00Z'));
+FILE_MTIME[STOCK_ID] = D('2026-10-10T00:00:00Z');        // 庫存表是上週的
+
+const e1 = X.erpStockSnapshot_('秀山莊-中華門市');
+ck('讀得到 ERP 匯出檔', e1.ok === true && e1.rows === 3, e1);
+ck('表頭有被跳過', e1.ok && e1.bySku['sku'] === undefined);
+ck('數量有解對', e1.ok && e1.bySku['SKU-A'] === 7 && e1.bySku['SKU-ERPNEW'] === 9, e1.bySku);
+
+clearMemo();
+const sn1 = X.storeStockSnapshot_('秀山莊-中華門市');
+console.log('   來源說明：', sn1.sourceNote);
+ck('ERP 較新時蓋過庫存表', sn1.bySku['SKU-A'].expected === 7, sn1.bySku['SKU-A']);
+ck('庫存表沒有的新貨被補上', (sn1.bySku['SKU-ERPNEW']||{}).expected === 9, sn1.bySku['SKU-ERPNEW']);
+ck('新貨標記來自 ERP', sn1.bySku['SKU-ERPNEW'].fromErp === true);
+ck('數字一樣的不算覆寫', sn1.bySku['SKU-B'].fromErp === undefined, sn1.bySku['SKU-B']);
+ck('來源記在 expectedSource', /ERP/.test(sn1.expectedSource||''), sn1.expectedSource);
+ck('來源說明兩邊時間都有', /庫存表/.test(sn1.sourceNote) && /ERP/.test(sn1.sourceNote), sn1.sourceNote);
+
+// 實際跑一場：新貨要能算出差異，而不是「庫存表查無此品號」
+const stE = X.startCountSession({store:'秀山莊-中華門市', counterId:'08', counterName:'ERP'});
+X.countScanBatch({sessionId: stE.sessionId, ops:[{code:'SKU-ERPNEW', qty:6}, {code:'SKU-A', qty:7}]});
+const finE = X.finishCountSession({sessionId: stE.sessionId});
+ck('結束得了', finE.ok === true, finE);
+const dE = {};
+BACKEND.getSheetByName(X.SHEET_COUNT_DETAIL)._rows.forEach(function(r){
+  if(r[0] === stE.sessionId) dE[r[2]] = r;
+});
+const iRes = X.COUNT_DETAIL_HEADER.indexOf('countResult');
+const iExp = X.COUNT_DETAIL_HEADER.indexOf('countExpected');
+const iDif = X.COUNT_DETAIL_HEADER.indexOf('countDiff');
+const iOsE = X.COUNT_DETAIL_HEADER.indexOf('otherStock');
+ck('新貨不再是「查無此品號」', dE['SKU-ERPNEW'][iRes] === '盤虧', dE['SKU-ERPNEW'][iRes]);
+ck('新貨的帳上數量來自 ERP', dE['SKU-ERPNEW'][iExp] === 9, dE['SKU-ERPNEW'][iExp]);
+ck('新貨的差異算得出來', dE['SKU-ERPNEW'][iDif] === -3, dE['SKU-ERPNEW'][iDif]);
+// 這一格不可以講「其他據點都沒有庫存」——CSV 只有這家店，別家是「不明」
+ck('別家庫存要說不明而不是沒有',
+   /不明/.test(dE['SKU-ERPNEW'][iOsE]) && !/都沒有庫存/.test(dE['SKU-ERPNEW'][iOsE]), dE['SKU-ERPNEW'][iOsE]);
+ck('SKU-A 用 ERP 的 7 對帳所以相符', dE['SKU-A'][iRes] === '相符', dE['SKU-A'][iRes]);
+// 用了哪個來源要留在場次備註裡，不然事後沒人追得回來
+const sesE = X.getCountSession({sessionId: stE.sessionId});
+ck('場次備註記下來源', /帳上數量來源/.test(String(sesE.session.note||'')), sesE.session.note);
+ck('結束回應也帶來源', /ERP/.test(String(finE['帳上數量來源']||'')), finE['帳上數量來源']);
+
+// 反過來：庫存表比較新時，ERP 不可以蓋掉它，但缺的還是要補
+FILE_MTIME[STOCK_ID] = D('2026-10-17T00:00:00Z');
+clearMemo();
+const sn2 = X.storeStockSnapshot_('秀山莊-中華門市');
+ck('庫存表較新時不被 ERP 蓋過', sn2.bySku['SKU-A'].expected === 5, sn2.bySku['SKU-A']);
+ck('但庫存表沒有的還是要補', (sn2.bySku['SKU-ERPNEW']||{}).expected === 9, sn2.bySku['SKU-ERPNEW']);
+ck('expectedSource 改指庫存表', !/ERP/.test(sn2.expectedSource||''), sn2.expectedSource);
+
+// 匯出檔太舊要大聲講——自動排程默默停掉是這套系統真的發生過的事
+ERP_FILES['xsz_zhonghua.csv'] = mkCsv('sku,endQty\nSKU-A,7\n', D('2026-01-01T00:00:00Z'));
+FILE_MTIME[STOCK_ID] = null;
+clearMemo();
+const sn3 = X.storeStockSnapshot_('秀山莊-中華門市');
+ck('來源太舊時有警告', /天沒更新/.test(sn3.sourceNote||''), sn3.sourceNote);
+
+// 沒有匯出檔也要能跑，只是退回只用庫存表
+ERP_FILES = {};
+clearMemo();
+const sn4 = X.storeStockSnapshot_('秀山莊-中華門市');
+ck('沒匯出檔時退回庫存表', sn4.ok === true && sn4.bySku['SKU-A'].expected === 5, sn4.bySku['SKU-A']);
+ck('並且說清楚為什麼沒用到', /沒用到/.test(sn4.sourceNote||''), sn4.sourceNote);
+
+console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：欄位對照、跨批累加、同批重複掃、手改數量、一店多欄加總、場次隔離、作廢場次、掃描當下補品名、品名補充表、ERP 匯出檔疊合、來源挑選與備援');
 process.exit(fail?1:0);
