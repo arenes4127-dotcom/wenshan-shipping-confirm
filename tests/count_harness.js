@@ -549,6 +549,28 @@ clearMemo();
 const sn3 = X.storeStockSnapshot_('秀山莊-中華門市');
 ck('來源太舊時有警告', /天沒更新/.test(sn3.sourceNote||''), sn3.sourceNote);
 
+// 10/19 真實情境：庫存表是今天的、ERP 停在 6 天前。
+// 這時採用庫存表是對的，但「每天跑的匯出停了 6 天」是另一件要修的事，
+// 不能因為這次用不到它就不講。
+ERP_FILES['xsz_zhonghua.csv'] = mkCsv('sku,endQty\nSKU-A,7\nSKU-ERPNEW,9\n', D('2026-10-13T12:42:00Z'));
+FILE_MTIME[STOCK_ID] = D('2026-10-19T11:28:00Z');
+clearMemo();
+const sn5 = X.storeStockSnapshot_('秀山莊-中華門市');
+ck('採用較新的庫存表', sn5.bySku['SKU-A'].expected === 5, sn5.bySku['SKU-A']);
+ck('沒採用也要喊 ERP 停了',
+   /ERP 匯出檔已經 \d+ 天沒更新/.test(sn5.sourceNote||''), sn5.sourceNote);
+ck('有講到「應該每天跑」', /每天跑/.test(sn5.sourceNote||''), sn5.sourceNote);
+ck('庫存表時間要標明是檔案層級', /檔案層級時間/.test(sn5.sourceNote||''), sn5.sourceNote);
+
+// skipErp：診斷要拿得到「沒疊過的原賌庫存表」，否則「只有 ERP 有」永遠是 0
+clearMemo();
+const rawS = X.storeStockSnapshot_('秀山莊-中華門市', {skipErp: true});
+ck('skipErp 不把 ERP 疊進來', rawS.bySku['SKU-ERPNEW'] === undefined, rawS.bySku['SKU-ERPNEW']);
+ck('skipErp 還是要有庫存表的資料', rawS.bySku['SKU-A'].expected === 5);
+clearMemo();
+const mergedS = X.storeStockSnapshot_('秀山莊-中華門市');
+ck('沒給 skipErp 時照常疊', mergedS.bySku['SKU-ERPNEW'] !== undefined);
+
 // 沒有匯出檔也要能跑，只是退回只用庫存表
 ERP_FILES = {};
 clearMemo();

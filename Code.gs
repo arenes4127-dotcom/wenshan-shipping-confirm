@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-16.198';
+const BACKEND_VERSION = '2026-10-19.199';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8863,7 +8863,10 @@ const STORE_DEFS = [
 // 不預設哪一邊永遠對，是因為兩邊都壞過：庫存表慢更，而自動匯出也可能某天默默停掉
 //（這套系統就有一個排程默默壞了 12 天沒人發現的前科）。
 const ERP_STOCK_FOLDER_ID = '1bBMl_LcW3cm3SvYUg1fj_E7VtdaMcLoo';
-const ERP_STOCK_STALE_DAYS = 7;    // 每天跑的東西超過這個天數，就要在備註裡大聲講
+// 匯出是每天跑的，所以超過兩天就代表排程停了，不是「舊一點」。
+// 原本設 7 天太鬆：10/19 第一次用真資料跑，四個檔全停在 10/13、已經 6 天，
+// 卻因為沒足 7 天而一聲不響——這就是「排程默默停掉」本人。
+const ERP_STOCK_STALE_DAYS = 2;
 
 // 讀一家店的 ERP 匯出檔。讀不到一律回報失敗，絕不拋錯——
 // 對帳寧可退回只用庫存表，也不能因為一個輔助來源讓整個「結束盤點」挂掉。
@@ -9072,7 +9075,8 @@ function openStoreStockSheet_(){
   return {ok:false, error: tried.join('；'), tried: tried};
 }
 
-function storeStockSnapshot_(store){
+function storeStockSnapshot_(store, opts){
+  const skipErp = !!(opts && opts.skipErp);   // 診斷要拿沒疊過的原賌來比
   const def = storeDef_(store);
   if(!def) return {ok:false, error:'不認得的門市：' + store};
   const open = openStoreStockSheet_();
@@ -9118,10 +9122,22 @@ function storeStockSnapshot_(store){
   // CSV 只有 sku 跟數量，所以它只能覆寫「帳上數量」；
   // 品名、規格、其他據點庫存還是只能從庫存表來。
   const stockUpdatedAt = fileUpdatedAt_(open.id);
+  if(skipErp){
+    return {ok:true, bySku: bySku, withStock: withStock, normIndex: normIndex,
+            rowsScanned: vals.length, store: store, cols: def.cols, source: open.label,
+            expectedSource: open.label, sourceNote: '（診斷模式：沒疊 ERP）',
+            updatedAt: stockUpdatedAt};
+  }
   const erp = erpStockSnapshot_(store);
   let expectedSource = open.label;
+  // 注意：stockUpdatedAt 是「整份試算表」的最後修改時間，不是「庫存表這個分頁」的。
+  // 山物倉地圖裡還有國際碼對照表等其他分頁，別人改那些也會把這個時間頂上去，
+  // 讓庫存表看起來比實際新。Drive API 給不到分頁級的時間，所以這裡老實標註，
+  // 不要讓看報表的人以為這個時間就是庫存數字的時間。
   const sourceBits = ['庫存表（' + open.label + '）'
-    + (stockUpdatedAt ? ' 更新於 ' + stampOf_(stockUpdatedAt) : ' 更新時間不明')];
+    + (stockUpdatedAt ? ' 整份試算表更新於 ' + stampOf_(stockUpdatedAt)
+         + '（檔案層級時間，不一定是庫存表分頁自己改的）'
+         : ' 更新時間不明')];
 
   if(erp.ok){
     sourceBits.push('ERP 匯出檔（' + erp.fileName + '）更新於 ' + stampOf_(erp.updatedAt)
@@ -9152,9 +9168,15 @@ function storeStockSnapshot_(store){
     sourceBits.push(erpNewer
       ? '→ 這次以 ERP 為準，覆寫 ' + over + ' 筆、補上庫存表沒有的 ' + added + ' 筆'
       : '→ 這次以庫存表為準（它比較新），只從 ERP 補上庫存表沒有的 ' + added + ' 筆');
-    const age = daysAgo_(erpNewer ? erp.updatedAt : stockUpdatedAt);
-    if(age !== null && age > ERP_STOCK_STALE_DAYS){
-      sourceBits.push('⚠ 所用來源已經 ' + age + ' 天沒更新，差異數字請先當參考');
+    // 匯出檔太舊要嗊，不管這次有沒有採用它。它是每天跑的，舊了就代表
+    // 排程停了——那本身就是要修的事，不是「這次用不到就算了」。
+    const erpAge = daysAgo_(erp.updatedAt);
+    if(erpAge !== null && erpAge > ERP_STOCK_STALE_DAYS){
+      sourceBits.push('⚠ ERP 匯出檔已經 ' + erpAge + ' 天沒更新（應該每天跑），請查自動匯出是不是停了');
+    }
+    const useAge = daysAgo_(erpNewer ? erp.updatedAt : stockUpdatedAt);
+    if(useAge !== null && useAge > ERP_STOCK_STALE_DAYS){
+      sourceBits.push('⚠ 這次採用的來源已經 ' + useAge + ' 天沒更新，差異數字請先當參考');
     }
   } else {
     sourceBits.push('ERP 匯出檔沒用到：' + erp.error);
@@ -9819,21 +9841,34 @@ function diagnoseErpStock(){
       + (age !== null && age > ERP_STOCK_STALE_DAYS ? '  ⚠ 太舊了，自動匯出是不是停了？' : ''));
     // 跟庫存表對一下，看兩邊差得多不多。差太多代表欄位對錯了，
     // 而不是真的有那麼多貨變動——這種錯沒驗就會變成整表假差異。
+    // 要跟「沒疊過 ERP 的原賌庫存表」比。
+    // 前一版這裡拿的是 storeStockSnapshot_() 的結果，而那個已經把 ERP 疊進去了，
+    // 所以「只有 ERP 有」永遠會是 0——不是真的沒有，是比對的對象被污染了。
+    // 10/19 那次就印出四家店全是 0，而同一行的來源說明卻說補上了兩千多筆，
+    // 兩個數字自己打架。診斷程式講錯話比沒有診斷更糟。
+    const raw = storeStockSnapshot_(d.name, {skipErp: true});
     const snap = storeStockSnapshot_(d.name);
-    if(snap.ok){
+    if(raw.ok && snap.ok){
       let both = 0, same = 0, diff = 0, onlyErp = 0;
       Object.keys(e.bySku).forEach(function(sku){
-        const info = snap.bySku[sku];
+        const info = raw.bySku[sku];
         if(!info){ onlyErp++; return; }
         both++;
         if(info.expected === e.bySku[sku]) same++; else diff++;
       });
-      lines.push('   兩邊都有：' + both + '（數字相同 ' + same + '、不同 ' + diff + '）'
-        + '；只有 ERP 有：' + onlyErp);
+      let onlyStock = 0;
+      Object.keys(raw.bySku).forEach(function(sku){
+        if(e.bySku[sku] === undefined) onlyStock++;
+      });
+      const pct = both ? Math.round(diff * 1000 / both) / 10 : 0;
+      lines.push('   兩邊都有：' + both + '（數字相同 ' + same + '、不同 ' + diff
+        + ' = ' + pct + '%）');
+      lines.push('   只有 ERP 有（庫存表還沒收到的新貨）：' + onlyErp
+        + '；只有庫存表有：' + onlyStock);
       lines.push('   來源判定：' + snap.expectedSource);
       lines.push('   ' + snap.sourceNote);
     } else {
-      lines.push('   庫存表讀不到：' + snap.error);
+      lines.push('   庫存表讀不到：' + (raw.error || snap.error));
     }
     lines.push('');
   });
