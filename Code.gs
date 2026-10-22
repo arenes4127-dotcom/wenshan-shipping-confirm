@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-22.200';
+const BACKEND_VERSION = '2026-10-22.201';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -9877,8 +9877,15 @@ function diagnoseNetFailures(days){
     const act = am ? am[1] : '?';
     byAction[act] = (byAction[act]||0) + 1;
     const mm = /訊息：(.*)$/.exec(det);
-    // 錯誤訊息裡的訂單號、數字會讓每一筆都變成不同的字串，收成同一種才數得出來
-    const msg = (mm ? mm[1] : '?').replace(/\d+/g, '#').slice(0, 60);
+    // 錯誤訊息裡的訂單號、數字會讓每一筆都變成不同的字串，收成同一種才數得出來。
+    //
+    // 但 HTTP 狀態碼不能跟訂單號一起收掉——第一版就是這樣寫的，
+    // 結果 10/22 跑出來是「HTTP #：79」，把最關鍵的資訊碾掉了：
+    // 429 是配額被擋（要減請求）、500/503 是後端自己出錯（要查程式）、
+    // 401/403 是授權（要重新部署）——三條路完全不同。
+    let msg = mm ? mm[1] : '?';
+    const httpM = /^\s*HTTP\s+(\d{3})\s*$/.exec(msg);
+    msg = httpM ? ('HTTP ' + httpM[1]) : msg.replace(/\d+/g, '#').slice(0, 60);
     byMsg[msg] = (byMsg[msg]||0) + 1;
     const who = String(r[iW]||'').trim() || '(未註明)';
     byWho[who] = (byWho[who]||0) + 1;
@@ -9894,6 +9901,8 @@ function diagnoseNetFailures(days){
   };
   const lines = ['連線失敗診斷　' + BACKEND_VERSION + '　最近 ' + back + ' 天', ''];
   lines.push('總共 ' + total + ' 筆' + (undated ? '（其中 ' + undated + ' 筆時間格式認不出來）' : ''));
+  lines.push('※ 這不是全貌：裝置本機最多只留 200 筆，滿了丟最舊的，而且要等下一次連得上才補送。');
+  lines.push('   所以越舊的日子越可能被低估，「最近幾天變多」要搭配當時的作業量一起看。');
   lines.push('');
   lines.push('【哪個動作】集中在一支 = 那支的問題；平均分散 = 現場網路或平台');
   lines.push(top(byAction, 10));
