@@ -1415,22 +1415,43 @@ function flushNetFailures(){
 
 // 真正發請求的底層函式，不含失敗記錄邏輯——補送連線失敗紀錄時要用這個，
 // 不然補送失敗又會記一筆新的失敗，變成無限循環。
+// 讀取的逾時。原本 fetch 沒有任何逾時，倉庫 Wi-Fi 一卡住，這個請求就永遠懸在那裡
+// （瀏覽器自己的逾時動輐4、五分鐘）。配上每 20 秒一次的背景輪詢，卡住的請求會一層層疊上去。
+// 25 秒是故意設寬的：getState 實測就要 4–7 秒，設太短會把慢但會成功的請求殺掉。
+const GET_TIMEOUT_MS = 25000;
+function fetchWithTimeout_(url, opts, ms){
+  const ctrl = new AbortController();
+  const timer = setTimeout(function(){ ctrl.abort(); }, ms);
+  return fetch(url, Object.assign({}, opts, {signal: ctrl.signal}))
+    .finally(function(){ clearTimeout(timer); });
+}
+
 async function rawApiGet(lean){
   // lean=true 時跟後端說「只要訂單、不用出貨紀錄」。
   // 舊版後端不認得這個參數會直接忽略、照樣回完整資料，所以前端先上線也不會壞。
   const url = settings.backendUrl + (lean ? (settings.backendUrl.indexOf('?')>=0 ? '&' : '?') + 'lean=1' : '');
-  const res = await fetch(url, {method:'GET'});
+  // 讀取是幂等的，失敗重試一次不會有副作用。寫入（POST）沒有這個待遇：
+  // 「逾時但其實已經寫進去了」的重試會把掃描算兩次，寧可讓它失敗。
+  let res;
+  try{
+    res = await fetchWithTimeout_(url, {method:'GET'}, GET_TIMEOUT_MS);
+  }catch(err){
+    res = await fetchWithTimeout_(url, {method:'GET'}, GET_TIMEOUT_MS);
+  }
   if(!res.ok) throw new Error('HTTP '+res.status);
   const data = await res.json();
   if(data && data.ok===false) throw new Error(data.error||'後端回應失敗');
   return data;
 }
+const POST_TIMEOUT_MS = 40000;   // 寫入比讀取慢（要拿鎖），給寬一點
 async function rawApiPost(action, payload){
-  const res = await fetch(settings.backendUrl, {
+  // 加逾時但「不重試」：寫入逾時不代表後端沒做，重送會把同一筆掃描算兩次。
+  // 這裡只是讓它失敗得乾脆一點，不要讓使用者對著轉圈圈等五分鐘。
+  const res = await fetchWithTimeout_(settings.backendUrl, {
     method:'POST',
     headers:{'Content-Type':'text/plain;charset=utf-8'}, // 避免觸發CORS preflight，Apps Script用text/plain收再自行JSON.parse
     body: JSON.stringify(Object.assign({action}, payload||{}))
-  });
+  }, POST_TIMEOUT_MS);
   if(!res.ok) throw new Error('HTTP '+res.status);
   const data = await res.json();
   // ok:false 分兩種：帶 error＝後端真的出錯（要丟例外）；帶 reason＝正常的業務判斷結果（如「已被別人認領」），交給呼叫端自己判斷 result.ok/result.reason，不當例外處理
@@ -6361,13 +6382,20 @@ if(settings.productImageSheetUrl){
 
 // 有設定共用後端時，每20秒背景刷新一次，讓多人多裝置看得到彼此的最新狀態
 // （掃描中的訂單current不會被這個刷新動到，見 refreshFromBackend 只換orders/log/staff）
+// 上一輪還沒回來就不要再發。沒這個闘門的話：一次 getState 實測 4–7 秒，
+// 尖峰時更久，而輪詢固定 20 秒一發——一旦變慢就會一層層疊上去，
+// 每一層都是一個 Apps Script 執行緒，越疊越慢、越慢越疊，最後整台看起來就是斷線。
+// 一台機器如此，倉庫裡幾台同時跡時更明顯。
+let pollInFlight = false;
 setInterval(()=>{
   if(!hasBackend()) return;
   if(isScanStationActive_()) return;
+  if(pollInFlight) return;
+  pollInFlight = true;
   refreshFromBackend(true, true).then(ok=>{   // 第二個 true = lean，不抓出貨紀錄
     if(!ok) return;
     renderDataViews();   // 跟其他呼叫點統一；原本這裡 renderHome() 重複寫了兩次
-  });
+  }).finally(()=>{ pollInFlight = false; });
 }, 20000);
 </script>
 </body>

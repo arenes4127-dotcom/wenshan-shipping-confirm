@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-19.199';
+const BACKEND_VERSION = '2026-10-22.200';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -9829,6 +9829,91 @@ function withSheetRetry_(label, fn, tries){
 // 上線前先用真資料驗一次：四家店的 ERP 匯出檔讀不讀得到、多舊、
 // 跟庫存表對起來差多少。不跑這支就直接信它，等於拿現場盤點當測試。
 // 只讀不寫。
+// 「系統會經常離線」——不要猜，資料一直都在。
+// 裝置斷線時會把失敗存在本機，下一次有請求成功就補送到「系統紀錄」（event=連線失敗）。
+// 這支把那些列按「哪個動作」、「哪一小時」、「什麼錯誤訊息」數出來。
+//
+// 要看的是分布，不是總數：
+//   集中在某個時段 → 跟排程（同步、歸檔）撞在一起，是伺服器端塞車
+//   均勻撒在全天   → 比較像現場網路本身
+//   集中在某一個動作 → 那支本身有問題，不是全面性的
+// 只讀不寫。
+function diagnoseNetFailures(days){
+  const back = Math.max(1, Number(days) || 14);
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SYSLOG);
+  if(!sh) return '找不到「' + SHEET_SYSLOG + '」分頁。';
+  const last = sh.getLastRow();
+  if(last < 2) return '「' + SHEET_SYSLOG + '」是空的。';
+  const vals = sh.getRange(2, 1, last - 1, SYSLOG_HEADER.length).getValues();
+  const iT = colOf(SYSLOG_HEADER,'logTime') - 1;
+  const iE = colOf(SYSLOG_HEADER,'event') - 1;
+  const iW = colOf(SYSLOG_HEADER,'claimedBy') - 1;
+  const iD = colOf(SYSLOG_HEADER,'detail') - 1;
+
+  const cutoff = new Date(Date.now() - back * 86400000);
+  const byAction = {}, byHour = {}, byMsg = {}, byDay = {}, byWho = {};
+  let total = 0, undated = 0;
+  vals.forEach(function(r){
+    if(String(r[iE]||'').trim() !== '連線失敗') return;
+    const raw = String(r[iT]||'').trim();
+    // 裝置寫的是 toLocaleString('zh-TW')，像「2026/10/22 下午10:05:31」
+    const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})\s*(上午|下午)?\s*(\d{1,2}):(\d{2})/.exec(raw);
+    if(m){
+      let hh = Number(m[5]);
+      if(m[4] === '下午' && hh < 12) hh += 12;
+      if(m[4] === '上午' && hh === 12) hh = 0;
+      const d = new Date(Number(m[1]), Number(m[2])-1, Number(m[3]), hh, Number(m[6]));
+      if(d < cutoff) return;
+      const day = m[1] + '/' + ('0'+m[2]).slice(-2) + '/' + ('0'+m[3]).slice(-2);
+      byDay[day] = (byDay[day]||0) + 1;
+      const hk = ('0'+hh).slice(-2) + ':00';
+      byHour[hk] = (byHour[hk]||0) + 1;
+    } else {
+      undated++;
+    }
+    total++;
+    const det = String(r[iD]||'');
+    const am = /動作：([^\s　]*)/.exec(det);
+    const act = am ? am[1] : '?';
+    byAction[act] = (byAction[act]||0) + 1;
+    const mm = /訊息：(.*)$/.exec(det);
+    // 錯誤訊息裡的訂單號、數字會讓每一筆都變成不同的字串，收成同一種才數得出來
+    const msg = (mm ? mm[1] : '?').replace(/\d+/g, '#').slice(0, 60);
+    byMsg[msg] = (byMsg[msg]||0) + 1;
+    const who = String(r[iW]||'').trim() || '(未註明)';
+    byWho[who] = (byWho[who]||0) + 1;
+  });
+
+  if(!total) return '最近 ' + back + ' 天沒有「連線失敗」紀錄。'
+    + '\n注意：這不等於沒斷線——裝置要等到下一次請求成功才補送得出來，'
+    + '一直連不上的裝置就一直沒補送。';
+
+  const top = function(obj, n){
+    return Object.keys(obj).sort(function(a,b){ return obj[b]-obj[a]; }).slice(0, n)
+      .map(function(k){ return '      ' + k + '：' + obj[k]; }).join('\n');
+  };
+  const lines = ['連線失敗診斷　' + BACKEND_VERSION + '　最近 ' + back + ' 天', ''];
+  lines.push('總共 ' + total + ' 筆' + (undated ? '（其中 ' + undated + ' 筆時間格式認不出來）' : ''));
+  lines.push('');
+  lines.push('【哪個動作】集中在一支 = 那支的問題；平均分散 = 現場網路或平台');
+  lines.push(top(byAction, 10));
+  lines.push('');
+  lines.push('【哪一小時】集中在固定時段 = 跟排程撞車（19:30 歸檔、20:00 備份、整點同步）');
+  lines.push(top(byHour, 24));
+  lines.push('');
+  lines.push('【錯誤訊息】數字已經收成 #');
+  lines.push(top(byMsg, 10));
+  lines.push('');
+  lines.push('【哪台／誰】集中在一台 = 那台機器或那個角落的訊號');
+  lines.push(top(byWho, 10));
+  lines.push('');
+  lines.push('【每日】');
+  lines.push(top(byDay, 14));
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
+}
+
 function diagnoseErpStock(){
   const lines = ['ERP 匯出檔診斷　' + BACKEND_VERSION, ''];
   STORE_DEFS.forEach(function(d){
