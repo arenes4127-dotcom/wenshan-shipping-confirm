@@ -6387,10 +6387,33 @@ if(settings.productImageSheetUrl){
 // 每一層都是一個 Apps Script 執行緒，越疊越慢、越慢越疊，最後整台看起來就是斷線。
 // 一台機器如此，倉庫裡幾台同時跡時更明顯。
 let pollInFlight = false;
+
+// 分頁在背景就不要輪詢。
+//
+// 為什麼要加：斷線紀錄裡 S04、S05 兩台就佔了 69%，而那兩台是桌機。
+// 桌機的頁面是一整天開著的，所以它每小時發 180 次輪詢、一天上千次，
+// 而手持機是拿起來用完就放下。兩台排在前面很可能不是訊號差，
+// 是它們發的請求就是比別人多一個數量級。
+//
+// 最浪費的那一半是「沒人在看」的時候：視窗被诋小、切到別的分頁、
+// 下班後沒關。那些輪詢拉回來的資料沒有任何人會看到，卻照樣占配額、
+// 照樣跟現場正在掃貨的手持機搶同一條線。
+//
+// 回到前景時立刻補一次，所以使用者感覺不到差別——他看到的第一眼就是新的。
+document.addEventListener('visibilitychange', function(){
+  if(document.hidden) return;
+  if(!hasBackend() || isScanStationActive_() || pollInFlight) return;
+  pollInFlight = true;
+  refreshFromBackend(true, true).then(function(ok){
+    if(ok) renderDataViews();
+  }).finally(function(){ pollInFlight = false; });
+});
+
 setInterval(()=>{
   if(!hasBackend()) return;
   if(isScanStationActive_()) return;
   if(pollInFlight) return;
+  if(document.hidden) return;   // 背景分頁不輪詢，回到前景會馬上補一次
   pollInFlight = true;
   refreshFromBackend(true, true).then(ok=>{   // 第二個 true = lean，不抓出貨紀錄
     if(!ok) return;
