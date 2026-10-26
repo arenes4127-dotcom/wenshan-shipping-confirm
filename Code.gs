@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-22.201';
+const BACKEND_VERSION = '2026-10-22.202';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -9852,12 +9852,13 @@ function diagnoseNetFailures(days){
 
   const cutoff = new Date(Date.now() - back * 86400000);
   const byAction = {}, byHour = {}, byMsg = {}, byDay = {}, byWho = {};
+  const raw = [];
   let total = 0, undated = 0;
   vals.forEach(function(r){
     if(String(r[iE]||'').trim() !== '連線失敗') return;
-    const raw = String(r[iT]||'').trim();
+    const raw_t = String(r[iT]||'').trim();
     // 裝置寫的是 toLocaleString('zh-TW')，像「2026/10/22 下午10:05:31」
-    const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})\s*(上午|下午)?\s*(\d{1,2}):(\d{2})/.exec(raw);
+    const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})\s*(上午|下午)?\s*(\d{1,2}):(\d{2})/.exec(raw_t);
     if(m){
       let hh = Number(m[5]);
       if(m[4] === '下午' && hh < 12) hh += 12;
@@ -9889,6 +9890,7 @@ function diagnoseNetFailures(days){
     byMsg[msg] = (byMsg[msg]||0) + 1;
     const who = String(r[iW]||'').trim() || '(未註明)';
     byWho[who] = (byWho[who]||0) + 1;
+    raw.push({t: raw_t, who: who, act: act, msg: msg});
   });
 
   if(!total) return '最近 ' + back + ' 天沒有「連線失敗」紀錄。'
@@ -9918,6 +9920,14 @@ function diagnoseNetFailures(days){
   lines.push('');
   lines.push('【每日】');
   lines.push(top(byDay, 14));
+  lines.push('');
+  // 分組的數字看不出「是不是擠在幾分鐘內一次爆發」。
+  // 一次部署的空窗、一次 AP 重啟，都會讓所有裝置在同一分鐘內全部失敗，
+  // 那跟「整天零星地掉」是完全不同的毛病。所以透出逐筆時間。
+  lines.push('【最近 40 筆逐筆】時間挙在幾分鐘內 = 單一事件（部署、AP 重啟）；散在全天 = 持續性問題');
+  raw.slice(-40).forEach(function(e){
+    lines.push('      ' + e.t + '  ' + e.who + '  ' + e.act + '  ' + e.msg);
+  });
   const text = lines.join('\n');
   Logger.log(text);
   return text;
