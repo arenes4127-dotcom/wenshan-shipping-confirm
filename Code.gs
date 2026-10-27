@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-26.203';
+const BACKEND_VERSION = '2026-10-27.204';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -5331,6 +5331,50 @@ function lookupLocation(body){
   const row = locIndex_(sh)[sku];
   if(!row) return {ok:false, reason:'not_found', sku: sku};
   return readLocRow_(sh, row, sku);
+}
+
+// 把 timeLookupLocations_ 包成「叫得動」的入口。
+//
+// 它三個月前就寫好了，就是為了回答「儲位查詢到底慢在哪一段」，但名字是底線結尾的
+// ——Apps Script 編輯器的函式下拉選單會把 name_ 藏起來，所以沒人叫得動。
+// 這個坑我在這個專案裡已經踩過兩次。
+//
+// 為什麼要先量再改：我本來打算直接把 locIndex_ 的快取 TTL 從 300 秒拉長。但那只對
+// 「每 5 分鐘第一個倒楣的人」有效；如果慢的是每一次查詢，瓶頸就不在重建索引，而是
+// 快取讀回來每次都要重組一個兩萬筆的物件、或者根本是 Apps Script 的請求開銷。
+// 改錯地方等於沒改。這題我已經猜錯三次（排程撞車、配額、鎖競爭），這次先看數字。
+//
+// 跑兩次：第一次可能是冷的、第二次一定是熱的，兩者的差別就是重建索引的成本。
+function diagnoseLocLookup(skuCsv){
+  const skus = String(skuCsv || '').split(/[,\s、]+/).filter(function(x){ return x; });
+  const body = skus.length ? {skus: skus} : {};
+  const cold = timeLookupLocations_(body);
+  const warm = timeLookupLocations_(body);
+  const fmt = function(label, r){
+    if(!r || !r.ok) return label + '：失敗 ' + (r && r.error);
+    const parts = Object.keys(r.deltas).map(function(k){ return '      ' + k + '：' + r.deltas[k]; });
+    return [label + '：共 ' + r.totalMs + 'ms'].concat(parts).join('\n');
+  };
+  const text = [
+    '儲位查詢計時　' + BACKEND_VERSION,
+    '查的品號：' + (skus.length ? skus.join('、') : '（預設範例一筆）'),
+    '儲位主檔列數：' + (cold.locMapLastRow || '?'),
+    '',
+    fmt('第一次（快取可能是冷的）', cold),
+    '',
+    fmt('第二次（快取一定是熱的）', warm),
+    '',
+    '怎麼讀：',
+    '  兩次的 afterGetLocMapSheet→afterLocIndex 差很多',
+    '    → 慢在重建索引，把快取 TTL 拉長會有效',
+    '  兩次都差不多、而且 afterLocIndex 那段就不小',
+    '    → 慢在「把快取讀回來重組成物件」，拉 TTL 沒用，要改成不整包載入',
+    '  兩次加起來都很快（各幾百 ms）',
+    '    → 後端不是瓶頸。現場感受到的慢是 Apps Script 的請求開銷，',
+    '      跟 getState 同一個問題，要走架構那條路'
+  ].join('\n');
+  Logger.log(text);
+  return text;
 }
 
 // 暫時性診斷用：跟 lookupLocations 完全一樣的邏輯，但每一步都打時間戳記，
