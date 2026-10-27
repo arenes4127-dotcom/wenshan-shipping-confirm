@@ -1426,19 +1426,45 @@ function fetchWithTimeout_(url, opts, ms){
     .finally(function(){ clearTimeout(timer); });
 }
 
+// 每次 GET 都帶一個不重複的參數，並且明講不要用快取。
+//
+// 為什麼：Apps Script 的 /exec 不會自己回內容，它回 302 轉到一個
+// script.googleusercontent.com/macros/echo?user_content_key=... 的網址，而那個網址
+// 是有時效的。瀏覽器如果把那個 302 快取起來，之後每一次 GET 都會直接打去那個
+// 已經過期的 echo 網址 —— 回來就是 HTTP 404。
+//
+// 這完全吻合 10/24 的逐筆紀錄：S04 從 15:32 一路 404 到 17:34（兩小時、每隔
+// 一兩分鐘一次），S03 從 18:31 到 18:59，而且兩段「不重疊」。伺服器端的問題
+// （部署空窗、Apps Script 出事）會讓所有裝置同時失敗，不會一次只壞一台壞兩小時。
+// 另一個鐵證是 404 幾乎只發生在 getState：POST 的 302 不會被這樣快取，
+// 而 claimOrder / finalizeShipment 那些總共只有個位數。
+//
+// 加參數之後每次都是新網址，拿不到舊的快取轉址，就會重新跟 /exec 要一次。
+function getUrlFresh_(lean){
+  const base = settings.backendUrl;
+  const sep = base.indexOf('?') >= 0 ? '&' : '?';
+  return base + sep + (lean ? 'lean=1&' : '') + '_=' + Date.now() + '.' + Math.random().toString(36).slice(2, 8);
+}
+
 async function rawApiGet(lean){
-  // lean=true 時跟後端說「只要訂單、不用出貨紀錄」。
-  // 舊版後端不認得這個參數會直接忽略、照樣回完整資料，所以前端先上線也不會壞。
-  const url = settings.backendUrl + (lean ? (settings.backendUrl.indexOf('?')>=0 ? '&' : '?') + 'lean=1' : '');
-  // 讀取是幂等的，失敗重試一次不會有副作用。寫入（POST）沒有這個待遇：
+  // 讀取是冪等的，失敗重試一次不會有副作用。寫入（POST）沒有這個待遇：
   // 「逾時但其實已經寫進去了」的重試會把掃描算兩次，寧可讓它失敗。
-  let res;
-  try{
-    res = await fetchWithTimeout_(url, {method:'GET'}, GET_TIMEOUT_MS);
-  }catch(err){
-    res = await fetchWithTimeout_(url, {method:'GET'}, GET_TIMEOUT_MS);
+  //
+  // 這裡連 404 / 5xx 也重試：如果真的是拿到過期的快取轉址，重試會帶新的
+  // 參數、走新的網址，很可能就成功了。每次都重新產生網址就是為了這個。
+  let res = null, lastErr = null;
+  for(let attempt = 0; attempt < 2; attempt++){
+    try{
+      res = await fetchWithTimeout_(getUrlFresh_(lean), {method:'GET', cache:'no-store'}, GET_TIMEOUT_MS);
+      if(res.ok) break;
+      lastErr = new Error('HTTP ' + res.status);
+      if(res.status !== 404 && res.status < 500) break;   // 其他狀態碼重試沒有意義
+    }catch(err){
+      lastErr = err;
+      res = null;
+    }
   }
-  if(!res.ok) throw new Error('HTTP '+res.status);
+  if(!res || !res.ok) throw (lastErr || new Error('讀取失敗'));
   const data = await res.json();
   if(data && data.ok===false) throw new Error(data.error||'後端回應失敗');
   return data;
