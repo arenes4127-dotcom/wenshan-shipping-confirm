@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-03.206';
+const BACKEND_VERSION = '2026-11-03.207';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -168,6 +168,15 @@ const NO_LOCK_ACTIONS = {
 // （跟 _ssMemo_ / _headerOk_ 同樣道理），不會殘留到下一次請求。
 let _scriptLockHeld_ = false;
 const SCRIPT_LOCK_WAIT_MS = 10000;
+// 現場按下去的動作（doPost）等久一點也比直接失敗好。
+//
+// 11/02 11:39:37→:48 這 11 秒內 S06 的「完成出貨」連續 5 次搶不到鎖，每次都是
+// 10 秒逾時。使用者看到的是五次錯誤，實際上他只要能排進去等一下就過了。
+// 寫入逾時是 40 秒（POST_TIMEOUT_MS），所以等 25 秒還有餘裕把事情做完。
+//
+// 排程維持 10 秒：它們每 15~60 分鐘跑一次，搶不到就跳過這一輪，
+// 下一輪會補上，沒必要為了排程把現場的人擋在門外。
+const USER_LOCK_WAIT_MS = 25000;
 
 function withScriptLock_(label, fn, waitMs){
   if(_scriptLockHeld_) return fn();          // 本次執行已經持有，直接跑
@@ -236,7 +245,7 @@ function doPost(e){
     return respond(result);
     };
     // 只讀的動作跳過鎖（見 NO_LOCK_ACTIONS）；其餘跟排程搶同一把
-    return needsLock ? withScriptLock_('doPost:' + body.action, run) : run();
+    return needsLock ? withScriptLock_('doPost:' + body.action, run, USER_LOCK_WAIT_MS) : run();
   }catch(err){
     // 鎖等不到也會走到這裡，回傳正常的 JSON 讓前端顯示得出訊息
     return respond({ok:false, error: String(err)});
@@ -3060,6 +3069,23 @@ function listAutomationTriggers_(){
   }).sort(function(x,y){ return x.handler < y.handler ? -1 : 1; });
 }
 
+// 重新安裝所有排程。改了上面任何一個 newTrigger 的時間設定，都要跑這支才會生效——
+// 既有的觸發器是當初建立時就固定下來的，改程式不會動到它們。
+// 沒有底線結尾：Apps Script 編輯器的函式下拉選單會把 name_ 藏起來（這個坑踩第四次了）。
+function reinstallTriggers(){
+  installAutomationTriggers_();   // 它自己只寫 Logger、不回傳，所以結果在這裡自己列
+  const lines = ['已重新安裝排程　' + BACKEND_VERSION, ''];
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    lines.push('  ' + t.getHandlerFunction());
+  });
+  lines.push('');
+  lines.push('共 ' + ScriptApp.getProjectTriggers().length + ' 個。');
+  lines.push('mirrorTransferScheduled_ 這次起改成每 30 分鐘（原本 15 分鐘）。');
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
+}
+
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
     'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_', 'releaseStaleClaims_',
@@ -3084,7 +3110,10 @@ function installAutomationTriggers_(){
   // 全部沒有真的被安裝成排程，一直沒被發現（因為呼叫這支函式後不會馬上看到症狀，
   // 是這次要加新排程重新呼叫才順著錯誤訊息抓到）。改成15，跟下面releaseStaleClaims_
   // 同樣的檢查頻率。
-  ScriptApp.newTrigger('mirrorTransferScheduled_').timeBased().everyMinutes(15).create();
+  // 從 15 分鐘改成 30 分鐘：掃描/匯入當下本來就會盡力鏡射一次，這支只是保險。
+  // 它每跑一次就要佔一次全域鎖、還要開外部試算表寫三片，頻率減半等於現場被擋住的
+  // 機會減半。真的漏鏡射時最多晚 30 分鐘補上，那張分頁本來就不是即時的。
+  ScriptApp.newTrigger('mirrorTransferScheduled_').timeBased().everyMinutes(30).create();
   // 已出貨訂單歸檔刻意排在 19:30，不能排在 20:30——
   // 「文山出貨 工作區」自己也有一個 20:30 的觸發器（dailyArchiveAndResetAuto），
   // 它會把「文山出貨V2」從模板還原、也就是清空當天的訂單資料。我們的歸檔要讀那份鏡像
@@ -4116,8 +4145,22 @@ function timeSingleTransferScan_(){
 }
 
 function mirrorTransferScheduled_(){
-  // 包鎖：鏡射會整片覆寫工作區的「調撥驗收」分頁，而 scanTransferBatch 也會寫同一片
-  try{ withScriptLock_('mirrorTransferScheduled_', mirrorTransferToWorkspace_); }
+  // 包鎖的理由沒變：鏡射會整片覆寫工作區的「調撥驗收」分頁，而 scanTransferBatch
+  // 也會寫同一片。但「讀調撥單」不需要在鎖裡面做。
+  //
+  // 這支每 15 分鐘跑一次，而它在鎖裡做的事包含 readRows(調撥單) 整張讀——那張表
+  // 從來沒有清理過，已驗收的列全部留著，所以它只會越來越慢。整個系統的寫入
+  // （完成出貨、認領訂單、調撥掃描）都在等同一把鎖，等於每 15 分鐘就被這張
+  // 越來越大的表擋住一次。11/02 與 10/27 那幾串「等不到寫入鎖」就是這樣來的。
+  //
+  // 先在鎖外面讀完再進去寫。讀完到寫入之間如果剛好有人掃了一筆，差別只是這一輪
+  // 少鏡射那一筆，下一輪補上——那張分頁本來就最多落後一輪，這個代價是零。
+  try{
+    const rows = readRows(SHEET_TRANSFER, TRANSFER_HEADER);
+    withScriptLock_('mirrorTransferScheduled_', function(){
+      return mirrorTransferToWorkspace_(rows);
+    });
+  }
   catch(err){ Logger.log('mirrorTransferToWorkspace_ 失敗：' + err); }
 }
 
