@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-03.207';
+const BACKEND_VERSION = '2026-11-03.208';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -2055,8 +2055,13 @@ function dailyMaintenance_(){
   return withScriptLock_('dailyMaintenance_', function(){
     const closed = batchCloseOtherWarehouseOrders_();
     const archived = archiveShippedOrders_();
-    Logger.log('每日維護完成：' + JSON.stringify({自動結案: closed, 歸檔: archived}));
-    return {自動結案: closed, 歸檔: archived};
+    // 調撥那兩張也一起搬。放在同一支排程、同一把鎖裡面，不要另外開一個排程——
+    // 多一個排程就多一個每天固定時段佔住全域鎖的東西，那正是現在要解決的問題。
+    const tDone = archiveTransferDone_();
+    const tLog = archiveTransferLog_();
+    const out = {自動結案: closed, 歸檔: archived, 調撥單歸檔: tDone, 驗收紀錄歸檔: tLog};
+    Logger.log('每日維護完成：' + JSON.stringify(out));
+    return out;
   });
 }
 
@@ -4142,6 +4147,196 @@ function timeSingleTransferScan_(){
     try{ mirrorTransferToWorkspace_(); }catch(e){}   // 把鏡射端殘留的測試資料沖乾淨
   }
   return result;
+}
+
+
+// ================= 調撥單／驗收紀錄歸檔 =================
+// 這兩張表只進不出：調撥單從上線到現在一列都沒清過，驗收紀錄也是。
+// 後果不只是「調撥載入很慢」——mirrorTransferScheduled_ 每半小時會把這兩張整張讀進來，
+// 而它讀的時候握著全域寫入鎖，所以表越大，現場「完成出貨」被擋住的時間就越長。
+// 11/02 那幾串「等不到寫入鎖」就是這樣來的。
+//
+// 做法完全照訂單歸檔那一套，因為那套已經在現場跑了一個多月、排程也驗收過：
+//   先備份成獨立檔案 → 切回作用中試算表 → 驗快照沒被動過 → 驗列號對得上
+//   → 重寫保留列（不用 deleteRows）→ 讀回來逐筆比對 → 對不上就當沒發生
+// 每一道都是過去真的被咬過才加的，一道都不省。
+const TRANSFER_ARCHIVE_KEEP_DAYS = 3;     // 已驗收的調撥單留 3 天（使用者指定）
+const TRANSFERLOG_ARCHIVE_KEEP_DAYS = 10; // 驗收紀錄留 10 天（使用者指定）
+
+// 日期欄可能是 Date 物件，也可能是 'yyyy/MM/dd HH:mm:ss' 或 ISO 字串
+// （Sheets 會把看起來像日期的字串自動轉型，這個系統各處都踩過）。
+// 解不出來一律回 NaN，呼叫端看到 NaN 就不歸檔——寧可留著也不要誤刪。
+function parseRowStamp_(v){
+  if(v instanceof Date) return v.getTime();
+  const s = String(v == null ? '' : v).trim();
+  if(!s) return NaN;
+  if(/^\d{4}-\d{2}-\d{2}T/.test(s)){ const t = Date.parse(s); return isNaN(t) ? NaN : t; }
+  const m = /^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})(?:[\sT]+(\d{1,2}):(\d{2}))?/.exec(s);
+  if(m) return new Date(+m[1], +m[2]-1, +m[3], m[4] ? +m[4] : 0, m[5] ? +m[5] : 0).getTime();
+  const t = Date.parse(s);
+  return isNaN(t) ? NaN : t;
+}
+
+// cfg: {sheetName, header, keyField, dateField, keepDays, label, eligible(row)}
+function archiveSheetRows_(cfg){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(cfg.sheetName);
+  if(!sh) return {歸檔: 0, 中止原因: '找不到「' + cfg.sheetName + '」分頁'};
+
+  const rows = readRows(cfg.sheetName, cfg.header);
+  if(!rows.length) return {歸檔: 0, 剩餘待歸檔: 0, 說明: cfg.sheetName + ' 是空的'};
+
+  const cutoff = Date.now() - cfg.keepDays * 86400 * 1000;
+  const toArchive = rows.filter(function(r){
+    if(cfg.eligible && !cfg.eligible(r)) return false;
+    const t = parseRowStamp_(r[cfg.dateField]);
+    if(isNaN(t)) return false;      // 日期看不懂就留著，不猜
+    return t <= cutoff;
+  });
+  if(!toArchive.length){
+    return {歸檔: 0, 剩餘待歸檔: 0, 說明: '沒有超過 ' + cfg.keepDays + ' 天的' + cfg.label};
+  }
+
+  toArchive.sort(function(a, b){ return a._row - b._row; });
+  const batch = toArchive.length > ARCHIVE_MAX_ROWS_PER_RUN
+    ? toArchive.slice(0, ARCHIVE_MAX_ROWS_PER_RUN) : toArchive;
+  const remaining = toArchive.length - batch.length;
+
+  // 先備份。檔名絕不覆蓋既有檔案——一天跑好幾批是正常路徑，每批搬的是不同的列，
+  // 覆蓋等於把前一批的唯一備份丟掉（訂單歸檔那邊差一步就真的弄丟過）。
+  const tz = ss.getSpreadsheetTimeZone();
+  const folder = DriveApp.getFolderById(SHIPPED_ORDER_ARCHIVE_FOLDER_ID);
+  const baseName = Utilities.formatDate(new Date(), tz, 'yyyy_MM_dd') + '_' + cfg.label + '歸檔';
+  let fileName = baseName, seq = 1;
+  while(folder.getFilesByName(fileName).hasNext()){ seq++; fileName = baseName + '_第' + seq + '批'; }
+
+  const archiveSs = SpreadsheetApp.create(fileName);
+  const archiveSh = archiveSs.getSheets()[0];
+  archiveSh.setName(cfg.sheetName);
+  archiveSh.getRange(1, 1, 1, cfg.header.length).setValues([cfg.header.slice()]);
+  archiveSh.getRange(2, 1, batch.length, cfg.header.length)
+    .setValues(batch.map(function(r){ return cfg.header.map(function(h){ return r[h]; }); }));
+  const archiveFile = DriveApp.getFileById(archiveSs.getId());
+  folder.addFile(archiveFile);
+  DriveApp.getRootFolder().removeFile(archiveFile);
+  SpreadsheetApp.flush();
+
+  // SpreadsheetApp.create() 會把新建的那份變成作用中試算表，後面所有
+  // getActiveSpreadsheet() 都會跑到錯的檔案上，而且分頁同名所以不會拋錯。
+  // 訂單歸檔那邊就是被這個坑弄到「刪了 8 次一列都沒少」查了兩週。
+  SpreadsheetApp.setActiveSpreadsheet(ss);
+  const shLive = ss.getSheetByName(cfg.sheetName);
+  if(!shLive){
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '建完備份後重新取得分頁失敗'};
+  }
+
+  // 建備份那幾秒內如果有人寫進新的一列，清尾巴就會把它一起清掉——那是真正的資料遺失。
+  const lastRowBefore = shLive.getLastRow();
+  const snapshotLastRow = 1 + rows.length;
+  if(lastRowBefore !== snapshotLastRow){
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '分頁在建備份期間被改動過，為避免清掉新資料而整批放棄',
+            快照lastRow: snapshotLastRow, 現在lastRow: lastRowBefore};
+  }
+
+  // 列號是快照當下拍的。照錯的列號動手是這個系統最嚴重的資料錯誤，所以先逐列驗 key。
+  const keyCol = colOf(cfg.header, cfg.keyField);
+  const minRow = batch[0]._row, maxRow = batch[batch.length - 1]._row;
+  const liveKeys = shLive.getRange(minRow, keyCol, maxRow - minRow + 1, 1).getValues();
+  const mismatches = [];
+  batch.forEach(function(r){
+    const live = String(liveKeys[r._row - minRow][0] || '').trim();
+    if(live !== String(r[cfg.keyField] || '').trim() && mismatches.length < 5){
+      mismatches.push({列: r._row, 預期: String(r[cfg.keyField] || ''), 實際讀到: live});
+    }
+  });
+  if(mismatches.length){
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '列號與內容對不上，為避免動到別的列而整批放棄', 對不上的範例: mismatches};
+  }
+
+  // 重寫保留列，不用 deleteRows（那支在歸檔這條路徑上確認過會靜默失效，根因沒找到，
+  // 但歸檔要的是「表變小」，不是「非得用 deleteRows」）。
+  const archiveRowSet = {};
+  batch.forEach(function(r){ archiveRowSet[r._row] = true; });
+  // 整列都空白的直接不保留。測試台抓到的：表中間若夾著空白列（人工刪過內容、
+  // 或上一輪清尾巴留下的痕跡），它們會被當成「要保留」而寫回去，於是寫完之後
+  // getLastRow() 停在最後一筆有內容的列、跟預期的列數對不上，驗證判失敗——
+  // 但那時候資料「已經寫回去了」，函式卻回報歸檔 0，說法跟事實不符。
+  // 空白列本來就沒有東西可以失去，順手壓掉，表也順便被整理乾淨。
+  const keep = rows.filter(function(r){
+    if(archiveRowSet[r._row]) return false;
+    return cfg.header.some(function(h){ return String(r[h] == null ? '' : r[h]).trim() !== ''; });
+  });
+  const keepValues = keep.map(function(r){ return cfg.header.map(function(h){ return r[h]; }); });
+  if(keepValues.length){
+    shLive.getRange(2, 1, keepValues.length, cfg.header.length).setValues(keepValues);
+  }
+  const tailStart = 2 + keepValues.length;
+  const tailCount = lastRowBefore - tailStart + 1;
+  if(tailCount > 0) shLive.getRange(tailStart, 1, tailCount, cfg.header.length).clearContent();
+  SpreadsheetApp.flush();
+
+  // 「沒拋錯就是成功」在這條路徑上已經被推翻太多次，一定要讀回來對。
+  const lastRowAfter = shLive.getLastRow();
+  const expectLastRow = 1 + keepValues.length;
+  let 內容對得上 = (lastRowAfter === expectLastRow);
+  let 第一個對不上的 = null;
+  if(內容對得上 && keepValues.length){
+    const backKeys = shLive.getRange(2, keyCol, keepValues.length, 1).getValues();
+    for(let k = 0; k < keep.length; k++){
+      const want = String(keep[k][cfg.keyField] || '').trim();
+      const got = String(backKeys[k][0] || '').trim();
+      if(want !== got){
+        內容對得上 = false;
+        第一個對不上的 = {第幾筆: k + 1, 列: k + 2, 預期: want, 實際: got};
+        break;
+      }
+    }
+  }
+  if(!內容對得上){
+    // 講清楚：這個分支的「寫回」已經做完了，不是什麼都沒發生。
+    // 被搬走的列在備份檔裡（上面先建的），所以資料沒有消失，但現場的表已經被改過，
+    // 不能回報成「歸檔 0、什麼都沒動」——那會讓人以為可以直接重跑。
+    return {歸檔: 0, 剩餘待歸檔: toArchive.length, 備份檔: fileName,
+            中止原因: '寫回之後讀回來對不上。注意：重寫已經執行，這張表已被改動，'
+                    + '被移走的列在備份檔裡，請人工比對後再決定要不要重跑',
+            寫入前lastRow: lastRowBefore, 寫入後lastRow: lastRowAfter,
+            預期lastRow: expectLastRow, 第一個對不上的: 第一個對不上的};
+  }
+
+  return {歸檔: batch.length, 剩餘待歸檔: remaining, 備份檔: fileName,
+          保留幾列: keepValues.length,
+          寫入前lastRow: lastRowBefore, 寫入後lastRow: lastRowAfter};
+}
+
+function archiveTransferDone_(){
+  return archiveSheetRows_({
+    sheetName: SHEET_TRANSFER, header: TRANSFER_HEADER,
+    keyField: 'sku', dateField: 'doneAt',
+    keepDays: TRANSFER_ARCHIVE_KEEP_DAYS, label: '調撥單',
+    // 只搬已驗收完成的。open 的是還沒收完的貨，cancelled 的沒有可靠的完成時間，都留著。
+    eligible: function(r){ return String(r.status||'').trim() === 'done'; }
+  });
+}
+
+function archiveTransferLog_(){
+  return archiveSheetRows_({
+    sheetName: SHEET_TRANSFERLOG, header: TRANSFERLOG_HEADER,
+    keyField: 'sku', dateField: 'logTime',
+    keepDays: TRANSFERLOG_ARCHIVE_KEEP_DAYS, label: '調撥驗收紀錄'
+  });
+}
+
+// 手動跑一次（會自己拿鎖，可以直接從編輯器執行）。沒有底線結尾，選單看得到。
+function runTransferArchiveNow(){
+  const out = withScriptLock_('runTransferArchiveNow', function(){
+    return {調撥單: archiveTransferDone_(), 驗收紀錄: archiveTransferLog_()};
+  });
+  const text = '調撥歸檔　' + BACKEND_VERSION + '\n' + JSON.stringify(out, null, 2);
+  Logger.log(text);
+  return text;
 }
 
 function mirrorTransferScheduled_(){
