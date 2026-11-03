@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-10-27.205';
+const BACKEND_VERSION = '2026-11-03.206';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -3597,7 +3597,16 @@ function shardedCacheClear_(prefix, shardCount){
   CacheService.getScriptCache().removeAll(shardedCacheKeys_(prefix, shardCount));
 }
 
-const LOCMAP_INDEX_CACHE_TTL_SEC = 300;
+// 11/03 用 diagnoseLocLookup 量到的：儲位主檔 17,044 列，
+//   冷（要重建索引）2,887ms，其中重建本身 2,207ms
+//   熱（讀快取）      47ms，其中讀快取本身   43ms
+// 差 61 倍。原本 TTL 300 秒代表每 5 分鐘就有一個人要等那 2.9 秒——而這整張表
+// 一天也改不了幾次。拉到 30 分鐘，冷重建從每小時 12 次降到 2 次。
+//
+// 不拉到上限 6 小時，是因為索引存的是「列號」：主檔被刪過列之後所有列號整批位移，
+// 過期的索引會指到隔壁商品那一列。下面 readLocRow_ 加了驗證會自己修正，
+// 但窗口還是越短越好，30 分鐘是在「少等」跟「少踩」之間取的。
+const LOCMAP_INDEX_CACHE_TTL_SEC = 1800;
 const LOCMAP_INDEX_CACHE_SHARDS = 10;
 function locIndexCacheGet_(){ return shardedCacheGet_('locIdxV1_', LOCMAP_INDEX_CACHE_SHARDS); }
 function locIndexCacheSet_(idx){ shardedCacheSet_('locIdxV1_', LOCMAP_INDEX_CACHE_SHARDS, idx, LOCMAP_INDEX_CACHE_TTL_SEC); }
@@ -3621,7 +3630,21 @@ function locIndex_(sh){
 }
 
 function readLocRow_(sh, row, sku){
-  const v = sh.getRange(row, 1, 1, LOCMAP_COL.note).getValues()[0];
+  let v = sh.getRange(row, 1, 1, LOCMAP_COL.note).getValues()[0];
+  // 確認這一列真的是要找的那個品號。
+  //
+  // 索引存的是列號而且是快取的，主檔只要被刪過一列，後面所有列號就整批往上位移，
+  // 拿到的會是隔壁商品那一列——而「安靜地回報別人的儲位」在現場就是把貨放到錯的
+  // 架上，比查不到嚴重得多。這一列本來就要讀，所以驗證不花額外成本。
+  // 對不上就清掉快取重建一次再試；還是對不上就老實說查不到。
+  if(String(v[LOCMAP_COL.sku-1]||'').trim() !== sku){
+    try{ locIndexCacheClear_(); }catch(err){}
+    const row2 = locIndex_(sh)[sku];
+    if(!row2) return {ok:false, reason:'not_found', sku: sku};
+    v = sh.getRange(row2, 1, 1, LOCMAP_COL.note).getValues()[0];
+    if(String(v[LOCMAP_COL.sku-1]||'').trim() !== sku) return {ok:false, reason:'not_found', sku: sku};
+    row = row2;
+  }
   const cell = String(v[LOCMAP_COL.location-1]||'').trim();
   const parsed = parseLocList_(cell);
   return {ok:true, sku: sku, row: row,
@@ -5396,7 +5419,11 @@ function timeLookupLocations_(body){
   skus.forEach(function(raw){
     const sku = String(raw||'').trim();
     if(!sku) return;
-    if(idx[sku]) found.push(readLocRow_(sh, idx[sku], sku));
+    if(idx[sku]){
+      const r = readLocRow_(sh, idx[sku], sku);
+      // 驗證沒過（索引過期）就當成沒查到，讓它走後面「補列／視為新品」那條既有的路
+      if(r.ok) found.push(r); else missing.push(sku);
+    }
     else missing.push(sku);
   });
   mark('afterReadRows');
@@ -5430,7 +5457,11 @@ function lookupLocations(body){
   skus.forEach(function(raw){
     const sku = String(raw||'').trim();
     if(!sku) return;
-    if(idx[sku]) found.push(readLocRow_(sh, idx[sku], sku));
+    if(idx[sku]){
+      const r = readLocRow_(sh, idx[sku], sku);
+      // 驗證沒過（索引過期）就當成沒查到，讓它走後面「補列／視為新品」那條既有的路
+      if(r.ok) found.push(r); else missing.push(sku);
+    }
     else missing.push(sku);
   });
   // 儲位主檔沒有，不代表這個品號不存在——新品入倉時 ERP 已經有資料了，
@@ -5753,7 +5784,10 @@ function changeLocation(body){
 
   // 先回寫來源、再寫紀錄。回寫失敗就整個中止，
   // 不要留下一筆「紀錄說搬了、地圖上沒搬」的假資料。
-  const res = applyLocChange_(sh, readLocRow_(sh, row, sku), opt);
+  // 寫入前一定要先確認讀到的是正確的那一列，不然會把別人的儲位改掉
+  const base = readLocRow_(sh, row, sku);
+  if(!base.ok) return base;
+  const res = applyLocChange_(sh, base, opt);
   if(!res.ok) return res;
   res.created = created;
   locLogRows_([res], opt);
@@ -5792,7 +5826,9 @@ function changeLocationBatch(body){
       created = true;
     }
     if(!row){ results.push({ok:false, sku: sku, reason:'not_found', error:'文山地圖裡找不到這個品號'}); return; }
-    const r = applyLocChange_(sh, readLocRow_(sh, row, sku), opt);
+    const base = readLocRow_(sh, row, sku);
+    if(!base.ok){ results.push(Object.assign({sku: sku}, base)); return; }
+    const r = applyLocChange_(sh, base, opt);
     r.created = created;
     results.push(r);
   });
