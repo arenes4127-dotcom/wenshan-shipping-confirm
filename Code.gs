@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-03.208';
+const BACKEND_VERSION = '2026-11-10.209';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -4186,15 +4186,43 @@ function archiveSheetRows_(cfg){
   const rows = readRows(cfg.sheetName, cfg.header);
   if(!rows.length) return {歸檔: 0, 剩餘待歸檔: 0, 說明: cfg.sheetName + ' 是空的'};
 
+  // 把「為什麼沒被選中」分開數。
+  //
+  // 第一版只回「沒有超過 N 天的」，而那句話把三件完全不同的事講成同一件：
+  // 真的沒有舊的、狀態不符、以及「日期欄我解不出來所以全部跳過」。
+  // 11/10 第一次對真實資料跑出 0 筆，我就分不出是哪一種——這正是這個系統
+  // 在歸檔上吃過大虧的那種含糊（deleteRows 當初也是「沒拋錯」就被當成成功）。
   const cutoff = Date.now() - cfg.keepDays * 86400 * 1000;
+  const why = {總列數: rows.length, 狀態不符: 0, 日期看不懂: 0, 還太新: 0, 可歸檔: 0};
+  const badDateSamples = [], freshSamples = [];
   const toArchive = rows.filter(function(r){
-    if(cfg.eligible && !cfg.eligible(r)) return false;
-    const t = parseRowStamp_(r[cfg.dateField]);
-    if(isNaN(t)) return false;      // 日期看不懂就留著，不猜
-    return t <= cutoff;
+    if(cfg.eligible && !cfg.eligible(r)){ why.狀態不符++; return false; }
+    const raw = r[cfg.dateField];
+    const t = parseRowStamp_(raw);
+    if(isNaN(t)){                   // 日期看不懂就留著，不猜
+      why.日期看不懂++;
+      if(badDateSamples.length < 3) badDateSamples.push(String(raw == null ? '(空)' : raw));
+      return false;
+    }
+    if(t > cutoff){
+      why.還太新++;
+      if(freshSamples.length < 3) freshSamples.push(String(raw));
+      return false;
+    }
+    why.可歸檔++;
+    return true;
   });
   if(!toArchive.length){
-    return {歸檔: 0, 剩餘待歸檔: 0, 說明: '沒有超過 ' + cfg.keepDays + ' 天的' + cfg.label};
+    const out = {歸檔: 0, 剩餘待歸檔: 0, 為什麼沒搬: why,
+                 保留天數: cfg.keepDays, 分頁: cfg.sheetName};
+    if(why.日期看不懂) out['解不出來的日期長這樣'] = badDateSamples;
+    if(why.還太新) out['最近的日期長這樣'] = freshSamples;
+    // 這一行才是重點：表到底多大。如果列數本來就很少，那「表太大拖慢鏡射」
+    // 這個推論就不成立，要回頭查鎖競爭的別的原因，不要繼續往這邊修。
+    out['說明'] = why.總列數 === 0
+      ? cfg.sheetName + ' 是空的'
+      : cfg.sheetName + ' 共 ' + why.總列數 + ' 列，沒有一列符合歸檔條件（細節看「為什麼沒搬」）';
+    return out;
   }
 
   toArchive.sort(function(a, b){ return a._row - b._row; });
@@ -4307,7 +4335,7 @@ function archiveSheetRows_(cfg){
   }
 
   return {歸檔: batch.length, 剩餘待歸檔: remaining, 備份檔: fileName,
-          保留幾列: keepValues.length,
+          保留幾列: keepValues.length, 為什麼沒搬其他的: why,
           寫入前lastRow: lastRowBefore, 寫入後lastRow: lastRowAfter};
 }
 

@@ -190,5 +190,27 @@ ck('只有日期沒有時間', !isNaN(X.parseRowStamp_('2026/11/03')));
 ck('空字串 → NaN', isNaN(X.parseRowStamp_('')));
 ck('亂寫 → NaN', isNaN(X.parseRowStamp_('不知道什麼時候')));
 
-console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：只搬該搬的、備份內容正確、不覆蓋舊備份、待驗收清單不受影響');
+console.log('\n【搬 0 筆時要講清楚為什麼】三種原因不能混成同一句話');
+// 11/10 對真實資料跑出 0 筆，而第一版只回「沒有超過 3 天的」——
+// 分不出是真的沒有舊的、還是日期欄解不出來所以整批被跳過。
+const t2 = makeSheet(X.SHEET_TRANSFER, [TH.slice(),
+  trow({batchId:'C1', sku:'OPEN-A',  status:'open', doneAt:'',               qty:1}),
+  trow({batchId:'C2', sku:'BAD-A',   status:'done', doneAt:'民國115年',      qty:2}),
+  trow({batchId:'C3', sku:'BAD-B',   status:'done', doneAt:'',               qty:3}),
+  trow({batchId:'C4', sku:'FRESH-A', status:'done', doneAt: daysAgo(1),      qty:4}),
+]);
+SS = makeSS('後端2', {});
+SS._sheets[X.SHEET_TRANSFER] = t2;
+SS._sheets[X.SHEET_TRANSFERLOG] = makeSheet(X.SHEET_TRANSFERLOG, [LH.slice()]);
+const r5 = X.archiveTransferDone_();
+console.log('   回傳：', JSON.stringify(r5['為什麼沒搬']));
+ck('有回報總列數', r5['為什麼沒搬'].總列數 === 4, r5);
+ck('狀態不符數對', r5['為什麼沒搬'].狀態不符 === 1, r5);
+ck('日期看不懂數對', r5['為什麼沒搬'].日期看不懂 === 2, r5);
+ck('還太新數對', r5['為什麼沒搬'].還太新 === 1, r5);
+ck('有附上解不出來的日期樣本', (r5['解不出來的日期長這樣']||[]).length === 2, r5);
+ck('說明裡講出總列數', /共 4 列/.test(String(r5.說明||'')), r5.說明);
+ck('空表要說是空的', /是空的/.test(String(X.archiveTransferLog_().說明||'')), X.archiveTransferLog_());
+
+console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：只搬該搬的、備份內容正確、不覆蓋舊備份、待驗收清單不受影響、搬0筆時講得出原因');
 process.exit(fail?1:0);
