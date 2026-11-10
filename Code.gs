@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-10.209';
+const BACKEND_VERSION = '2026-11-10.210';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -178,21 +178,42 @@ const SCRIPT_LOCK_WAIT_MS = 10000;
 // 下一輪會補上，沒必要為了排程把現場的人擋在門外。
 const USER_LOCK_WAIT_MS = 25000;
 
+// 佔用或等待超過這個時間就記一筆到「系統紀錄」。
+//
+// 為什麼要記：11/06 15:37 與 11/09 13:41 現場還是有人「完成出貨」等不到鎖——
+// 而那時候使用者端已經是等 25 秒才放棄（.207）。等於有東西佔著鎖超過 25 秒。
+// 嫌疑最大的是 hourlySync_：它在同一把鎖裡做四件事（syncNativeOrderSheet_、
+// syncLogisticsConfirm_、closeBasketConfirmedPending_、syncSpecialNotes_），
+// 每件都要讀外部表。但這題我已經猜錯三次了，不再憑嫌疑動手，先量出來。
+const LOCK_SLOW_MS = 8000;
+
 function withScriptLock_(label, fn, waitMs){
   if(_scriptLockHeld_) return fn();          // 本次執行已經持有，直接跑
   const lock = LockService.getScriptLock();
   // 用 tryLock（回傳布林）而不是 waitLock（丟例外），才能給出看得懂的訊息。
   // 原本 waitLock 寫在 try 外面，逾時會丟出未攔截的例外 → Web App 回傳 HTML 錯誤頁
   // 而不是 JSON → 前端 res.json() 解析失敗，使用者看到的是莫名其妙的訊息。
+  const _lockT0_ = Date.now();
   if(!lock.tryLock(waitMs == null ? SCRIPT_LOCK_WAIT_MS : waitMs)){
     throw new Error('系統忙碌中，請稍候再試（等不到寫入鎖：' + label + '）');
   }
+  const waitedMs = Date.now() - _lockT0_;
   _scriptLockHeld_ = true;
+  const heldFrom = Date.now();
   try{
     return fn();
   }finally{
+    const heldMs = Date.now() - heldFrom;
     _scriptLockHeld_ = false;
     try{ lock.releaseLock(); }catch(err){ /* 釋放失敗不能蓋掉原本的回傳值或例外 */ }
+    // 一定要「釋放之後」才寫紀錄——佔著鎖去寫 log 等於把要量的問題弄得更嚴重。
+    // 只有真的慢才寫，平常這段是零成本。寫失敗完全忽略：診斷不能影響現場作業。
+    if(heldMs >= LOCK_SLOW_MS || waitedMs >= LOCK_SLOW_MS){
+      try{
+        appendSysLog_('鎖佔用過久', '', '',
+          label + '　佔用 ' + heldMs + 'ms　等待 ' + waitedMs + 'ms');
+      }catch(err){ /* 診斷寫不進去就算了 */ }
+    }
   }
 }
 
@@ -10184,6 +10205,68 @@ function withSheetRetry_(label, fn, tries){
 //   均勻撒在全天   → 比較像現場網路本身
 //   集中在某一個動作 → 那支本身有問題，不是全面性的
 // 只讀不寫。
+// 誰佔著鎖、佔多久。資料來自 withScriptLock_ 寫進「系統紀錄」的「鎖佔用過久」列。
+//
+// 現場「完成出貨」等不到鎖時，看到的只是結果，看不到是誰佔著。這支把它反過來問：
+// 哪一支函式佔最久、最久幾秒、發生在哪個小時。只讀不寫。
+function diagnoseLockHolds(days){
+  const back = Math.max(1, Number(days) || 14);
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SYSLOG);
+  if(!sh) return '找不到「' + SHEET_SYSLOG + '」分頁。';
+  const last = sh.getLastRow();
+  if(last < 2) return '「' + SHEET_SYSLOG + '」是空的。';
+  const vals = sh.getRange(2, 1, last - 1, SYSLOG_HEADER.length).getValues();
+  const iT = colOf(SYSLOG_HEADER,'logTime') - 1;
+  const iE = colOf(SYSLOG_HEADER,'event') - 1;
+  const iD = colOf(SYSLOG_HEADER,'detail') - 1;
+  const cutoff = Date.now() - back * 86400000;
+
+  const byLabel = {}, byHour = {}, raw = [];
+  vals.forEach(function(r){
+    if(String(r[iE]||'').trim() !== '鎖佔用過久') return;
+    const t = parseRowStamp_(r[iT]);
+    if(!isNaN(t) && t < cutoff) return;
+    const det = String(r[iD]||'');
+    const m = /^(\S+)\s*　?佔用 (\d+)ms\s*　?等待 (\d+)ms/.exec(det)
+           || /^(\S+).*?佔用 (\d+)ms.*?等待 (\d+)ms/.exec(det);
+    if(!m) return;
+    const label = m[1], held = Number(m[2]), waited = Number(m[3]);
+    if(!byLabel[label]) byLabel[label] = {次數:0, 最久佔用ms:0, 總佔用ms:0, 最久等待ms:0};
+    const b = byLabel[label];
+    b.次數++; b.總佔用ms += held;
+    if(held > b.最久佔用ms) b.最久佔用ms = held;
+    if(waited > b.最久等待ms) b.最久等待ms = waited;
+    const hm = /\s(\d{1,2}):(\d{2})/.exec(String(r[iT]||''));
+    if(hm){ const k = ('0'+hm[1]).slice(-2) + ':00'; byHour[k] = (byHour[k]||0) + 1; }
+    raw.push(String(r[iT]||'') + '  ' + det);
+  });
+
+  const labels = Object.keys(byLabel);
+  if(!labels.length){
+    return '最近 ' + back + ' 天沒有「鎖佔用過久」紀錄（門檻 ' + LOCK_SLOW_MS + 'ms）。\n'
+         + '代表沒有任何一次佔用或等待超過這個時間——如果現場還是在抱怨等不到鎖，\n'
+         + '那就不是「有東西佔著不放」，要往別的方向查。';
+  }
+  labels.sort(function(a,b){ return byLabel[b].最久佔用ms - byLabel[a].最久佔用ms; });
+  const lines = ['鎖佔用診斷　' + BACKEND_VERSION + '　最近 ' + back + ' 天　門檻 ' + LOCK_SLOW_MS + 'ms', ''];
+  lines.push('【誰佔最久】排在最上面的就是要先處理的');
+  labels.forEach(function(k){
+    const b = byLabel[k];
+    lines.push('      ' + k + '：' + b.次數 + ' 次，最久佔用 ' + (b.最久佔用ms/1000).toFixed(1) + ' 秒'
+      + '，平均 ' + (b.總佔用ms / b.次數 / 1000).toFixed(1) + ' 秒'
+      + '，最久等待 ' + (b.最久等待ms/1000).toFixed(1) + ' 秒');
+  });
+  lines.push('');
+  lines.push('【哪一小時】');
+  Object.keys(byHour).sort().forEach(function(k){ lines.push('      ' + k + '：' + byHour[k]); });
+  lines.push('');
+  lines.push('【最近 20 筆逐筆】');
+  raw.slice(-20).forEach(function(x){ lines.push('      ' + x); });
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
+}
+
 function diagnoseNetFailures(days){
   const back = Math.max(1, Number(days) || 14);
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SYSLOG);
