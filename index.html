@@ -535,6 +535,30 @@
     </div>
   </div>
 
+  <div class="confirm-mask" id="findMask">
+    <div class="confirm-box">
+      <h3>用品號或品名找商品</h3>
+      <p class="hint" style="margin-top:0;">
+        <b>＊</b>＝任何字。<code>2076262A36＊</code>找同款所有顏色尺寸、<code>＊頭巾＊</code>找品名含「頭巾」的；
+        不打＊就是「包含」。勾起來可以整批帶進異動清單。
+      </p>
+      <div class="scan-row" style="margin-bottom:10px;">
+        <input id="findInput" class="scan-input" type="text" placeholder="例如 2076262A36＊ 或 ＊頭巾＊" autocomplete="off">
+        <button class="btn sm" id="findGo" style="white-space:nowrap;">搜尋</button>
+      </div>
+      <div class="row" style="gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap;">
+        <button class="btn gray sm" id="findAll">全選</button>
+        <button class="btn gray sm" id="findNone">全不選</button>
+        <span class="hint" id="findStat" style="margin:0;"></span>
+      </div>
+      <div class="confirm-list" id="findList"></div>
+      <div class="row">
+        <button class="btn gray" id="findCancel">關閉</button>
+        <button class="btn" id="findOk">加入清單</button>
+      </div>
+    </div>
+  </div>
+
   <div class="imgview" id="imgView" onclick="closeImgView()">
     <img id="imgViewImg" alt="">
     <div class="cap" id="imgViewCap"></div>
@@ -890,6 +914,7 @@
             <button type="button" class="btn-camera" onclick="openCameraScan(locScan)" title="用相機掃描">📷</button>
           </div>
         </label>
+        <button class="btn gray block" id="btnLocSearch">🔎 用品號或品名找商品（可用 ＊）</button>
         <button class="btn gray block" id="btnShelfQuery">🔍 查詢貨架上有哪些商品</button>
         <button class="btn gray block" id="btnRecordLoc" style="margin-top:8px;">📋 紀錄儲位商品</button>
         <button class="btn gray block" id="btnClearLoc" style="margin-top:8px;">🧹 清空儲位</button>
@@ -4105,6 +4130,111 @@ function closeSiblings(add){
   sibCandidates = [];
 }
 
+// ================= 品號／品名模糊查詢 =================
+// 為什麼要有這個：「同款其他規格」是靠品號的規則去推同款，推不到的就找不到。
+// 實際上倉庫裡很多東西的品號編法對不上那套規則（不同年份、不同供應商、
+// 改款過的），辨識率不夠。這裡退回最笨但永遠有效的做法——讓人自己描述
+// 要找什麼，＊ 當萬用字元。
+//
+// 刻意不預先勾選任何一筆。一個 ＊ 可能命中幾百筆，全部勾起來送出，
+// 等於在地圖上宣告一整排架上其實根本沒有的商品——那比沒有資料更糟。
+let findCandidates = [];
+
+async function openLocSearch(){
+  if(!hasBackend()){ errorBeep(); flash('err','需要連線','',1600); return; }
+  findCandidates = [];
+  document.getElementById('findList').innerHTML =
+    '<p class="hint" style="padding:12px;margin:0;">輸入品號或品名的一部分，按「搜尋」。</p>';
+  document.getElementById('findStat').textContent = '';
+  document.getElementById('findMask').classList.add('show');
+  const inp = document.getElementById('findInput');
+  inp.value = '';
+  setTimeout(function(){ inp.focus(); }, 60);
+}
+
+function closeLocSearch(add){
+  document.getElementById('findMask').classList.remove('show');
+  if(add){
+    const picked = findCandidates.filter(function(x){ return x.checked; });
+    picked.forEach(function(x){
+      locBatch.push({uid: ++locSeq, code: x.sku, ok: true, sku: x.sku, baseName: x.baseName,
+        spec: '', location: x.location || '', locations: parseLocList(x.location).list,
+        note: '', updated: '', isNew: false, stockWs: ''});
+    });
+    if(picked.length){ okBeep(); flash('ok', '加入 ' + picked.length + ' 個品號', '', 1600); }
+    else flash('err', '沒有勾選任何商品', '', 1600);
+    renderLocBatch();
+  }
+  findCandidates = [];
+}
+
+async function runLocSearch(){
+  const q = String(document.getElementById('findInput').value || '')
+    .replace(/\uff0a/g, '*').trim();     // 全形＊也要收，手持機的輸入法常常跳全形
+  const stat = document.getElementById('findStat');
+  const box = document.getElementById('findList');
+  if(q.length < 2){
+    errorBeep(); stat.textContent = '';
+    box.innerHTML = '<p class="hint" style="padding:12px;margin:0;">請至少輸入 2 個字。</p>';
+    return;
+  }
+  stat.textContent = '搜尋中…';
+  box.innerHTML = '';
+  let res;
+  try{ res = await apiPost('searchLocations', {q: q}); }
+  catch(err){
+    errorBeep(); stat.textContent = '';
+    box.innerHTML = '<p class="hint" style="padding:12px;margin:0;">查詢失敗：'
+      + escapeHtml(err.message || '') + '</p>';
+    return;
+  }
+  const already = {};
+  locBatch.forEach(function(x){ if(x.ok) already[x.sku] = 1; });
+  const items = (res && res.items) || [];
+  const dupes = items.filter(function(x){ return already[x.sku]; }).length;
+  findCandidates = items.filter(function(x){ return !already[x.sku]; })
+    .map(function(x){ return Object.assign({}, x, {checked: false}); });
+
+  // 總筆數講的是倉庫裡實際符合幾筆，不是畫面上剩幾筆。
+  // 被截斷的時候一定要說，不然人會以為「倉庫裡就只有這些」。
+  let line = '符合 ' + (res['符合幾筆'] || 0) + ' 筆';
+  if(res['有沒有被截斷']) line += '，只顯示前 ' + (res['回傳幾筆'] || 0) + ' 筆（請把條件再縮小一點）';
+  if(dupes) line += '；其中 ' + dupes + ' 筆已經在清單裡';
+  stat.textContent = line;
+
+  if(!findCandidates.length){
+    box.innerHTML = '<p class="hint" style="padding:12px;margin:0;">'
+      + (res['符合幾筆'] ? '符合的商品都已經在清單裡了。' : '找不到符合的商品。試試在前後加 ＊。')
+      + '</p>';
+    return;
+  }
+  renderFindList();
+}
+
+function renderFindList(){
+  const box = document.getElementById('findList');
+  box.innerHTML = findCandidates.map(function(x){
+    return '<label class="sib-row">' +
+      '<input type="checkbox" data-sku="' + escapeHtml(x.sku) + '"' + (x.checked ? ' checked' : '') + '>' +
+      '<div class="t"><b>' + escapeHtml(x.sku) + '</b>' +
+        '<div>' + escapeHtml((x.baseName || '').slice(0, 40)) + '</div>' +
+        (x.location ? '<div style="color:var(--muted);">現在：' + escapeHtml(x.location) + '</div>' : '') +
+      '</div>' +
+    '</label>';
+  }).join('');
+  box.querySelectorAll('input[type=checkbox]').forEach(function(cb){
+    cb.addEventListener('change', function(){
+      const hit = findCandidates.find(function(x){ return x.sku === cb.dataset.sku; });
+      if(hit) hit.checked = cb.checked;
+    });
+  });
+}
+
+function findSetAll(v){
+  findCandidates.forEach(function(x){ x.checked = v; });
+  renderFindList();
+}
+
 // 揀貨卡片上的「改儲位」：人就站在貨架前，這時候改最準。
 // 要是得先記在紙上、回辦公室再補，多半就不會補了。
 async function locFromPick(sku){
@@ -6315,6 +6445,18 @@ document.getElementById('locAuditMask').addEventListener('click', function(e){
 });
 document.getElementById('sibOk').addEventListener('click', function(){ closeSiblings(true); });
 document.getElementById('sibCancel').addEventListener('click', function(){ closeSiblings(false); });
+document.getElementById('btnLocSearch').addEventListener('click', openLocSearch);
+document.getElementById('findGo').addEventListener('click', runLocSearch);
+document.getElementById('findInput').addEventListener('keydown', function(e){
+  if(e.key === 'Enter'){ e.preventDefault(); runLocSearch(); }
+});
+document.getElementById('findAll').addEventListener('click', function(){ findSetAll(true); });
+document.getElementById('findNone').addEventListener('click', function(){ findSetAll(false); });
+document.getElementById('findCancel').addEventListener('click', function(){ closeLocSearch(false); });
+document.getElementById('findOk').addEventListener('click', function(){ closeLocSearch(true); });
+document.getElementById('findMask').addEventListener('click', function(e){
+  if(e.target === document.getElementById('findMask')) closeLocSearch(false);
+});
 document.getElementById('sibMask').addEventListener('click', function(e){
   if(e.target === document.getElementById('sibMask')) closeSiblings(false);
 });
