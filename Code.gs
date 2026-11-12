@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-10.210';
+const BACKEND_VERSION = '2026-11-12.211';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -145,7 +145,7 @@ function doGet(e){
 const NO_LOCK_ACTIONS = {
   lookupLocation: 1, lookupLocations: 1, getLocationVocab: 1, findSiblingSkus: 1,
   listLocationContents: 1, getShopeePriceInfo: 1, getTransferPending: 1, __versioncheck__: 1,
-  getCountSession: 1, listCountSessions: 1
+  getCountSession: 1, listCountSessions: 1, searchLocations: 1
 };
 
 // ---------------- 寫入鎖 ----------------
@@ -242,6 +242,7 @@ function doPost(e){
       case 'changeLocationBatch': result = changeLocationBatch(body); break;
       case 'getLocationVocab': result = getLocationVocab(body); break;
       case 'findSiblingSkus': result = findSiblingSkus(body); break;
+      case 'searchLocations': result = searchLocations(body); break;
       case 'listLocationContents': result = listLocationContents(body); break;
       case 'getShopeePriceInfo': result = getShopeePriceInfo_(body); break;
       case 'getTransferPending': result = getTransferPending(); break;
@@ -3106,7 +3107,7 @@ function reinstallTriggers(){
   });
   lines.push('');
   lines.push('共 ' + ScriptApp.getProjectTriggers().length + ' 個。');
-  lines.push('mirrorTransferScheduled_ 這次起改成每 30 分鐘（原本 15 分鐘）。');
+  lines.push('mirrorTransferScheduled_ 每 30 分鐘；warmLocCaches_ 每 15 分鐘（儲位快取預熱）。');
   const text = lines.join('\n');
   Logger.log(text);
   return text;
@@ -3115,7 +3116,8 @@ function reinstallTriggers(){
 function installAutomationTriggers_(){
   const handlerNames = ['autoSyncOrders_', 'backupAndClearShippingLog_', 'archiveShippedOrders_',
     'syncNativeOrderSheet_', 'hourlySync_', 'dailyMaintenance_', 'releaseStaleClaims_',
-    'syncMissingLocationRowsDaily_', 'mirrorTransferScheduled_', 'importProductImages_'];
+    'syncMissingLocationRowsDaily_', 'mirrorTransferScheduled_', 'importProductImages_',
+    'warmLocCaches_'];
   ScriptApp.getProjectTriggers().forEach(t=>{
     if(handlerNames.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
   });
@@ -3155,6 +3157,9 @@ function installAutomationTriggers_(){
   // 才會被釋放，時限寫30分鐘但實際上要4小時，等於數字是假的。
   // 15分鐘檢查一次，最壞情況是認領後45分鐘被釋放，跟設定值差得不多。
   ScriptApp.newTrigger('releaseStaleClaims_').timeBased().everyMinutes(15).create();
+  // 儲位快取預熱：15 分鐘跑一次，快取時效 30 分鐘，使用者永遠踩不到冷的那次
+  // （冷 2,887ms vs 熱 47ms）。這支不拿全域寫入鎖，只讀表寫快取。
+  ScriptApp.newTrigger('warmLocCaches_').timeBased().everyMinutes(15).create();
 
   // 商品主圖對照：使用者反映蝦皮商品每週都會有新品上架／規格變動，圖片對照原本
   // 完全沒有排程、只能靠人手動叫我重跑，現場才會發現「有些款式上錯顏色」都是
@@ -3667,11 +3672,160 @@ function locIndexCacheGet_(){ return shardedCacheGet_('locIdxV1_', LOCMAP_INDEX_
 function locIndexCacheSet_(idx){ shardedCacheSet_('locIdxV1_', LOCMAP_INDEX_CACHE_SHARDS, idx, LOCMAP_INDEX_CACHE_TTL_SEC); }
 function locIndexCacheClear_(){ shardedCacheClear_('locIdxV1_', LOCMAP_INDEX_CACHE_SHARDS); }
 
-function locIndex_(sh){
-  try{
-    const cached = locIndexCacheGet_();
-    if(cached) return cached;
-  }catch(err){ /* 快取讀取失敗就當沒快取，往下照原本邏輯重新掃描 */ }
+// ================= 儲位搜尋索引與快取預熱 =================
+//
+// 兩件事一起做，因為它們是同一個問題的兩面。
+//
+// (一) 預熱。diagnoseLocLookup 量到：主檔 17,044 列，快取冷的時候一次查詢要
+//      2,887ms（其中重建索引 2,207ms），熱的時候 47ms，差 61 倍。
+//      快取時間已經從 5 分鐘拉到 30 分鐘，但只要會過期，就一定有某個倒楣的人
+//      要等那 2.9 秒。所以改成排程每 15 分鐘先重建好，使用者永遠踩到熱的。
+//      預熱只讀表、只寫快取，不拿全域寫入鎖——現在還有一個「有東西佔著鎖超過
+//      25 秒」的未解問題，新功能絕不能往那把鎖上再加東西。
+//
+// (二) 搜尋索引。模糊查詢要同時比對品號與品名，而 locIndex_ 只有「品號→列號」，
+//      沒有品名。但不要把品名塞進 locIndex_：它現在很小（熱讀只要 43ms），
+//      單筆查詢是最常走的路，不該為了搜尋把它變肥。
+//
+//      搜尋索引另外存，而且刻意存成「純文字行」而不是 JSON 物件：
+//        品號 \t 品名 \t 儲位 \t 列號 \n
+//      理由是搜尋根本不需要先解析。正規式直接掃那一大段文字，只有命中的那幾行
+//      才切開——17,044 列大約 1MB，正規式掃過去是幾毫秒，而 JSON.parse 整包
+//      要上百毫秒。存進去也比較省：沒有括號、引號、重複的欄位名。
+const LOC_SEARCH_PREFIX = 'locSearchV1_';
+const LOC_SEARCH_SHARDS = 20;
+const LOC_SEARCH_TTL_SEC = 1800;      // 跟 locIndex_ 一樣，預熱頻率比它短就不會過期
+const LOC_SEARCH_MAX_HITS = 200;      // 一個 * 不應該把整個倉庫倒到手持機上
+
+function locSearchShardKeys_(){
+  const keys = [];
+  for(let i = 0; i < LOC_SEARCH_SHARDS; i++) keys.push(LOC_SEARCH_PREFIX + i);
+  return keys;
+}
+
+function locSearchIndexBuild_(sh){
+  const lastRow = sh.getLastRow();
+  if(lastRow < 2) return {ok:false, error:'儲位主檔沒有資料列'};
+  const n = lastRow - 1;
+  // 一次把品號/品名/儲位三欄讀下來。LOCMAP_COL 的 sku=1 name=2 location=3 剛好相鄰，
+  // 三欄一次讀比分三次省兩趟 RPC。
+  const vals = sh.getRange(2, LOCMAP_COL.sku, n, 3).getValues();
+  const shards = [];
+  for(let i = 0; i < LOC_SEARCH_SHARDS; i++) shards.push([]);
+  let rows = 0;
+  for(let i = 0; i < n; i++){
+    const sku = String(vals[i][0]||'').trim();
+    if(!sku) continue;
+    // 欄位裡若真的混進 tab 或換行，會把這一行切壞，先換成空白
+    const name = String(vals[i][1]||'').replace(/[\t\r\n]/g, ' ').trim();
+    const loc  = String(vals[i][2]||'').replace(/[\t\r\n]/g, ' ').trim();
+    shards[rows % LOC_SEARCH_SHARDS].push(sku + '\t' + name + '\t' + loc + '\t' + (i + 2));
+    rows++;
+  }
+  const payload = {};
+  locSearchShardKeys_().forEach(function(k, i){ payload[k] = shards[i].join('\n'); });
+  CacheService.getScriptCache().putAll(payload, LOC_SEARCH_TTL_SEC);
+  return {ok:true, rows: rows, shards: LOC_SEARCH_SHARDS};
+}
+
+function locSearchIndexGet_(){
+  const vals = CacheService.getScriptCache().getAll(locSearchShardKeys_());
+  const keys = locSearchShardKeys_();
+  // 任何一片沒中就當全部沒中——缺一片等於搜尋結果會莫名其妙少一批商品，
+  // 而「搜尋結果不完整」比「搜尋比較慢」難發現得多。
+  for(let i = 0; i < keys.length; i++){ if(vals[keys[i]] === undefined) return null; }
+  return keys.map(function(k){ return vals[k]; });
+}
+
+// 把使用者輸入的樣式轉成正規式。
+//   有 * ：當萬用字元，2076262A36* / *頭巾* / *A3601*
+//   沒有 *：當「包含」處理，不用每次都自己打星號
+// 其餘字元全部跳脫，避免使用者打到 ( [ . 之類把正規式弄壞或掃爆。
+function locPatternToRegex_(raw){
+  const q = String(raw||'').trim();
+  if(!q) return null;
+  const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');   // 先全部跳脫
+  const body = q.indexOf('*') >= 0 ? esc.replace(/\\\*/g, '.*') : '.*' + esc + '.*';
+  try{ return new RegExp('^' + body + '$', 'i'); }catch(err){ return null; }
+}
+
+// 模糊查詢：同時比對品號與品名。只讀不寫。
+function searchLocations(body){
+  const q = String((body && body.q) || '').trim();
+  if(q.length < 2) return {ok:false, error:'請至少輸入 2 個字'};
+  const re = locPatternToRegex_(q);
+  if(!re) return {ok:false, error:'查詢字串看不懂：' + q};
+  const limit = Math.max(1, Math.min(Number((body && body.limit) || LOC_SEARCH_MAX_HITS), LOC_SEARCH_MAX_HITS));
+
+  let shards = locSearchIndexGet_();
+  let rebuilt = false;
+  if(!shards){
+    const sh = getLocMapSheet_();
+    if(!sh) return {ok:false, error:'找不到「' + LOCMAP_TAB.trim() + '」分頁'};
+    const b = locSearchIndexBuild_(sh);
+    if(!b.ok) return {ok:false, error: b.error};
+    rebuilt = true;
+    shards = locSearchIndexGet_();
+    if(!shards) return {ok:false, error:'搜尋索引建好之後讀不回來'};
+  }
+
+  const hits = [];
+  let total = 0;
+  for(let i = 0; i < shards.length; i++){
+    const lines = shards[i] ? shards[i].split('\n') : [];
+    for(let j = 0; j < lines.length; j++){
+      const line = lines[j];
+      if(!line) continue;
+      // 先用整行比對擋掉絕大多數，命中了才切欄位——切字串比正規式貴得多
+      const tab1 = line.indexOf('\t');
+      const sku = line.slice(0, tab1);
+      let hit = re.test(sku);
+      if(!hit){
+        const rest = line.slice(tab1 + 1);
+        const tab2 = rest.indexOf('\t');
+        hit = re.test(rest.slice(0, tab2));
+      }
+      if(!hit) continue;
+      total++;
+      if(hits.length >= limit) continue;   // 繼續數總數，但不再堆資料
+      const parts = line.split('\t');
+      hits.push({sku: parts[0], baseName: parts[1], location: parts[2], row: Number(parts[3]) || 0});
+    }
+  }
+  hits.sort(function(a, b){ return a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0; });
+  return {ok:true, q: q, 符合幾筆: total, 回傳幾筆: hits.length,
+          有沒有被截斷: total > hits.length, items: hits, 這次有沒有重建索引: rebuilt};
+}
+
+// 預熱。排程每 15 分鐘跑一次，快取時效是 30 分鐘，所以使用者永遠踩不到冷的。
+// 不拿全域寫入鎖：這支只讀表、只寫快取。
+function warmLocCaches_(){
+  const sh = getLocMapSheet_();
+  if(!sh) return {ok:false, error:'找不到儲位主檔'};
+  const t0 = Date.now();
+  const idx = locIndex_(sh, true);          // 強制重建，不要讀到舊快取就直接回來
+  const t1 = Date.now();
+  const built = locSearchIndexBuild_(sh);
+  const t2 = Date.now();
+  return {ok:true, 品號索引筆數: Object.keys(idx).length, 品號索引耗時ms: t1 - t0,
+          搜尋索引: built, 搜尋索引耗時ms: t2 - t1, 總耗時ms: t2 - t0};
+}
+
+// 手動跑一次看數字用（沒有底線結尾，編輯器選單叫得到）
+function runWarmLocCachesNow(){
+  const out = warmLocCaches_();
+  const text = '儲位快取預熱　' + BACKEND_VERSION + '\n' + JSON.stringify(out, null, 2);
+  Logger.log(text);
+  return text;
+}
+
+function locIndex_(sh, forceRebuild){
+  if(!forceRebuild){
+    try{
+      const cached = locIndexCacheGet_();
+      if(cached) return cached;
+    }catch(err){ /* 快取讀取失敗就當沒快取，往下照原本邏輯重新掃描 */ }
+  }
 
   const lastRow = sh.getLastRow();
   const skus = sh.getRange(2, LOCMAP_COL.sku, lastRow - 1, 1).getValues();
