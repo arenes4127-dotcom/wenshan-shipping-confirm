@@ -4,6 +4,12 @@ const { chromium } = require('playwright');
 const path = require('path');
 (async () => {
   const b = await chromium.launch();
+  // 測試絕對不能碰到正式環境：預設設定裡帶著正式後端與試算表的網址。
+  // 就算哪天設定的鍵名又寫錯，這一道也會把請求擋掉。
+  const _PROD = /script\.google\.com|script\.googleusercontent\.com|docs\.google\.com/;
+  { const _np = b.newPage.bind(b), _nc = b.newContext.bind(b);
+    b.newPage = async (o) => { const p = await _np(o); await p.route(_PROD, r => r.abort()); return p; };
+    b.newContext = async (o) => { const c = await _nc(o); await c.route(_PROD, r => r.abort()); return c; }; }
   const ctx = await b.newContext();
   const errs = [];
   let fail = 0;
@@ -13,7 +19,7 @@ const path = require('path');
   async function open(pg){
     pg.on('pageerror', e => errs.push(String(e)));
     await pg.addInitScript(() => {
-      localStorage.setItem('wsc_settings', JSON.stringify({backendUrl:'https://example.invalid/exec', store:'odm_shilin', staff:'x'}));
+      localStorage.setItem('ssz_settings', JSON.stringify({backendUrl:'https://example.invalid/exec', store:'odm_shilin', staff:'x'}));
     });
     await pg.goto('file://' + path.resolve('index.html'));
     await pg.evaluate(() => {
