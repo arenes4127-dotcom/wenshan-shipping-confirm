@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-12.211';
+const BACKEND_VERSION = '2026-11-17.213';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -167,6 +167,9 @@ const NO_LOCK_ACTIONS = {
 // 旗標放模組層級是安全的：Apps Script 每次執行都是全新的全域作用域
 // （跟 _ssMemo_ / _headerOk_ 同樣道理），不會殘留到下一次請求。
 let _scriptLockHeld_ = false;
+// 鎖裡的工作可以在這裡留一句「我的時間花在哪幾段」，withScriptLock_ 只有在真的慢的時候
+// 才會把它跟著寫進「系統紀錄」。平常不產生任何成本。
+let _lockNote_ = '';
 const SCRIPT_LOCK_WAIT_MS = 10000;
 // 現場按下去的動作（doPost）等久一點也比直接失敗好。
 //
@@ -203,6 +206,12 @@ function withScriptLock_(label, fn, waitMs){
   try{
     return fn();
   }finally{
+    // 放鎖之前先把還沒送出去的寫入真的寫進試算表。
+    // Apps Script 的寫入會先攢著、等到下一次讀取或執行結束才送出。不先 flush 的話，
+    // 鎖放掉的那一刻「出貨紀錄」的新列可能還沒落地，下一個拿到鎖的人去問「最後一列是哪一列」
+    // 會拿到同一個位置，兩筆出貨紀錄寫在同一列，後寫的蓋掉先寫的。
+    // 這段時間本來就要花（執行結束時也會送），只是從鎖外搬進鎖內，使用者等的總時間不變。
+    try{ SpreadsheetApp.flush(); }catch(err){ /* flush 失敗不能蓋掉原本的回傳值或例外 */ }
     const heldMs = Date.now() - heldFrom;
     _scriptLockHeld_ = false;
     try{ lock.releaseLock(); }catch(err){ /* 釋放失敗不能蓋掉原本的回傳值或例外 */ }
@@ -211,7 +220,8 @@ function withScriptLock_(label, fn, waitMs){
     if(heldMs >= LOCK_SLOW_MS || waitedMs >= LOCK_SLOW_MS){
       try{
         appendSysLog_('鎖佔用過久', '', '',
-          label + '　佔用 ' + heldMs + 'ms　等待 ' + waitedMs + 'ms');
+          label + '　佔用 ' + heldMs + 'ms　等待 ' + waitedMs + 'ms'
+          + (_lockNote_ ? '　｜' + _lockNote_ : ''));
       }catch(err){ /* 診斷寫不進去就算了 */ }
     }
   }
@@ -1202,7 +1212,7 @@ function summarizeItems(items){
 }
 
 // ---------------- 訂單同步（合併，已出貨的不覆蓋） ----------------
-function mergeOrders(incoming){
+function mergeOrdersCore_(incoming){
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   // 先把逾時的認領放回待出貨，再讀資料——順序不能顛倒，不然下面的 keepClaim 會把
   // 那些其實早就沒人在處理的訂單當成「正在掃描中」保護起來，等於永遠釋放不掉。
@@ -1270,14 +1280,21 @@ function mergeOrders(incoming){
     else { rowAppends.push(values); added++; }
   });
   flushOrderRowWrites_(sh, rowUpdates, rowAppends);
+  // 同步可能新增了訂單列，索引要跟著失效，新訂單才不用等第一次「找不到→重建」才查得到。
+  if(added) { try{ orderIndexCacheClear_(); }catch(err){} }
+  return {ok:true, added, updated, skippedShipped};
+}
+
+// 手動同步（APP 按「同步」）走這支：合併完接著重建明細與顏色，一次做完。
+// 排程走 autoSyncOrders_，那邊把這三步拆成各拿各的鎖，不要一口氣佔到底。
+function mergeOrders(incoming){
+  const result = mergeOrdersCore_(incoming);
   rebuildOrderDetailSheet_();
   // 顏色規則的範圍依實際列數計算，所以每次同步完（訂單列數可能變多）都要重新套用一次，
   // 新增的訂單才不會落在規則範圍外變成沒有顏色。順便也有自動修復的效果：
   // 萬一哪個一次性函式把分頁重建掉、規則跟著消失，下一次同步就會自己補回來。
   setupOrderSheetColors();
-  // 同步可能新增了訂單列，索引要跟著失效，新訂單才不用等第一次「找不到→重建」才查得到。
-  if(added) { try{ orderIndexCacheClear_(); }catch(err){} }
-  return {ok:true, added, updated, skippedShipped};
+  return result;
 }
 
 // 把 mergeOrders 收集到的整批列一次寫回。
@@ -1356,10 +1373,39 @@ const MIRROR_ORDER_SHEET_NAME = '文山出貨V2';
 function autoSyncOrders_(){
   // 包鎖：mergeOrders 會逐列改寫整張「訂單」分頁，跟使用者的完成出貨／認領撞同一列。
   // 09:00/09:15/14:05/14:15 正好是倉庫尖峰，這支是 lost update 風險最高的一支。
-  return withScriptLock_('autoSyncOrders_', autoSyncOrdersLocked_);
+  //
+  // 量出來的數字（14 天）：23 次佔鎖超過 8 秒、平均 40.4 秒、最久 203.8 秒。
+  // 它排在 09:00/09:15/14:05/14:15——正是倉庫最忙的時候，而現場「完成出貨」只等 25 秒。
+  // 原本整支包在一把鎖裡：讀來源鏡像、解析、合併、重建明細分頁、重套顏色、
+  // 再加三件外部同步，全部做完才放手。
+  // 現在：
+  //   1. 讀鏡像＋解析完全不拿鎖。那是讀「另一張分頁」的快照，跟訂單表的寫入無關；
+  //      前端手動同步本來就是在瀏覽器抓好資料才送進來，快照晚幾秒是同一件事。
+  //   2. 其餘每一件各拿各的鎖，件與件之間讓出（見 runLockedSteps_）。
+  // 真正需要不可分割的只有「合併」那一步（讀訂單表→算→寫回），它還是整段在鎖裡。
+  const parsed = autoSyncParseMirror_();
+  if(!parsed) return;
+  let result = null;
+  const steps = runLockedSteps_('autoSync', [
+    ['merge',     function(){ result = mergeOrdersCore_(parsed.orders); return result; }],
+    ['detail',    rebuildOrderDetailSheet_],
+    ['colors',    setupOrderSheetColors],
+    ['native',    syncNativeOrderSheet_],     // 順便把核對結果同步回舊的核對表單
+    ['logistics', syncLogisticsConfirm_],     // 以及物流籃確認狀態
+    ['notes',     syncSpecialNotes_]          // 以及客服寫的特殊註記
+  ]);
+  if(result){
+    Logger.log('自動同步完成：新增'+result.added+'／更新'+result.updated+'／已出貨略過'+result.skippedShipped
+      +'，非本倉略過'+parsed.skippedOtherWarehouse+'，資料欄位不全略過'+parsed.skippedRows+'。');
+  }else{
+    Logger.log('自動同步：合併這一步沒有完成（多半是等不到鎖），下一輪排程會補上。');
+  }
+  return steps;
 }
 
-function autoSyncOrdersLocked_(){
+// 讀來源鏡像並解析成 {訂單號: 訂單}。純讀取，不拿鎖。
+// 回傳 null 代表這次沒東西可同步（原因已經寫進 Logger）。
+function autoSyncParseMirror_(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(MIRROR_ORDER_SHEET_NAME);
   if(!sh){ Logger.log('找不到「'+MIRROR_ORDER_SHEET_NAME+'」鏡像分頁，無法自動同步'); return; }
@@ -1442,12 +1488,7 @@ function autoSyncOrdersLocked_(){
       summary + '　｜　' + sample.join('、') + (sample.length < skippedOrderCount ? '…（僅列部分）' : ''));
   }
 
-  const result = mergeOrders(parsed);
-  syncNativeOrderSheet_(); // 順便把核對結果同步回舊的核對表單
-  syncLogisticsConfirm_(); // 以及物流籃確認狀態
-  syncSpecialNotes_();     // 以及客服寫的特殊註記
-  Logger.log('自動同步完成：新增'+result.added+'／更新'+result.updated+'／已出貨略過'+result.skippedShipped
-    +'，非本倉略過'+skippedOtherWarehouse+'，資料欄位不全略過'+skippedRows+'。');
+  return {orders: parsed, skippedOtherWarehouse: skippedOtherWarehouse, skippedRows: skippedRows};
 }
 
 // 跟 index.html 的 parseOrderDate()/excelSerialToDateStr() 邏輯對應：純數字字串當Excel序列日期換算，
@@ -3737,6 +3778,63 @@ function locSearchIndexGet_(){
   return keys.map(function(k){ return vals[k]; });
 }
 
+// 蝦皮賣場對照表的索引。「同款其他規格」每次都要整欄掃它兩趟找同賣場的商品，
+// 那兩趟在使用者按下按鈕之後才開始跑。改成跟儲位搜尋索引一樣由預熱排程先建好，
+// 使用者那一下就只剩記憶體比對。
+const SHOPEE_IDX_PREFIX = 'shopeeIdxV1_';
+const SHOPEE_IDX_SHARDS = 10;
+const SHOPEE_IDX_TTL_SEC = 1800;
+
+function shopeeIdxShardKeys_(){
+  const keys = [];
+  for(let i = 0; i < SHOPEE_IDX_SHARDS; i++) keys.push(SHOPEE_IDX_PREFIX + i);
+  return keys;
+}
+
+// 回傳 [[品號, 賣場商品ID], ...]
+function shopeeIndexBuild_(){
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
+  const shop = ss.getSheetByName(SHOPEE_MAP_TAB);
+  if(!shop || shop.getLastRow() < 2) return {ok:false, error:'找不到或沒有資料：' + SHOPEE_MAP_TAB, pairs:[]};
+  const n = shop.getLastRow() - 1;
+  const ids = shop.getRange(2, SHOPEE_COL.productId, n, 1).getValues();
+  const sks = shop.getRange(2, SHOPEE_COL.sku, n, 1).getValues();
+  const shards = [];
+  for(let i = 0; i < SHOPEE_IDX_SHARDS; i++) shards.push([]);
+  const pairs = [];
+  let rows = 0;
+  for(let i = 0; i < n; i++){
+    const k = String(sks[i][0]||'').trim();
+    const id = String(ids[i][0]||'').trim();
+    if(!k || !id) continue;
+    pairs.push([k, id]);
+    shards[rows % SHOPEE_IDX_SHARDS].push(k.replace(/[\t\r\n]/g,' ') + '\t' + id.replace(/[\t\r\n]/g,' '));
+    rows++;
+  }
+  const payload = {};
+  shopeeIdxShardKeys_().forEach(function(k, i){ payload[k] = shards[i].join('\n'); });
+  CacheService.getScriptCache().putAll(payload, SHOPEE_IDX_TTL_SEC);
+  return {ok:true, rows: rows, shards: SHOPEE_IDX_SHARDS, pairs: pairs};
+}
+
+function shopeeIndexGet_(){
+  const keys = shopeeIdxShardKeys_();
+  const vals = CacheService.getScriptCache().getAll(keys);
+  // 缺一片就當全部沒中：少一批同賣場商品比慢一點難發現得多
+  for(let i = 0; i < keys.length; i++){ if(vals[keys[i]] === undefined) return null; }
+  const pairs = [];
+  keys.forEach(function(k){
+    const lines = vals[k] ? vals[k].split('\n') : [];
+    for(let j = 0; j < lines.length; j++){
+      if(!lines[j]) continue;
+      const t = lines[j].indexOf('\t');
+      if(t < 0) continue;
+      pairs.push([lines[j].slice(0, t), lines[j].slice(t + 1)]);
+    }
+  });
+  return pairs;
+}
+
 // 把使用者輸入的樣式轉成正規式。
 //   有 * ：當萬用字元，2076262A36* / *頭巾* / *A3601*
 //   沒有 *：當「包含」處理，不用每次都自己打星號
@@ -3807,8 +3905,47 @@ function warmLocCaches_(){
   const t1 = Date.now();
   const built = locSearchIndexBuild_(sh);
   const t2 = Date.now();
+  // 蝦皮對照表：「同款其他規格」要用它找同賣場商品。建不起來不該讓整個預熱失敗，
+  // 那支功能自己有冷備援，只是會慢一點。
+  let shopee;
+  try{ shopee = shopeeIndexBuild_(); }
+  catch(err){ shopee = {ok:false, error:String(err && err.message || err)}; }
+  const t3 = Date.now();
   return {ok:true, 品號索引筆數: Object.keys(idx).length, 品號索引耗時ms: t1 - t0,
-          搜尋索引: built, 搜尋索引耗時ms: t2 - t1, 總耗時ms: t2 - t0};
+          搜尋索引: built, 搜尋索引耗時ms: t2 - t1,
+          蝦皮索引: {ok: shopee.ok, rows: shopee.rows, error: shopee.error}, 蝦皮索引耗時ms: t3 - t2,
+          總耗時ms: t3 - t0};
+}
+
+// 「同款其他規格」到底慢在哪一段——量出來再說，不要猜。
+function diagnoseSiblings(sku){
+  const target = String(sku || '').trim();
+  if(!target) return '用法：diagnoseSiblings(\'2076262A3601A03\')';
+  const lines = ['同款規格效能診斷　' + BACKEND_VERSION, '品號：' + target, ''];
+
+  CacheService.getScriptCache().removeAll(locSearchShardKeys_().concat(shopeeIdxShardKeys_()));
+  let t0 = Date.now();
+  const cold = findSiblingSkus({sku: target});
+  const coldMs = Date.now() - t0;
+  lines.push('快取全清（最糟情況）：' + coldMs + ' ms，找到 ' + ((cold.siblings||[]).length) + ' 個同款');
+
+  const w = warmLocCaches_();
+  lines.push('預熱一次：' + w.總耗時ms + ' ms（儲位 ' + w.搜尋索引耗時ms
+             + ' ms、蝦皮 ' + w.蝦皮索引耗時ms + ' ms）');
+
+  t0 = Date.now();
+  const warm = findSiblingSkus({sku: target});
+  const warmMs = Date.now() - t0;
+  lines.push('預熱後（使用者實際會踩到的）：' + warmMs + ' ms，找到 '
+             + ((warm.siblings||[]).length) + ' 個同款');
+  lines.push('');
+  lines.push(coldMs > 0 ? ('差 ' + (coldMs / Math.max(warmMs, 1)).toFixed(1) + ' 倍') : '');
+  lines.push('兩次找到的數量要一樣，不一樣就是快取漏資料：'
+             + ((cold.siblings||[]).length === (warm.siblings||[]).length ? '一樣，OK' : '**不一樣，有問題**'));
+
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
 }
 
 // 手動跑一次看數字用（沒有底線結尾，編輯器選單叫得到）
@@ -5173,41 +5310,60 @@ function debugShoeSkuPatterns_(){
 function findSiblingSkus(body){
   const sku = String((body && body.sku) || '').trim();
   if(!sku) return {ok:false, error:'請提供品號'};
-  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
   const sib = {};
 
-  // (1) 蝦皮商品ID
-  const shop = ss.getSheetByName(SHOPEE_MAP_TAB);
-  if(shop && shop.getLastRow() > 1){
-    const n = shop.getLastRow() - 1;
-    const ids = shop.getRange(2, SHOPEE_COL.productId, n, 1).getValues();
-    const sks = shop.getRange(2, SHOPEE_COL.sku, n, 1).getValues();
-    let myId = '';
-    for(let i = 0; i < n; i++){
-      if(String(sks[i][0]||'').trim() === sku){ myId = String(ids[i][0]||'').trim(); break; }
-    }
-    if(myId){
-      for(let i = 0; i < n; i++){
-        if(String(ids[i][0]||'').trim() !== myId) continue;
-        const k = String(sks[i][0]||'').trim();
-        if(k && k !== sku) sib[k] = '同賣場商品';
-      }
+  // (1) 同一個蝦皮賣場的其他商品
+  // 原本每次都整欄掃兩趟對照表。改讀預熱好的索引，冷的時候才自己建。
+  let shop = shopeeIndexGet_();
+  if(!shop){ const b = shopeeIndexBuild_(); shop = b.pairs || []; }
+  let myId = '';
+  for(let i = 0; i < shop.length; i++){ if(shop[i][0] === sku){ myId = shop[i][1]; break; } }
+  if(myId){
+    for(let i = 0; i < shop.length; i++){
+      if(shop[i][1] !== myId) continue;
+      const k = shop[i][0];
+      if(k && k !== sku) sib[k] = '同賣場商品';
     }
   }
 
   // (2) 品號前綴（去掉尾端尺寸碼）
-  const dst = getLocMapSheet_();
+  // 這裡本來每次都把儲位主檔整張拉下來——17,044 列、約 2.2 秒，
+  // 而且是在使用者按下「同款規格」之後才開始跑。現在改用預熱好的搜尋索引：
+  // 同一份資料（品號／品名／儲位／列號），已經在記憶體等著了。
   const key = skuFamilyKey_(sku);
   const rows = {};
-  if(dst){
-    const last = dst.getLastRow();
-    const vals = dst.getRange(2, LOCMAP_COL.sku, last - 1, LOCMAP_COL.location).getValues();
-    vals.forEach(function(r, i){
-      const k = String(r[0]||'').trim();
-      if(!k) return;
-      rows[k] = {row: i + 2, location: String(r[LOCMAP_COL.location - 1]||'').trim()};
-      if(k !== sku && skuFamilyKey_(k) === key && !sib[k]) sib[k] = '同品號前綴';
-    });
+  const shards = locSearchIndexGet_();
+  if(shards){
+    for(let i = 0; i < shards.length; i++){
+      const lines = shards[i] ? shards[i].split('\n') : [];
+      for(let j = 0; j < lines.length; j++){
+        const line = lines[j];
+        if(!line) continue;
+        const t1 = line.indexOf('\t');
+        const k = t1 < 0 ? line : line.slice(0, t1);
+        if(!k) continue;
+        // 只有真的是同款、或是蝦皮那邊撈到的，才需要切欄位拿儲位和列號。
+        // 其餘一萬多列連切都不用切——這是它快的原因。
+        const isFamily = (k !== sku && skuFamilyKey_(k) === key);
+        if(!isFamily && !sib[k]) continue;
+        const parts = line.split('\t');
+        rows[k] = {row: Number(parts[3]) || 0, location: String(parts[2]||'').trim()};
+        if(isFamily && !sib[k]) sib[k] = '同品號前綴';
+      }
+    }
+  }else{
+    // 快取冷的備援：照舊整張讀。慢，但不能因為快取沒中就查不到東西。
+    const dst = getLocMapSheet_();
+    if(dst){
+      const last = dst.getLastRow();
+      const vals = dst.getRange(2, LOCMAP_COL.sku, last - 1, LOCMAP_COL.location).getValues();
+      vals.forEach(function(r, i){
+        const k = String(r[0]||'').trim();
+        if(!k) return;
+        rows[k] = {row: i + 2, location: String(r[LOCMAP_COL.location - 1]||'').trim()};
+        if(k !== sku && skuFamilyKey_(k) === key && !sib[k]) sib[k] = '同品號前綴';
+      });
+    }
   }
 
   const keys = Object.keys(sib);
@@ -5775,12 +5931,36 @@ function cacheInfoFor_(skus){
   const src = ss.getSheetByName(LOC_SYNC_TAB);
   if(!src) return out;
   const idx = srcSkuIndex_(src);
-  Object.keys(want).forEach(function(k){
-    const row = idx[k];
-    if(!row) return;
-    const v = src.getRange(row, 1, 1, 10).getValues()[0];   // A~J一次讀（單列，不用再分段）
-    out[k] = {sku: v[0], baseName: String(v[1]||'').trim(), spec: String(v[2]||'').trim(),
-              stockWs: String(v[8]||'').trim(), stockMain: String(v[9]||'').trim()};
+
+  // 原本是一個品號一次 getRange。40 個同款規格就是 40 趟往返，
+  // 而「同款其他規格」一按下去就是 40 個——那是它要轉很久的主因之一。
+  // 改成先把列號收齊、排序、併成連續段，一段讀一次。
+  const rows = [];
+  Object.keys(want).forEach(function(k){ const r = idx[k]; if(r) rows.push({row: r, sku: k}); });
+  if(!rows.length) return out;
+  rows.sort(function(a, b){ return a.row - b.row; });
+
+  // 不能無腦讀 min..max：萬一一個在第 5 列、一個在第 20000 列，
+  // 那一次就把兩萬列拉下來，比 40 趟還慘。隔太遠就斷開成另一段。
+  const GAP = 200;
+  const runs = [];
+  let cur = {from: rows[0].row, to: rows[0].row};
+  for(let i = 1; i < rows.length; i++){
+    if(rows[i].row - cur.to <= GAP) cur.to = rows[i].row;
+    else { runs.push(cur); cur = {from: rows[i].row, to: rows[i].row}; }
+  }
+  runs.push(cur);
+
+  const byRow = {};
+  runs.forEach(function(run){
+    const vals = src.getRange(run.from, 1, run.to - run.from + 1, 10).getValues();   // A~J
+    for(let i = 0; i < vals.length; i++) byRow[run.from + i] = vals[i];
+  });
+  rows.forEach(function(it){
+    const v = byRow[it.row];
+    if(!v) return;
+    out[it.sku] = {sku: v[0], baseName: String(v[1]||'').trim(), spec: String(v[2]||'').trim(),
+                   stockWs: String(v[8]||'').trim(), stockMain: String(v[9]||'').trim()};
   });
   return out;
 }
@@ -7739,14 +7919,49 @@ function syncLogisticsConfirm_(){
 function hourlySync_(){
   // 包鎖：closeBasketConfirmedPending_ 會寫「訂單」分頁的 manualClose 欄，
   // 跟使用者的 finalizeShipment / claimOrder 撞同一列。見 withScriptLock_ 的說明。
-  return withScriptLock_('hourlySync_', function(){
-    syncNativeOrderSheet_();
-    syncLogisticsConfirm_();
-    // 順序不能顛倒：要先更新完物流籃狀態，才知道哪些訂單該結案。
-    // 掛在每小時而不是每天19:30，是因為留在清單裡的每一分鐘都可能被人重複揀一次。
-    closeBasketConfirmedPending_();
-    syncSpecialNotes_();
-  });
+  //
+  // 四件事各拿各的鎖，不再一把鎖從頭佔到尾。
+  // 量出來的數字（14 天）：141 次佔鎖超過 8 秒、平均 15.6 秒、最久 58.5 秒——
+  // 現場「完成出貨」最多等 25 秒，所以這支一慢起來就是直接把人擋到失敗。
+  // 這四件事彼此不需要是同一個不可分割的動作（每一件都是自己重讀訂單表再寫），
+  // 只需要「各自在寫的時候沒有別人插進來」。拆開之後最長的一次佔用從「四件的總和」
+  // 變成「最慢那一件」，而且每件做完都會讓出鎖，排隊中的出貨可以插進來。
+  // 順序維持不變：要先更新完物流籃狀態，才知道哪些訂單該結案。
+  // 掛在每小時而不是每天19:30，是因為留在清單裡的每一分鐘都可能被人重複揀一次。
+  runLockedSteps_('hourlySync', [
+    ['native',    syncNativeOrderSheet_],
+    ['logistics', syncLogisticsConfirm_],
+    ['closeBasket', closeBasketConfirmedPending_],
+    ['notes',     syncSpecialNotes_]
+  ]);
+}
+
+// 排程專用：把一串工作拆成「一件拿一次鎖」，件與件之間讓出鎖。
+//
+// 排程等鎖可以等久一點（60 秒）：它不像人會站在那邊乾等，而現場的動作每個只佔一兩秒，
+// 排程一定排得進去。其中一件拿不到鎖或出錯，記一筆就繼續做下一件——
+// 不要因為第一件失敗，後面三件這個小時就全部沒做。
+// 回傳每一件的結果，給診斷用。
+const BG_STEP_LOCK_WAIT_MS = 60000;
+const BG_STEP_YIELD_MS = 1000;
+function runLockedSteps_(prefix, steps){
+  const out = [];
+  for(let i = 0; i < steps.length; i++){
+    const name = steps[i][0], fn = steps[i][1];
+    const t0 = Date.now();
+    try{
+      const r = withScriptLock_(prefix + ':' + name, fn, BG_STEP_LOCK_WAIT_MS);
+      out.push({step: name, ok: true, ms: Date.now() - t0, result: r});
+    }catch(err){
+      out.push({step: name, ok: false, ms: Date.now() - t0, error: String(err && err.message || err)});
+      try{ appendSysLog_('排程步驟失敗', '', '', prefix + ':' + name + '　' + String(err && err.message || err)); }
+      catch(e2){ /* 記不進去就算了 */ }
+    }
+    // 讓出鎖之後停一下再搶下一把。不停的話，同一支排程會立刻把鎖搶回去，
+    // 排隊中的「完成出貨」根本沒有機會插進來，拆鎖就白拆了。
+    if(i < steps.length - 1) Utilities.sleep(BG_STEP_YIELD_MS);
+  }
+  return out;
 }
 
 // 唯讀診斷用：看某個分頁的資料列是靜態值還是公式（公式才看得出資料是從哪裡串過來的）。
@@ -7911,7 +8126,37 @@ function releaseStaleClaims_(){
   // 包鎖：會改寫「訂單」分頁的狀態／認領欄。
   // 注意它也被 mergeOrders 內部呼叫——那時鎖已經在手上，靠 withScriptLock_ 的
   // 可重入守衛直接跑完，不會自己卡死自己。
+  //
+  // 先看再鎖。量出來的數字（diagnoseLockHolds，14 天）：這支每 15 分鐘跑一次，
+  // 其中 322 次佔鎖超過 8 秒、平均 11 秒——而它絕大多數時候「什麼都沒釋放」。
+  // 那 11 秒花在整張讀訂單表（24 欄，其中 itemsJson 是大 JSON），只為了確認沒事可做。
+  // 改成先不拿鎖、只讀狀態那三欄看有沒有逾時的認領；沒有就直接結束，連鎖都不碰。
+  // 真的有才進鎖，進鎖後照原本的邏輯整張重讀再判斷一次（預檢只是門票，不是依據，
+  // 所以預檢跟進鎖之間就算有人動了資料也不會寫錯）。
+  if(_scriptLockHeld_) return releaseStaleClaimsLocked_();   // mergeOrders 在鎖裡呼叫的，照舊
+  if(!hasStaleClaimCandidate_()) return 0;
   return withScriptLock_('releaseStaleClaims_', releaseStaleClaimsLocked_);
+}
+
+// 不拿鎖的預檢：只讀 status / claimedBy / claimedAt 三欄（相鄰），不碰 itemsJson。
+// 判斷條件必須跟 releaseStaleClaimsLocked_ 一模一樣——寧可多報（進鎖後會再確認），
+// 絕對不能漏報（漏報等於逾時的認領永遠沒人釋放）。讀失敗一律當「有」，交給鎖內處理。
+function hasStaleClaimCandidate_(){
+  try{
+    const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+    const last = sh.getLastRow();
+    if(last < 2) return false;
+    const sCol = colOf(ORDERS_HEADER, 'status');
+    if(colOf(ORDERS_HEADER, 'claimedAt') !== sCol + 2) return true;   // 欄位順序被改過就不走捷徑
+    const vals = sh.getRange(2, sCol, last - 1, 3).getValues();
+    for(let i = 0; i < vals.length; i++){
+      if(textToStatus(vals[i][0]) !== 'scanning') continue;
+      if(isStaleClaim_(vals[i][2])) return true;
+    }
+    return false;
+  }catch(err){
+    return true;
+  }
 }
 
 function releaseStaleClaimsLocked_(){
@@ -8014,10 +8259,16 @@ function releaseOrder(orderNo){
 // ---------------- 完成出貨：標記已出貨＋寫入紀錄 ----------------
 function finalizeShipment(entry){
   if(!entry || !entry.orderNo) return {ok:false, error:'missing orderNo'};
+  // 分段計時。量出來「完成出貨」自己偶爾會佔鎖到 138 秒（14 天 5 次、平均 52.7 秒），
+  // 它一卡住，其他包貨的人全部等不到鎖。但它只做三件事：找列、寫訂單那一列、寫出貨紀錄——
+  // 哪一段會花兩分鐘，從程式看不出來，只能等它下次發生時把三段時間留下來。
+  const _t0 = Date.now();
+  let _tFind = 0, _tOrder = 0;
   const ordersSh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
   // 只讀需要的那一列（見 findOrderRow_）。原本是 readOrderRows() 整張讀，
   // 這是「完成出貨」按下去之後人員實際在等的那幾秒裡最大的一塊。
   let row = findOrderRow_(ordersSh, entry.orderNo);
+  _tFind = Date.now() - _t0;
   if(row){
     row = healOrderRowIfNeeded_(ordersSh, row);
     // 防呆：這張訂單已經出貨過了就不要再記錄第二次（例如兩台裝置都認領到同一張訂單、
@@ -8037,8 +8288,16 @@ function finalizeShipment(entry){
     ordersSh.getRange(row._row, ssCol, 1, 2).setNumberFormat('@');
     ordersSh.getRange(row._row, ssCol, 1, 2)
       .setValues([[String(entry.startTime||''), String(entry.time||'')]]);
+    // 這裡 flush 不會多花時間：下面 appendLogRow 一開始就要讀「出貨紀錄」的最後一列，
+    // 那個讀取本來就會逼著前面的寫入先送出去。明講出來只是為了讓「寫訂單」這段的時間量得準。
+    _tOrder = Date.now();
+    SpreadsheetApp.flush();
+    _tOrder = Date.now() - _tOrder;
   }
+  const _tLog0 = Date.now();
   appendLogRow(entry);
+  _lockNote_ = '找列 ' + _tFind + 'ms／寫訂單 ' + _tOrder + 'ms／寫出貨紀錄 ' + (Date.now() - _tLog0)
+             + 'ms（其餘是最後送出的時間）';
   return {ok:true};
 }
 
@@ -10363,6 +10622,8 @@ function withSheetRetry_(label, fn, tries){
 //
 // 現場「完成出貨」等不到鎖時，看到的只是結果，看不到是誰佔著。這支把它反過來問：
 // 哪一支函式佔最久、最久幾秒、發生在哪個小時。只讀不寫。
+const LOCK_WORK_HOUR_FROM = 9;
+const LOCK_WORK_HOUR_TO = 19;
 function diagnoseLockHolds(days){
   const back = Math.max(1, Number(days) || 14);
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SYSLOG);
@@ -10376,6 +10637,7 @@ function diagnoseLockHolds(days){
   const cutoff = Date.now() - back * 86400000;
 
   const byLabel = {}, byHour = {}, raw = [];
+  const byLabelWork = {}, killers = [];
   vals.forEach(function(r){
     if(String(r[iE]||'').trim() !== '鎖佔用過久') return;
     const t = parseRowStamp_(r[iT]);
@@ -10393,6 +10655,17 @@ function diagnoseLockHolds(days){
     const hm = /\s(\d{1,2}):(\d{2})/.exec(String(r[iT]||''));
     if(hm){ const k = ('0'+hm[1]).slice(-2) + ':00'; byHour[k] = (byHour[k]||0) + 1; }
     raw.push(String(r[iT]||'') + '  ' + det);
+    // 工作時段另外算。半夜的排程佔再久也沒有人在等，混在一起排名會把真正
+    // 擋到現場的那幾支淹沒（第一次跑出來的排行榜就是這樣：三百多筆都是半夜的）。
+    const hr = hm ? Number(hm[1]) : -1;
+    if(hr >= LOCK_WORK_HOUR_FROM && hr < LOCK_WORK_HOUR_TO){
+      if(!byLabelWork[label]) byLabelWork[label] = {次數:0, 最久佔用ms:0, 總佔用ms:0};
+      const w = byLabelWork[label];
+      w.次數++; w.總佔用ms += held;
+      if(held > w.最久佔用ms) w.最久佔用ms = held;
+      // 現場最多等 25 秒，所以「工作時段、佔用超過 20 秒」的每一筆都可能直接造成出貨失敗
+      if(held >= 20000) killers.push(String(r[iT]||'') + '  ' + det);
+    }
   });
 
   const labels = Object.keys(byLabel);
@@ -10410,6 +10683,19 @@ function diagnoseLockHolds(days){
       + '，平均 ' + (b.總佔用ms / b.次數 / 1000).toFixed(1) + ' 秒'
       + '，最久等待 ' + (b.最久等待ms/1000).toFixed(1) + ' 秒');
   });
+  lines.push('');
+  lines.push('【工作時段 ' + LOCK_WORK_HOUR_FROM + ':00–' + LOCK_WORK_HOUR_TO + ':00 誰佔最久】這一段才是現場真的會撞到的');
+  const wl = Object.keys(byLabelWork).sort(function(a,b){ return byLabelWork[b].總佔用ms - byLabelWork[a].總佔用ms; });
+  if(!wl.length) lines.push('      （工作時段沒有任何一筆超過門檻）');
+  wl.forEach(function(k){
+    const w = byLabelWork[k];
+    lines.push('      ' + k + '：' + w.次數 + ' 次，合計 ' + (w.總佔用ms/1000).toFixed(0) + ' 秒'
+      + '，最久 ' + (w.最久佔用ms/1000).toFixed(1) + ' 秒');
+  });
+  lines.push('');
+  lines.push('【工作時段、佔用超過 20 秒】每一筆都可能讓「完成出貨」直接失敗（最多列 40 筆）');
+  if(!killers.length) lines.push('      （沒有）');
+  killers.slice(-40).forEach(function(x){ lines.push('      ' + x); });
   lines.push('');
   lines.push('【哪一小時】');
   Object.keys(byHour).sort().forEach(function(k){ lines.push('      ' + k + '：' + byHour[k]); });
