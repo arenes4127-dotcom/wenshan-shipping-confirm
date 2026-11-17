@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-17.214';
+const BACKEND_VERSION = '2026-11-17.215';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -3332,9 +3332,17 @@ function logNetFailures(entries){
 function markPickedBatch(ops){
   if(!ops || !ops.length) return {ok:true, 處理筆數:0};
   const sh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
-  const rows = readOrderRows();
+  // 原本是 readOrderRows() 整張讀（幾百到上千列 × 24 欄，含 itemsJson 大 JSON），
+  // 只為了改這一批動到的一兩張單。揀貨中每隔幾秒就送一批，而且這支在寫入鎖裡跑——
+  // 等於揀貨的人一直斷斷續續佔著鎖，包貨那邊的「完成出貨」就得排隊。
+  // 改成只讀這一批真的動到的訂單（findOrderRow_：索引找列、讀那一列、核對訂單號，
+  // 對不上會自己重建索引，不會寫到別張單上）。
   const byOrderNo = {};
-  rows.forEach(r=> byOrderNo[r.orderNo] = r);
+  ops.forEach(function(op){
+    const no = String(op.orderNo||'').trim();
+    if(!no || byOrderNo[no] !== undefined) return;
+    byOrderNo[no] = findOrderRow_(sh, no);       // 找不到就是 null，下面會算進「找不到訂單」
+  });
 
   const pickedCol = colOf(ORDERS_HEADER, 'pickedJson');
   const touched = {};   // orderNo -> 這張訂單最新的 picked 物件
@@ -7673,15 +7681,51 @@ function buildPickDifference_(d){
 // 這張單在揀貨紀錄裡出現過幾次「取消揀貨」「掃描不符」。
 // 從紀錄算而不是靠前端傳：人員可能中途重整頁面、換裝置，前端記的次數會歸零，
 // 而紀錄不會。
+// 數這張單在揀貨紀錄裡被「取消揀貨」幾次、「掃描不符」幾次。
+//
+// 原本是 readRows(揀貨紀錄) 整張讀（12 欄全部），而揀貨紀錄是累積的、從來不清——
+// 每按一次「揀貨完成」要讀的量就多一點，而且是在寫入鎖裡讀。
+// 改成用 TextFinder 在「訂單號」那一欄找出這張單的列（搜尋在 Google 那邊做，
+// 不用把整欄拉回來），再只讀那幾列的「動作」欄。
+// TextFinder 萬一不能用，退回只讀訂單號、動作兩欄，還是比整張 12 欄讀少很多。
 function countPickEvents_(orderNo){
-  const rows = readRows(SHEET_PICKLOG, PICKLOG_HEADER);
+  const want = String(orderNo||'').trim();
   let cancel = 0, miss = 0;
-  rows.forEach(function(r){
-    if(String(r.orderNo||'').trim() !== orderNo) return;
-    const a = String(r.action||'');
+  if(!want) return {cancelCount: 0, scanMiss: 0};
+  const sh = getSheet(SHEET_PICKLOG, PICKLOG_HEADER);
+  const last = sh.getLastRow();
+  if(last < 2) return {cancelCount: 0, scanMiss: 0};
+  const oCol = colOf(PICKLOG_HEADER, 'orderNo');
+  const aCol = colOf(PICKLOG_HEADER, 'action');
+  const tally = function(a){
+    a = String(a||'');
     if(a === '取消揀貨') cancel++;
     else if(a === '掃描不符') miss++;
-  });
+  };
+  let rows = null;
+  try{
+    rows = sh.getRange(2, oCol, last - 1, 1).createTextFinder(want)
+             .matchEntireCell(true).matchCase(true).findAll()
+             .map(function(r){ return r.getRow(); });
+  }catch(err){ rows = null; }
+  if(rows){
+    if(!rows.length) return {cancelCount: 0, scanMiss: 0};
+    // 動作欄跟訂單號欄一起讀回來核對：TextFinder 比的是顯示文字，
+    // 萬一格式造成誤判，核對不過的列不算。
+    const lo = Math.min(oCol, aCol), width = Math.abs(aCol - oCol) + 1;
+    const byRow = readRowsClustered_(sh, rows, lo, width);
+    rows.forEach(function(r){
+      const v = byRow[r];
+      if(!v || String(v[oCol - lo]||'').trim() !== want) return;
+      tally(v[aCol - lo]);
+    });
+    return {cancelCount: cancel, scanMiss: miss};
+  }
+  const nos = sh.getRange(2, oCol, last - 1, 1).getValues();
+  const acts = sh.getRange(2, aCol, last - 1, 1).getValues();
+  for(let i = 0; i < nos.length; i++){
+    if(String(nos[i][0]||'').trim() === want) tally(acts[i][0]);
+  }
   return {cancelCount: cancel, scanMiss: miss};
 }
 
@@ -10773,6 +10817,63 @@ function withSheetRetry_(label, fn, tries){
 //
 // 現場「完成出貨」等不到鎖時，看到的只是結果，看不到是誰佔著。這支把它反過來問：
 // 哪一支函式佔最久、最久幾秒、發生在哪個小時。只讀不寫。
+// 揀貨、調撥的後端到底花多少時間——只讀，不寫任何東西，現場上班時跑也安全。
+// 從編輯器下拉選單執行（不用帶參數）。
+function diagnosePickTransfer(){
+  const lines = ['揀貨／調撥效能診斷　' + BACKEND_VERSION, ''];
+  const t = function(fn){ const a = Date.now(); const r = fn(); return {ms: Date.now() - a, r: r}; };
+
+  const osh = getSheet(SHEET_ORDERS, ORDERS_HEADER);
+  const plsh = getSheet(SHEET_PICKLOG, PICKLOG_HEADER);
+  lines.push('訂單表 ' + Math.max(osh.getLastRow() - 1, 0) + ' 列；揀貨紀錄 ' + Math.max(plsh.getLastRow() - 1, 0)
+             + ' 列（這張是累積的，從來不清）');
+  lines.push('');
+
+  // 拿一張最近有揀貨紀錄的訂單當樣本
+  let sample = '';
+  const last = plsh.getLastRow();
+  if(last >= 2){
+    const from = Math.max(2, last - 200);
+    const tail = plsh.getRange(from, colOf(PICKLOG_HEADER, 'orderNo'), last - from + 1, 1).getValues();
+    for(let i = tail.length - 1; i >= 0 && !sample; i--){ sample = String(tail[i][0]||'').trim(); }
+  }
+  if(!sample){ lines.push('揀貨紀錄裡找不到任何訂單號，沒有樣本可以量。'); Logger.log(lines.join('\n')); return lines.join('\n'); }
+  lines.push('樣本訂單：' + sample);
+  lines.push('');
+
+  lines.push('【點件送出（markPickedBatch）每一批都要做的讀取】');
+  const oldOrders = t(function(){ return readOrderRows().length; });
+  const newOrder = t(function(){ return findOrderRow_(osh, sample) ? 1 : 0; });
+  lines.push('   改之前：整張讀訂單表　' + oldOrders.ms + ' ms');
+  lines.push('   改之後：只讀這張單　　' + newOrder.ms + ' ms' + (newOrder.r ? '' : '（這張單已不在訂單表，可能已歸檔）'));
+  lines.push('');
+
+  lines.push('【揀貨完成（markPickDone）數取消／掃錯次數】');
+  const oldCount = t(function(){
+    let c = 0, m = 0;
+    readRows(SHEET_PICKLOG, PICKLOG_HEADER).forEach(function(r){
+      if(String(r.orderNo||'').trim() !== sample) return;
+      const a = String(r.action||''); if(a === '取消揀貨') c++; else if(a === '掃描不符') m++;
+    });
+    return c + '/' + m;
+  });
+  const newCount = t(function(){ const x = countPickEvents_(sample); return x.cancelCount + '/' + x.scanMiss; });
+  lines.push('   改之前：整張讀揀貨紀錄　' + oldCount.ms + ' ms（取消/掃錯 = ' + oldCount.r + '）');
+  lines.push('   改之後：只找這張單的列　' + newCount.ms + ' ms（取消/掃錯 = ' + newCount.r + '）');
+  lines.push('   兩種算法結果' + (oldCount.r === newCount.r ? '一樣，OK' : '**不一樣，有問題**'));
+  lines.push('');
+
+  lines.push('【調撥：載入待驗收清單（getTransferPending）】');
+  const tp = t(function(){ const r = getTransferPending(); return (r.items||[]).length + ' 筆待驗收、今天完成 ' + (r.recentDone||[]).length + ' 筆'; });
+  lines.push('   ' + tp.ms + ' ms（' + tp.r + '）');
+  lines.push('');
+  lines.push('註：這裡量的是後端自己花的時間。現場按下去到看到結果，還要加上 Apps Script');
+  lines.push('每次來回的固定成本（約 1–3 秒），那一段靠前端「先顯示、後確認」來藏。');
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
+}
+
 const LOCK_WORK_HOUR_FROM = 9;
 const LOCK_WORK_HOUR_TO = 19;
 function diagnoseLockHolds(days){
