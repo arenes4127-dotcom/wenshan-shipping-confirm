@@ -3919,8 +3919,8 @@ function warmLocCaches_(){
 
 // 「同款其他規格」到底慢在哪一段——量出來再說，不要猜。
 function diagnoseSiblings(sku){
-  const target = String(sku || '').trim();
-  if(!target) return '用法：diagnoseSiblings(\'2076262A3601A03\')';
+  // 從編輯器的下拉選單執行時沒辦法帶參數，所以給一個現場真的有、同款很多（40 個）的品號當預設
+  const target = String(sku || '').trim() || '2076262A3601A03';
   const lines = ['同款規格效能診斷　' + BACKEND_VERSION, '品號：' + target, ''];
 
   CacheService.getScriptCache().removeAll(locSearchShardKeys_().concat(shopeeIdxShardKeys_()));
