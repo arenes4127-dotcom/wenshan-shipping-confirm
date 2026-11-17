@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-17.213';
+const BACKEND_VERSION = '2026-11-17.214';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -3911,10 +3911,16 @@ function warmLocCaches_(){
   try{ shopee = shopeeIndexBuild_(); }
   catch(err){ shopee = {ok:false, error:String(err && err.message || err)}; }
   const t3 = Date.now();
+  // 查詢售價用的貨號索引。同樣不該讓它拖垮整個預熱。
+  let price;
+  try{ price = warmPriceCaches_(); }
+  catch(err){ price = {ok:false, error:String(err && err.message || err)}; }
+  const t4 = Date.now();
   return {ok:true, 品號索引筆數: Object.keys(idx).length, 品號索引耗時ms: t1 - t0,
           搜尋索引: built, 搜尋索引耗時ms: t2 - t1,
           蝦皮索引: {ok: shopee.ok, rows: shopee.rows, error: shopee.error}, 蝦皮索引耗時ms: t3 - t2,
-          總耗時ms: t3 - t0};
+          售價索引: price, 售價索引耗時ms: t4 - t3,
+          總耗時ms: t4 - t0};
 }
 
 // 「同款其他規格」到底慢在哪一段——量出來再說，不要猜。
@@ -5922,6 +5928,41 @@ function analyzeLocMapWorkbook_(){
 // 那一列的A~J（見 srcSkuIndex_ 上面的說明，這張表是IMPORTRANGE鏡射進來的，
 // 只能靠索引快取TTL界定過期範圍，庫存數字本身每次都是即時讀，不會顯示
 // 過期的庫存量）。
+// 一次讀回一批不連續的列：排序、併成連續段、一段只打一次 getRange。
+// 回傳 {列號: 那一列的值陣列}。
+//
+// 不能無腦讀「最小列～最大列」：萬一一個在第 5 列、一個在第 20000 列，
+// 那一次就把兩萬列拉下來，比一列一列讀還慘。相隔超過 gap 列就斷開成另一段。
+// 查同款規格、查售價都是同一種形狀的問題（已知列號、要讀好幾列），共用這一支。
+const ROW_CLUSTER_GAP = 200;
+function readRowsClustered_(sh, rowNums, firstCol, width, gap){
+  const out = {};
+  const seen = {};
+  const rows = [];
+  (rowNums || []).forEach(function(r){
+    const n = Number(r);
+    if(!n || n < 1 || seen[n]) return;
+    seen[n] = 1; rows.push(n);
+  });
+  if(!rows.length) return out;
+  rows.sort(function(a, b){ return a - b; });
+  const G = gap == null ? ROW_CLUSTER_GAP : gap;
+  const runs = [];
+  let cur = {from: rows[0], to: rows[0]};
+  for(let i = 1; i < rows.length; i++){
+    if(rows[i] - cur.to <= G) cur.to = rows[i];
+    else { runs.push(cur); cur = {from: rows[i], to: rows[i]}; }
+  }
+  runs.push(cur);
+  runs.forEach(function(run){
+    const vals = sh.getRange(run.from, firstCol, run.to - run.from + 1, width).getValues();
+    for(let i = 0; i < vals.length; i++){
+      if(seen[run.from + i]) out[run.from + i] = vals[i];   // 只留有要的列，中間順便讀到的不佔記憶體
+    }
+  });
+  return out;
+}
+
 function cacheInfoFor_(skus){
   const want = {};
   (skus||[]).forEach(function(x){ const k = String(x||'').trim(); if(k) want[k] = 1; });
@@ -5934,28 +5975,11 @@ function cacheInfoFor_(skus){
 
   // 原本是一個品號一次 getRange。40 個同款規格就是 40 趟往返，
   // 而「同款其他規格」一按下去就是 40 個——那是它要轉很久的主因之一。
-  // 改成先把列號收齊、排序、併成連續段，一段讀一次。
+  // 改成先把列號收齊，交給 readRowsClustered_ 併成連續段，一段讀一次。
   const rows = [];
   Object.keys(want).forEach(function(k){ const r = idx[k]; if(r) rows.push({row: r, sku: k}); });
   if(!rows.length) return out;
-  rows.sort(function(a, b){ return a.row - b.row; });
-
-  // 不能無腦讀 min..max：萬一一個在第 5 列、一個在第 20000 列，
-  // 那一次就把兩萬列拉下來，比 40 趟還慘。隔太遠就斷開成另一段。
-  const GAP = 200;
-  const runs = [];
-  let cur = {from: rows[0].row, to: rows[0].row};
-  for(let i = 1; i < rows.length; i++){
-    if(rows[i].row - cur.to <= GAP) cur.to = rows[i].row;
-    else { runs.push(cur); cur = {from: rows[i].row, to: rows[i].row}; }
-  }
-  runs.push(cur);
-
-  const byRow = {};
-  runs.forEach(function(run){
-    const vals = src.getRange(run.from, 1, run.to - run.from + 1, 10).getValues();   // A~J
-    for(let i = 0; i < vals.length; i++) byRow[run.from + i] = vals[i];
-  });
+  const byRow = readRowsClustered_(src, rows.map(function(x){ return x.row; }), 1, 10);   // A~J
   rows.forEach(function(it){
     const v = byRow[it.row];
     if(!v) return;
@@ -6490,17 +6514,23 @@ const SHEET_PRODUCT_IMAGE = '商品主圖';
 // 裡的好幾個賣場上架賣）——第一版用「第一個出現的贏」建索引，會靜默漏掉其他
 // 賣場的價格，使用者問「其他賣場也可以查嗎」時實測抓到這個問題。索引改成
 // 「一個貨號對應一串列號」，回傳時把同一個貨號在所有賣場的價格都列出來。
-const SPEC_SKU_INDEX_CACHE_TTL_SEC = 300;
+// 時效從 5 分鐘拉到 30 分鐘，由預熱排程每 15 分鐘重建，使用者不會踩到冷的。
+// 拉長的前提是「讀回來一定驗證」：查售價那邊每一列都核對貨號對不對得上，
+// 對不上就當場重建再查一次（見 priceLookupPass_）；會寫入這張表的那一支
+// 則一律強制重建、不吃快取。少了這兩道，時效拉長就等於把別人的價格顯示出來。
+const SPEC_SKU_INDEX_CACHE_TTL_SEC = 1800;
 const SPEC_SKU_INDEX_CACHE_SHARDS = 15;
 function specSkuIndexCacheGet_(){ return shardedCacheGet_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS); }
 function specSkuIndexCacheSet_(idx){ shardedCacheSet_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS, idx, SPEC_SKU_INDEX_CACHE_TTL_SEC); }
 function specSkuIndexCacheClear_(){ shardedCacheClear_('specSkuIdxV2_', SPEC_SKU_INDEX_CACHE_SHARDS); }
 
-function specSkuIndex_(sh, skuCol){
-  try{
-    const cached = specSkuIndexCacheGet_();
-    if(cached) return cached;
-  }catch(err){ /* 快取讀失敗就當沒快取，往下重新掃描 */ }
+function specSkuIndex_(sh, skuCol, forceRebuild){
+  if(!forceRebuild){
+    try{
+      const cached = specSkuIndexCacheGet_();
+      if(cached) return cached;
+    }catch(err){ /* 快取讀失敗就當沒快取，往下重新掃描 */ }
+  }
   const last = sh.getLastRow();
   const idx = {};
   if(last >= 2){
@@ -6549,13 +6579,15 @@ function priceResultCacheSetMany_(map){
 }
 
 const SPEC_UPDATED_AT_CACHE_KEY = 'specUpdatedAtV1';
-const SPEC_UPDATED_AT_CACHE_TTL_SEC = 300;
-function getSpecUpdatedAtCached_(){
+const SPEC_UPDATED_AT_CACHE_TTL_SEC = 1800;   // 由預熱排程每 15 分鐘刷新，查詢的人不用付那 400ms
+function getSpecUpdatedAtCached_(forceRefresh){
   const cache = CacheService.getScriptCache();
-  try{
-    const hit = cache.get(SPEC_UPDATED_AT_CACHE_KEY);
-    if(hit) return hit;
-  }catch(err){ /* 讀快取失敗就當沒快取 */ }
+  if(!forceRefresh){
+    try{
+      const hit = cache.get(SPEC_UPDATED_AT_CACHE_KEY);
+      if(hit) return hit;
+    }catch(err){ /* 讀快取失敗就當沒快取 */ }
+  }
   let updatedAt = '';
   try{
     const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
@@ -6563,6 +6595,78 @@ function getSpecUpdatedAtCached_(){
     if(updatedAt) cache.put(SPEC_UPDATED_AT_CACHE_KEY, updatedAt, SPEC_UPDATED_AT_CACHE_TTL_SEC);
   }catch(err){ /* 拿不到最後修改時間就不顯示，不影響查價本身 */ }
   return updatedAt;
+}
+
+// 表頭（哪一欄是貨號、哪一欄是價格）。原本每次查價都去讀一次第 1 列，
+// 那是一趟對外部試算表的往返，而表頭幾個月才變一次。
+const SPEC_HEADER_CACHE_KEY = 'specHeaderV1';
+const SPEC_HEADER_CACHE_TTL_SEC = 1800;
+function specHeader_(sh, forceRebuild){
+  const cache = CacheService.getScriptCache();
+  if(!forceRebuild){
+    try{
+      const hit = cache.get(SPEC_HEADER_CACHE_KEY);
+      if(hit){ const arr = JSON.parse(hit); if(Array.isArray(arr) && arr.length) return arr; }
+    }catch(err){ /* 壞掉的快取當沒中 */ }
+  }
+  const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+                   .map(function(x){ return String(x||'').trim(); });
+  try{ cache.put(SPEC_HEADER_CACHE_KEY, JSON.stringify(header), SPEC_HEADER_CACHE_TTL_SEC); }catch(err){}
+  return header;
+}
+
+const PRICE_COLS = ['賣場ID','賣場名稱','商品ID','商品名稱','商品選項ID','商品規格名稱','選項名稱','第二階規格','商品選項貨號','價格'];
+
+// 查一輪。回傳 {results, stale}；stale=true 代表索引或表頭跟實際的表對不上
+// （來源被重新匯出、列位移了），呼叫端要用 forceRebuild 再查一輪。
+//
+// 每一列讀回來都核對「這一列的貨號真的是我要查的貨號」。少了這個核對，
+// 過期的列號會把「別的商品的價格」當成這個商品的顯示出來——而且畫面上完全看不出來。
+function priceLookupPass_(sh, skus, forceRebuild){
+  const header = specHeader_(sh, forceRebuild);
+  const idx = {}; PRICE_COLS.forEach(function(c){ idx[c] = header.indexOf(c); });
+  if(idx['商品選項貨號'] < 0 || idx['價格'] < 0){
+    // 快取的表頭對不上就先重讀一次，真的沒有才報錯
+    if(!forceRebuild) return {stale: true, results: {}};
+    return {error: '來源表欄位跟預期不符（缺 商品選項貨號／價格）'};
+  }
+  const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1, forceRebuild);
+
+  // 只讀用得到的那一段欄位，而且所有貨號的所有列一次收齊再讀。
+  // 原本是「每個貨號的每一列各打一次 getRange、每次讀整列所有欄」。
+  const used = PRICE_COLS.map(function(c){ return idx[c]; }).filter(function(i){ return i >= 0; });
+  const fromCol = Math.min.apply(null, used) + 1;
+  const width = Math.max.apply(null, used) + 1 - fromCol + 1;
+  const need = [];
+  skus.forEach(function(sku){ (skuIndex[sku] || []).forEach(function(r){ need.push(r); }); });
+  const byRow = readRowsClustered_(sh, need, fromCol, width);
+
+  const results = {};
+  let stale = false;
+  skus.forEach(function(sku){
+    const rows = skuIndex[sku];
+    if(!rows || !rows.length){ results[sku] = {ok:false, sku: sku, reason:'not_found'}; return; }
+    const matches = [];
+    rows.forEach(function(row){
+      const vals = byRow[row];
+      const get = function(c){ return (vals && idx[c] >= 0) ? String(vals[idx[c] + 1 - fromCol]||'').trim() : ''; };
+      if(!vals || get('商品選項貨號') !== sku){ stale = true; return; }   // 列號過期：這一列不能用
+      // 表頭是快取的（省一趟往返）。萬一來源表的欄位被調動、價格欄搬家而貨號欄沒動，
+      // 上面的貨號核對會過，讀到的卻是別的欄。價格讀出來不是數字就當表頭過期，
+      // 重讀表頭再查一輪。擋不到的只剩「價格欄跟另一個純數字欄對調」，
+      // 那要等預熱排程下一次重讀表頭（最多 15 分鐘）才會修正。
+      const p = get('價格');
+      if(p && !/^[\d,.\s]+$/.test(p)){ stale = true; return; }
+      matches.push({shopId: get('賣場ID'), shopName: get('賣場名稱'),
+        itemId: get('商品ID'), itemName: get('商品名稱'),
+        modelId: get('商品選項ID'),
+        specName: get('商品規格名稱'),   // 蝦皮原始的「顏色,容量」逗號組合字串，本身就是完整的規格描述
+        optionName: get('選項名稱'), price: get('價格')});
+    });
+    results[sku] = matches.length ? {ok:true, sku: sku, matches: matches}
+                                  : {ok:false, sku: sku, reason:'not_found'};
+  });
+  return {results: results, stale: stale};
 }
 
 function getShopeePriceInfo_(body){
@@ -6583,29 +6687,13 @@ function getShopeePriceInfo_(body){
     const src = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
     const sh = src.getSheetByName(SPEC_IMAGE_TAB) || src.getSheets()[0];
     if(!sh) return {ok:false, error:'找不到「' + SPEC_IMAGE_TAB + '」分頁'};
-    const header = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
-                      .map(function(x){ return String(x||'').trim(); });
-    const cols = ['賣場ID','賣場名稱','商品ID','商品名稱','商品選項ID','商品規格名稱','選項名稱','第二階規格','商品選項貨號','價格'];
-    const idx = {}; cols.forEach(function(c){ idx[c] = header.indexOf(c); });
-    if(idx['商品選項貨號'] < 0 || idx['價格'] < 0){
-      return {ok:false, error:'來源表欄位跟預期不符（缺 商品選項貨號／價格）'};
-    }
-    const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1);
 
-    missing.forEach(function(sku){
-      const rows = skuIndex[sku];
-      if(!rows || !rows.length){ results[sku] = {ok:false, sku: sku, reason:'not_found'}; return; }
-      const matches = rows.map(function(row){
-        const vals = sh.getRange(row, 1, 1, sh.getLastColumn()).getValues()[0];
-        const get = function(c){ return idx[c] >= 0 ? String(vals[idx[c]]||'').trim() : ''; };
-        return {shopId: get('賣場ID'), shopName: get('賣場名稱'),
-          itemId: get('商品ID'), itemName: get('商品名稱'),
-          modelId: get('商品選項ID'),
-          specName: get('商品規格名稱'),   // 蝦皮原始的「顏色,容量」逗號組合字串，本身就是完整的規格描述
-          optionName: get('選項名稱'), price: get('價格')};
-      });
-      results[sku] = {ok:true, sku: sku, matches: matches};
-    });
+    let pass = priceLookupPass_(sh, missing, false);
+    // 對不上就重建索引與表頭再查一次。第二輪還對不上的列直接不採用——
+    // 寧可說「查不到」，也不能把不確定是誰的價格顯示出來。
+    if(pass.stale) pass = priceLookupPass_(sh, missing, true);
+    if(pass.error) return {ok:false, error: pass.error};
+    missing.forEach(function(sku){ results[sku] = pass.results[sku]; });
 
     // 使用者要求「在價格旁備註ERP」——「山物地圖(快取)」除了庫存，還有自己的
     // 「定價」「特惠價」兩欄（程式裡本來就把這張表當ERP資料源，見changeLocationBatch
@@ -6617,11 +6705,14 @@ function getShopeePriceInfo_(body){
       const erpSrc = erpSs.getSheetByName(LOC_SYNC_TAB);
       if(erpSrc){
         const erpIdx = srcSkuIndex_(erpSrc);
+        const erpRows = [];
+        missing.forEach(function(sku){ if(results[sku] && erpIdx[sku]) erpRows.push(erpIdx[sku]); });
+        const erpByRow = readRowsClustered_(erpSrc, erpRows, 1, 14);   // 所有貨號一次讀，不是一個一趟
         missing.forEach(function(sku){
           if(!results[sku]) return;
-          const row = erpIdx[sku];
-          if(!row) return;
-          const v = erpSrc.getRange(row, 1, 1, 14).getValues()[0];
+          const v = erpByRow[erpIdx[sku]];
+          // 同樣要核對：這一列的品號不是我要的，就不附 ERP 價格
+          if(!v || String(v[0]||'').trim() !== sku) return;
           results[sku].erp = {listPrice: String(v[12]||'').trim(), specialPrice: String(v[13]||'').trim()};
         });
       }
@@ -6632,6 +6723,63 @@ function getShopeePriceInfo_(body){
   }
 
   return {ok:true, results: results, updatedAt: getSpecUpdatedAtCached_()};
+}
+
+// 預熱查價要用的三樣東西：貨號索引、表頭、來源檔的最後更新時間。
+// 由 warmLocCaches_ 每 15 分鐘呼叫。不拿鎖：只讀表、只寫快取。
+function warmPriceCaches_(){
+  const t0 = Date.now();
+  const src = openSheetMemo_(SPEC_IMAGE_SOURCE_ID);
+  const sh = src.getSheetByName(SPEC_IMAGE_TAB) || src.getSheets()[0];
+  if(!sh) return {ok:false, error:'找不到「' + SPEC_IMAGE_TAB + '」分頁'};
+  const header = specHeader_(sh, true);
+  const skuCol = header.indexOf('商品選項貨號');
+  if(skuCol < 0) return {ok:false, error:'來源表沒有「商品選項貨號」欄'};
+  const idx = specSkuIndex_(sh, skuCol + 1, true);
+  const updatedAt = getSpecUpdatedAtCached_(true);
+  return {ok:true, 貨號數: Object.keys(idx).length, 資料更新於: updatedAt, 耗時ms: Date.now() - t0};
+}
+
+// 查售價到底快了多少——量出來再說。從編輯器下拉選單執行時不能帶參數，所以有預設品號。
+function diagnosePriceQuery(sku){
+  const target = String(sku || '').trim() || '2076262A3601A03';
+  const lines = ['查詢售價效能診斷　' + BACKEND_VERSION, '貨號：' + target, ''];
+  const cache = CacheService.getScriptCache();
+  const clearAll = function(){
+    try{ specSkuIndexCacheClear_(); }catch(e){}
+    try{ cache.removeAll([SPEC_HEADER_CACHE_KEY, SPEC_UPDATED_AT_CACHE_KEY, priceResultCacheKey_(target)]); }catch(e){}
+  };
+  const summarize = function(r){
+    const x = r && r.results && r.results[target];
+    if(!x) return '（沒有結果）';
+    return (x.ok ? x.matches.length + ' 個賣場：' + x.matches.map(function(m){ return m.shopName + ' $' + m.price; }).join('、') : '查無賣場售價')
+         + (x.erp ? '｜ERP 定價 ' + x.erp.listPrice + ' 特惠 ' + x.erp.specialPrice : '');
+  };
+
+  clearAll();
+  let t = Date.now();
+  const cold = getShopeePriceInfo_({skus:[target]});
+  lines.push('1. 所有快取全清（最糟情況）：' + (Date.now() - t) + ' ms');
+  lines.push('   ' + summarize(cold));
+
+  clearAll();
+  const w = warmPriceCaches_();
+  lines.push('2. 預熱一次：' + (w.耗時ms || 0) + ' ms（' + (w.貨號數 || 0) + ' 個貨號；這一步是排程在背景做的）');
+
+  t = Date.now();
+  const warm = getShopeePriceInfo_({skus:[target]});
+  lines.push('3. 預熱後第一次查（現場第一次掃某個貨號）：' + (Date.now() - t) + ' ms');
+  lines.push('   ' + summarize(warm));
+
+  t = Date.now();
+  const hit = getShopeePriceInfo_({skus:[target]});
+  lines.push('4. 5 分鐘內再查同一個貨號：' + (Date.now() - t) + ' ms');
+  lines.push('');
+  lines.push('三次查到的內容要一樣，不一樣就是快取出了問題：'
+    + ((summarize(cold) === summarize(warm) && summarize(warm) === summarize(hit)) ? '一樣，OK' : '**不一樣，有問題**'));
+  const text = lines.join('\n');
+  Logger.log(text);
+  return text;
 }
 
 // 來源是一份原生的 Google 試算表（實測 openById 開得起來），所以直接用 SpreadsheetApp 讀，
@@ -9370,7 +9518,10 @@ function importShopeeUpdateStage_(shopId, shopName){
   // 是這個重複的全表掃描太貴（跟getShopeePriceInfo_最早那版同一類問題）。
   // 同一個貨號可能同時掛在別的賣場（[[wenshan-shipping-app]]記過36%的貨號跨
   // 賣場撞號），候選列裡只挑賣場ID等於這次賣場的那一列，其餘賣場的列不能動。
-  const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1);
+  // 強制重建，不吃快取。這一支會照著索引的列號「寫入」，而它只核對那一列的賣場ID、
+  // 不核對貨號——拿到過期的列號，就是把這個貨號的資料寫到同賣場另一個商品身上。
+  // 這是偶爾才跑的管理動作，多花幾秒重建換來不會寫錯列，划算。
+  const skuIndex = specSkuIndex_(sh, idx['商品選項貨號'] + 1, true);
   const shopColNum = idx['賣場ID'] + 1;
   const existingRowFor = function(sku){
     const candidates = skuIndex[sku];

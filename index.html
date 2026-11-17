@@ -3498,13 +3498,23 @@ async function priceScan(code){
   const cands = [raw].concat(barcodeMap[raw] || []);
   const el = document.getElementById('priceSkuInput');
   if(el) el.disabled = true;
+  // 等待期間在結果區最上面掛一行「查詢中」。原本只有把輸入框鎖住，
+  // 看起來跟「掃了沒反應」一模一樣。
+  const box = document.getElementById('priceQueryResult');
+  const busy = document.createElement('p');
+  busy.className = 'hint'; busy.id = 'priceBusy';
+  busy.textContent = '查詢中… ' + raw;
+  if(box) box.insertBefore(busy, box.firstChild);
+  const clearBusy = function(){ if(busy.parentNode) busy.parentNode.removeChild(busy); };
   let res;
   try{ res = await apiPost('getShopeePriceInfo', {skus: cands}); }
   catch(err){
+    clearBusy();
     if(el){ el.disabled = false; el.focus(); }
     errorBeep(); flash('err','查詢失敗', err.message||'', 2200);
     return;
   }
+  clearBusy();
   if(el){ el.disabled = false; el.focus(); }
   if(!res || !res.ok){
     errorBeep(); flash('err','查詢失敗', (res && res.error)||'', 2200);
