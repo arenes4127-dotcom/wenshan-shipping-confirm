@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-17.216';
+const BACKEND_VERSION = '2026-11-17.217';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -8451,6 +8451,23 @@ function releaseOrder(orderNo){
 }
 
 // ---------------- 完成出貨：標記已出貨＋寫入紀錄 ----------------
+// 出貨紀錄裡是否已經有這一筆（同訂單號＋同完成時間）。只讀訂單號、完成時間兩欄。
+function isLoggedShipment_(entry){
+  try{
+    const sh = getSheet(SHEET_LOG, LOG_HEADER);
+    const last = sh.getLastRow();
+    if(last < 2) return false;
+    const oc = colOf(LOG_HEADER, 'orderNo'), tc = colOf(LOG_HEADER, 'time');
+    const lo = Math.min(oc, tc), w = Math.abs(tc - oc) + 1;
+    const vals = sh.getRange(2, lo, last - 1, w).getValues();
+    const no = String(entry.orderNo||'').trim(), t = String(entry.time||'').trim();
+    for(let i = 0; i < vals.length; i++){
+      if(String(vals[i][oc - lo]||'').trim() === no && String(vals[i][tc - lo]||'').trim() === t) return true;
+    }
+  }catch(err){ /* 查不到就照原本的行為寫 */ }
+  return false;
+}
+
 function finalizeShipment(entry){
   if(!entry || !entry.orderNo) return {ok:false, error:'missing orderNo'};
   // 分段計時。量出來「完成出貨」自己偶爾會佔鎖到 138 秒（14 天 5 次、平均 52.7 秒），
@@ -8468,7 +8485,15 @@ function finalizeShipment(entry){
     // 防呆：這張訂單已經出貨過了就不要再記錄第二次（例如兩台裝置都認領到同一張訂單、
     // 或使用者不小心點了兩次完成出貨）。找不到這張訂單（row為null，理論上不該發生）維持原行為照樣記錄。
     if(row.status === 'shipped'){
-      return {ok:false, reason:'already_shipped'};
+      // 「完成出貨：先過、後送」之後，前端會在背景自動重送。第一次其實已經寫進去、
+      // 只是回應在路上丟了（逾時、斷線），重送就會走到這裡——那不是別人出的，
+      // 是同一次出貨。用「出貨完成時間」核對：那是按下完成出貨的那台裝置產生的、
+      // 精確到秒，上面寫進訂單的 shipDoneAt 就是它。對得上就當成功，不要報衝突。
+      if(entry.time && String(row.shipDoneAt||'').trim() === String(entry.time).trim()){
+        return {ok:true, duplicate:true};
+      }
+      // 真的是別人（或別台裝置）出的。把對方的完成時間帶回去，前端的警示才講得清楚。
+      return {ok:false, reason:'already_shipped', shippedAt: String(row.shipDoneAt||'')};
     }
     // 這張訂單如果在「訂單修改」分頁被人工調整過，把調整內容一起寫進出貨紀錄的差異明細。
     // 不寫的話，事後看紀錄只會看到「完成 🟢、無差異」，完全看不出實際出的東西跟原訂單不一樣，
@@ -8489,6 +8514,10 @@ function finalizeShipment(entry){
     _tOrder = Date.now() - _tOrder;
   }
   const _tLog0 = Date.now();
+  // 找不到這張訂單時（理論上不該發生）原本也照樣寫出貨紀錄，那一條路沒有「已出貨」
+  // 這道防線，背景重送會把同一筆寫兩次。先看出貨紀錄裡有沒有同一張單、同一個完成時間的。
+  // 出貨紀錄每晚清空，所以這裡讀的量很小。
+  if(!row && isLoggedShipment_(entry)) return {ok:true, duplicate:true};
   appendLogRow(entry);
   _lockNote_ = '找列 ' + _tFind + 'ms／寫訂單 ' + _tOrder + 'ms／寫出貨紀錄 ' + (Date.now() - _tLog0)
              + 'ms（其餘是最後送出的時間）';

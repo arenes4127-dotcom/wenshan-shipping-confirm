@@ -228,8 +228,22 @@ ck('寫入全部在鎖裡', EVENTS.filter(e=>e.t==='write').every(e=>e.held), EV
 ck('放鎖前有 flush', LOCK.flushWhileHeld >= 1);
 reset();
 const fr2 = X.withScriptLock_('doPost:finalizeShipment', function(){ return X.finalizeShipment(entry); });
-ck('同一張再送一次會被擋（不會重複出貨）', fr2.ok === false && fr2.reason === 'already_shipped', fr2);
+ck('同一次出貨的重送（逾時後自動重送）：當成功，不報衝突', fr2.ok === true && fr2.duplicate === true, fr2);
 ck('被擋下來時出貨紀錄沒有多一列', logSh.getLastRow() === 2, logSh.getLastRow());
+reset();
+const other = Object.assign({}, entry, {time:'2026/11/17 10:07:30', staffId:'S02', waybill:'W999'});
+const fr3 = X.withScriptLock_('doPost:finalizeShipment', function(){ return X.finalizeShipment(other); });
+ck('別人（不同完成時間）再出同一張：照舊擋下', fr3.ok === false && fr3.reason === 'already_shipped', fr3);
+ck('而且帶回原本那次的完成時間，警示才講得清楚', fr3.shippedAt === '2026/11/17 10:00:05', fr3);
+ck('被擋下時出貨紀錄還是只有一列', logSh.getLastRow() === 2, logSh.getLastRow());
+
+console.log('\n【完成出貨】訂單不在表裡時的重送，不能寫兩次出貨紀錄');
+const ghost = Object.assign({}, entry, {orderNo:'GHOST1', time:'2026/11/17 10:09:00'});
+X.withScriptLock_('doPost:finalizeShipment', function(){ return X.finalizeShipment(ghost); });
+const n1 = logSh.getLastRow();
+const fr4 = X.withScriptLock_('doPost:finalizeShipment', function(){ return X.finalizeShipment(ghost); });
+ck('第一次照原本行為寫了紀錄', n1 === 3, n1);
+ck('重送回成功、不再多寫一列', fr4.ok === true && fr4.duplicate === true && logSh.getLastRow() === 3, {fr4, n: logSh.getLastRow()});
 
 console.log('\n【鎖診斷】半夜的不能淹沒白天的');
 const SH = X.SYSLOG_HEADER;
