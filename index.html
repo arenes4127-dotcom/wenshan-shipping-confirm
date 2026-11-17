@@ -1218,6 +1218,8 @@ const LS = {
   netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue',
   // 待送出的調撥驗收掃描，跟 pickQueue 同樣道理：關掉分頁/斷線也不會掉，開起來繼續送
   transferQueue: 'ssz_transfer_queue',
+  // 上一次拿到的待驗收清單。進調撥頁先畫這份，不用空等一趟網路（見 showTransferCache_）
+  transferCache: 'ssz_transfer_cache',
   // 同步時順手從來源數出來的「非本倉」訂單數（山物出／中華宅配／各調撥來源）。
   // 這些訂單本系統不匯入，本機訂單資料裡永遠是0，只有同步當下看得到，所以存起來給首頁用。
   sourceStats: 'ssz_source_stats',
@@ -1718,6 +1720,7 @@ async function gotoView(name){
     renderStaffSelects();
     // 切頁當下畫面可能還停留在上次的舊清單（或是空的），資料回來前先講清楚
     // 「正在讀」，不要讓人以為這個倉庫真的沒有待驗收品項。
+    showTransferCache_();
     const pendingBox = document.getElementById('transferPendingList');
     if(pendingBox && !pendingBox.innerHTML) pendingBox.innerHTML = '<p class="hint">載入中…</p>';
     loadTransferPending();
@@ -3919,6 +3922,11 @@ async function finishLocAudit(){
 let transferPending = [];   // 目前開放中的待驗收品項（一列＝一筆調撥單裡的一個品號）
 let transferDone = [];      // 今天已完成的（含被人工放棄的不會出現在這裡）
 let transferLastRow = {};   // sku -> 最近一次成功掃描命中的列號，給「撤銷」用
+// 這次開頁面以來，清單有沒有從後端確認過。沒確認過（只是本機上次存的）的時候，
+// 掃到「本機清單裡沒有」的東西不能直接判定找不到——可能是別人剛匯入的新調撥單。
+let transferConfirmedAt = 0;
+let transferReloadAgain = false;   // 載入中又發現對不上，載完要再載一次
+let transferLoadError = '';        // 最近一次讀清單失敗的原因（成功就清空）
 
 // 待送出的驗收掃描。跟揀貨的 pickQueue 完全同一套做法：畫面先反應、動作累積起來
 // 批次送後端。原本這裡是「每掃一件就 await 一次 scanTransferBatch，期間把輸入框
@@ -3941,23 +3949,60 @@ async function loadTransferPending(){
   if(!hasBackend()) return;
   // 對帳發現分歧 → loadTransferPending → flush → 又對帳，理論上會互相呼叫。
   // 每次 flush 都會把佇列清空，所以不會無限下去，但還是擋一道比較安心。
-  if(transferLoading) return;
+  if(transferLoading){ transferReloadAgain = true; return; }
   transferLoading = true;
+  renderTransferLists();          // 顯示「更新中」
   try{
     // 佇列裡還有沒送出的掃描就先送掉，否則後端回來的清單不含那幾件，
     // 會把畫面上已經扣掉的數字又加回去，看起來像掃到的東西不見了。
     if(transferQueue.length){ try{ await flushTransferQueue(); }catch(err){} }
     await loadTransferPendingInner_();
-  } finally { transferLoading = false; }
+  } finally {
+    transferLoading = false;
+    renderTransferLists();
+  }
+  // 載入途中有掃描回來跟清單對不上（例如剛好有人匯入新單），
+  // 這一輪的結果可能已經過時，再載一次拿最新的。
+  if(transferReloadAgain){ transferReloadAgain = false; loadTransferPending(); }
+}
+
+// 進調撥頁時先把本機上次存的清單畫出來。原本是「載入中…」空等一整趟 Apps Script
+// 來回（2～4 秒，冷啟動更久），現場站在那邊看白畫面。清單本身變動不頻繁，
+// 先給上一次的、背景更新完再換成最新的；更新之前畫面上會標示「這是幾點的清單」。
+function showTransferCache_(){
+  if(transferPending.length || transferDone.length) return;   // 這次開頁面已經有資料了
+  const c = loadJSON(LS.transferCache, null);
+  if(!c || !Array.isArray(c.items)) return;
+  // 超過一天的就不要拿出來了：昨天的待驗收清單幾乎一定已經對不上
+  if(!c.at || Date.now() - c.at > 24 * 3600 * 1000) return;
+  transferPending = c.items;
+  transferDone = Array.isArray(c.recentDone) ? c.recentDone : [];
+  transferCacheAt_ = c.at;
+  renderTransferLists();
+}
+let transferCacheAt_ = 0;
+function saveTransferCache_(){
+  try{ saveJSON(LS.transferCache, {at: transferConfirmedAt || transferCacheAt_ || Date.now(),
+    items: transferPending, recentDone: transferDone.slice(0, 30)}); }catch(err){}
 }
 
 async function loadTransferPendingInner_(){
   let res;
-  try{ res = await apiPost('getTransferPending', {}); }
-  catch(err){ flash('err', '讀取待驗收清單失敗', err.message || '', 2200); return; }
+  try{ res = await apiPost('getTransferPending', {}); transferLoadError = ''; }
+  catch(err){ transferLoadError = err.message || '連線失敗'; flash('err', '讀取待驗收清單失敗', err.message || '', 2200); return; }
   if(!res || !res.ok) return;
   transferPending = res.items || [];
   transferDone = res.recentDone || [];
+  transferConfirmedAt = Date.now();
+  // 佇列裡還沒送到後端的掃描，後端的清單裡當然沒有——要重新套上去，
+  // 不然畫面上已經扣掉的件數會被加回來，看起來像剛掃的東西不見了。
+  transferQueue.forEach(function(op){
+    // 正在送的那幾件：後端可能已經算進剛拿到的清單、也可能還沒，重套可能算兩次。
+    // 先不動，等送出結果回來的對帳（transferReconcile_）以後端的數字為準修正。
+    if(op.localRow == null || op.sending) return;
+    const it = transferPending.find(function(x){ return x.row === op.localRow; });
+    if(it) transferBumpLocal_(it, 1);
+  });
   renderTransferLists();
 }
 
@@ -3972,9 +4017,26 @@ function renderTransferLists(){
   // 畫面上的數字是本機先扣的樂觀值。還沒送到後端的那幾件要講出來，不然斷線時
   // 現場會以為已經同步好了——跟揀貨頁「N 筆待同步」同一個做法。
   const syncHint = document.getElementById('transferSyncHint');
-  if(syncHint) syncHint.textContent = transferQueue.length ? '　' + transferQueue.length + ' 筆待同步' : '';
+  if(syncHint){
+    const parts = [];
+    if(transferQueue.length) parts.push(transferQueue.length + ' 筆待同步');
+    if(!transferConfirmedAt && transferCacheAt_){
+      const d = new Date(transferCacheAt_);
+      parts.push('顯示的是 ' + d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0') + ' 的清單' + (transferLoading ? '，更新中…' : ''));
+    }else if(transferLoading){
+      parts.push('更新中…');
+    }
+    syncHint.textContent = parts.length ? '　' + parts.join('　') : '';
+  }
+  saveTransferCache_();
 
-  if(!transferPending.length){
+  if(!transferPending.length && !transferConfirmedAt){
+    // 還沒從後端拿到過清單。這時候說「沒有待驗收」是誤導——會讓人以為今天真的沒東西要驗。
+    pendingBox.innerHTML = (transferLoadError && !transferLoading)
+      ? '<p class="hint" style="margin:0;color:var(--danger);">讀不到待驗收清單（' + escapeHtml(transferLoadError)
+        + '）。網路恢復後切到別頁再切回來就會重新讀。</p>'
+      : '<p class="hint" style="margin:0;">載入中…</p>';
+  } else if(!transferPending.length){
     pendingBox.innerHTML = '<p class="hint" style="margin:0;">目前沒有待驗收的調撥品項。</p>';
   } else {
     const list = transferPending.slice().sort(function(a, b){
@@ -4082,6 +4144,12 @@ function transferScan(code){
     transferLastRow[target] = local.row.row;
     transferBumpLocal_(local.row, 1);
     flash('ok', local.row.baseName || target, '已掃 ' + local.row.scannedQty + ' / ' + local.row.qty, 1400);
+  }else if(!transferConfirmedAt || transferLoading){
+    // 清單還沒跟後端確認過（畫面上是本機上次存的、或正在更新）。本機查不到不代表
+    // 真的沒有——可能是剛匯入的新調撥單。這時候先不響錯誤，送出去等後端判定，
+    // 結果回來再告訴人（見 transferReconcile_ 的 deferred）。
+    op.deferred = true;
+    flash('ok', '清單還在更新，這件已記下', '「' + raw + '」結果一回來就會告訴你', 1800);
   }else{
     // 待驗收清單是剛從後端載來的，本機查不到幾乎就是真的沒有——現場需要當下就知道，
     // 不能等一趟網路才響。還是照樣送出去：後端要留一筆 no_match 稽核紀錄，而且如果
@@ -4117,6 +4185,7 @@ function flushTransferQueue(){
   if(transferFlushTimer){ clearTimeout(transferFlushTimer); transferFlushTimer = null; }
   if(!transferQueue.length || !hasBackend()) return Promise.resolve();
   const batch = transferQueue.slice();
+  batch.forEach(function(o){ o.sending = true; });
   return apiPost('scanTransferBatch', {ops: batch.map(function(o){
       return {sku: o.sku, staffId: o.staffId, staffName: o.staffName, time: o.time};
     })})
@@ -4128,6 +4197,7 @@ function flushTransferQueue(){
       transferReconcile_(batch, (res && res.results) || []);
     })
     .catch(function(){
+      batch.forEach(function(o){ delete o.sending; });
       // 送不出去就留在佇列裡等下一輪。畫面上的數字是樂觀值，還沒被後端確認過，
       // 這裡不回滾——回滾會讓現場已經數過的東西憑空消失，比暫時對不上更糟。
       scheduleTransferFlush();
@@ -4143,6 +4213,11 @@ function transferReconcile_(batch, results){
     const r = results[i];
     const okLocal = op.localRow != null;
     const okServer = !!(r && r.ok);
+    if(op.deferred){
+      // 當初清單還沒確認、先記下來沒判定的那一件，現在有答案了
+      if(okServer){ okBeep(); flash('ok', (r.baseName || r.sku) + ' 已確認', '已掃 ' + r.scannedQty + ' / ' + r.qty, 1800); }
+      else { errorBeep(); flash('err', '找不到這個品號的待驗收項目', '「' + (op.raw || op.sku) + '」目前沒有調撥單在等它，或已經收滿了', 2600); }
+    }
     if(okLocal !== okServer){ diverged = true; return; }
     if(!okServer) return;
     transferLastRow[r.sku] = r.row;
@@ -4150,7 +4225,10 @@ function transferReconcile_(batch, results){
     const mine = transferPending.concat(transferDone).find(function(x){ return x.row === r.row; });
     if(!mine || mine.scannedQty !== r.scannedQty) diverged = true;
   });
-  if(diverged) loadTransferPending();
+  if(diverged){
+    if(transferLoading) transferReloadAgain = true;   // 正在載的那一份可能不含這幾件，載完再載一次
+    else loadTransferPending();
+  }
 }
 
 // 待驗收卡片上的「✓ 確認1件」按鈕——沒有條碼、不方便掃描/複製貼上的品項，
@@ -6897,6 +6975,7 @@ document.addEventListener('visibilitychange', function(){
 
 // ---- 調撥驗收：同樣把上次沒送完的掃描接著送 ----
 transferQueue = loadJSON(LS.transferQueue, []);
+transferQueue.forEach(function(o){ delete o.sending; });   // 上次關頁面時正在送的，這次重送
 if(transferQueue.length) scheduleTransferFlush();
 // 現場常常掃完就直接關掉分頁/切走。1.2秒的去抖動窗口內關掉的話那幾件會留在
 // localStorage 等下次開啟才送——資料不會掉，但工作區那邊會晚一步看到。
