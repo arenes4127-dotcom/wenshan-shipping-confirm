@@ -282,6 +282,13 @@
   .q-item .t b{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
   .q-item .st{font-size:12px;white-space:nowrap;text-align:right;}
   .q-item .st .zero{color:var(--danger);}
+  /* 貨架查詢結果：整列可以點，加入／移出異動清單 */
+  .q-item.pickable{cursor:pointer;border-radius:8px;}
+  .q-item.pickable:active{background:var(--panel2);}
+  .q-item .pick{flex:none;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    font-size:20px;font-weight:700;border:1.5px solid var(--border);color:var(--muted);}
+  .q-item.in-batch{background:var(--blue-dim);}
+  .q-item.in-batch .pick{background:var(--blue);border-color:var(--blue);color:#fff;}
   .q-sum{background:var(--panel2);border-radius:8px;padding:10px 12px;margin-top:12px;font-size:13px;line-height:1.6;}
 
   /* 同款規格挑選：一款可能有 80 個規格，要能一眼看出哪些文山有貨 */
@@ -3660,12 +3667,17 @@ function renderShelfResult(){
     (groups[it.matched] = groups[it.matched] || []).push(it);
   });
   const order = res.locations.map(function(x){ return x.location; });
+  const inBatch_ = {};
+  locBatch.forEach(function(x){ if(x.ok) inBatch_[x.sku] = 1; });
+  const picked = Object.keys(inBatch_).length;
 
   let html = '<div class="q-sum">共 <b>' + res.total + '</b> 個品號，分布在 <b>'
     + res.locations.length + '</b> 個位置。'
     + (res.noStock ? '<br><span style="color:var(--danger);">其中 ' + res.noStock
         + ' 個品號目前庫存是 0</span>（地圖上還掛著，實際架上可能已經沒有了）' : '')
     + (res.truncated ? '<br><span class="hint">結果太多，只顯示前 ' + res.total + ' 筆</span>' : '')
+    + '<br><span class="hint">點商品那一列可以單獨加入異動清單，再點一下拿掉。'
+    + (picked ? '目前清單裡有 <b>' + picked + '</b> 件。' : '') + '</span>'
     + '</div>';
 
   order.forEach(function(loc){
@@ -3680,7 +3692,10 @@ function renderShelfResult(){
       '</div>';
     html += list.map(function(it){
       const zero = !it.stockWs && !it.stockMain;
-      return '<div class="q-item">' + thumbHtml(it.sku, it.baseName) +
+      const inBatch = !!inBatch_[it.sku];
+      return '<div class="q-item pickable' + (inBatch ? ' in-batch' : '') + '" data-sku="' + escapeHtml(it.sku) +
+        '" data-loc="' + escapeHtml(loc) + '" title="' + (inBatch ? '點一下從異動清單拿掉' : '點一下加入異動清單') + '">' +
+        thumbHtml(it.sku, it.baseName) +
         '<div class="t"><b>' + escapeHtml(it.sku) + '</b>' +
           '<div>' + escapeHtml((it.baseName || '').slice(0, 46)) + '</div>' +
           (it.alsoAt && it.alsoAt.length
@@ -3689,11 +3704,47 @@ function renderShelfResult(){
         '</div>' +
         '<div class="st"><div' + (zero ? ' class="zero"' : '') + '>文山 ' + escapeHtml(it.stockWs || '0') + '</div>' +
           '<div class="hint">總倉 ' + escapeHtml(it.stockMain || '0') + '</div></div>' +
+        '<div class="pick">' + (inBatch ? '✓' : '＋') + '</div>' +
       '</div>';
     }).join('');
     html += '</div>';
   });
   box.innerHTML = html;
+}
+
+// 只要這一格裡的其中幾件。整格加入之後還要一件一件移除太麻煩，
+// 反過來一件一件掃又要走回去拿條碼——直接在查詢結果上點選。
+// 再點一次是拿掉：點錯了不用關視窗去清單裡找。
+function toggleShelfItemInBatch(sku, loc){
+  if(!shelfResult) return;
+  const idx = locBatch.findIndex(function(x){ return x.ok && x.sku === sku; });
+  if(idx >= 0){
+    locBatch.splice(idx, 1);
+    flash('ok', '已從清單拿掉', sku, 1000);
+  }else{
+    const it = shelfResult.items.find(function(x){ return x.sku === sku && x.matched === loc; })
+            || shelfResult.items.find(function(x){ return x.sku === sku; });
+    if(!it) return;
+    locBatch.push({uid: ++locSeq, code: it.sku, ok: true, sku: it.sku, baseName: it.baseName,
+      spec: '', location: it.location, locations: parseLocList(it.location).list,
+      note: it.note || '', updated: it.updated || '', isNew: false, stockWs: it.stockWs || ''});
+    okBeep();
+    flash('ok', '加入異動清單', sku + '　（清單共 ' + locBatch.filter(function(x){ return x.ok; }).length + ' 件）', 1200);
+  }
+  renderLocBatch();
+  // 只換這一列的狀態，不整個重畫——重畫會把捲動位置跳回最上面，
+  // 一格幾十件的時候點一件就要重新往下捲，很煩。
+  const inBatch = locBatch.some(function(x){ return x.ok && x.sku === sku; });
+  document.querySelectorAll('#qResult .q-item[data-sku="' + CSS.escape(sku) + '"]').forEach(function(r){
+    r.classList.toggle('in-batch', inBatch);
+    r.title = inBatch ? '點一下從異動清單拿掉' : '點一下加入異動清單';
+    const mark = r.querySelector('.pick'); if(mark) mark.textContent = inBatch ? '✓' : '＋';
+  });
+  const sum = document.querySelector('#qResult .q-sum .hint:last-child');
+  if(sum){
+    const n = locBatch.filter(function(x){ return x.ok; }).length;
+    sum.innerHTML = '點商品那一列可以單獨加入異動清單，再點一下拿掉。' + (n ? '目前清單裡有 <b>' + n + '</b> 件。' : '');
+  }
 }
 
 // 查到一整格之後，常常接著就是要把它們搬走。
@@ -3714,6 +3765,7 @@ function addShelfGroupToBatch(loc){
   okBeep();
   flash('ok', loc + ' 整格加入 ' + picked.length + ' 個品號', '關掉查詢就可以指定新位置', 2400);
   renderLocBatch();
+  renderShelfResult();     // 每一列的 ✓ 要跟著亮起來
 }
 
 // ================= 儲位商品品項紀錄（選定一個儲位，掃現場實際有的東西比對） =================
@@ -6907,6 +6959,12 @@ document.getElementById('btnShelfQuery').addEventListener('click', async functio
 });
 document.getElementById('qZone').addEventListener('change', qFillSlots);
 document.getElementById('qRun').addEventListener('click', runShelfQuery);
+document.getElementById('qResult').addEventListener('click', function(e){
+  if(e.target.closest('button, a, img')) return;       // 按鈕、連結、看大圖不算
+  const row = e.target.closest('.q-item.pickable');
+  if(!row) return;
+  toggleShelfItemInBatch(row.dataset.sku, row.dataset.loc);
+});
 document.getElementById('qClose').addEventListener('click', function(){
   document.getElementById('shelfMask').classList.remove('show');
 });
