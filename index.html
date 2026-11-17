@@ -1495,7 +1495,8 @@ async function rawApiGet(lean){
   return data;
 }
 const POST_TIMEOUT_MS = 40000;   // 寫入比讀取慢（要拿鎖），給寬一點
-async function rawApiPost(action, payload){
+const LOCK_BUSY_RETRIES = 3;     // 後端回「搶不到鎖」時自動重送幾次（每次後端自己會再等 25 秒）
+async function rawApiPost(action, payload, _attempt){
   // 加逾時但「不重試」：寫入逾時不代表後端沒做，重送會把同一筆掃描算兩次。
   // 這裡只是讓它失敗得乾脆一點，不要讓使用者對著轉圈圈等五分鐘。
   const res = await fetchWithTimeout_(settings.backendUrl, {
@@ -1506,7 +1507,27 @@ async function rawApiPost(action, payload){
   if(!res.ok) throw new Error('HTTP '+res.status);
   const data = await res.json();
   // ok:false 分兩種：帶 error＝後端真的出錯（要丟例外）；帶 reason＝正常的業務判斷結果（如「已被別人認領」），交給呼叫端自己判斷 result.ok/result.reason，不當例外處理
-  if(data && data.ok===false && data.error) throw new Error(data.error);
+  if(data && data.ok===false && data.error){
+    const msg = String(data.error);
+    // 「等不到寫入鎖：doPost:xxx」是唯一可以放心自動重送的失敗：
+    // 鎖是在動作開始「之前」拿的，拿不到就代表後端一行都還沒執行，重送不會算兩次。
+    // （逾時就不行——逾時不代表後端沒做，所以上面那條「不重試」的規矩還在。）
+    // 以前這種情況是直接丟一段紅字要人自己再按一次；人在包貨，沒道理替系統排隊。
+    if(msg.indexOf('等不到寫入鎖：doPost:') >= 0){
+      const n = (_attempt || 0) + 1;
+      if(n <= LOCK_BUSY_RETRIES){
+        try{ flash('ok', '系統忙碌，自動重試中…', '第 ' + n + ' 次，不用再按', 2500); }catch(e){}
+        await new Promise(function(r){ setTimeout(r, 1200 * n); });
+        return rawApiPost(action, payload, n);
+      }
+    }
+    // 前端比後端新的時候會遇到這個：頁面已經有新功能的按鈕，後端還不認得那個動作。
+    // 原本的訊息是「unknown action: xxx」，看起來像功能壞了，其實只是後端還沒部署。
+    if(msg.indexOf('unknown action') >= 0){
+      throw new Error('後端還沒更新到支援這個功能的版本（請部署最新版後端再試）');
+    }
+    throw new Error(msg);
+  }
   return data;
 }
 
@@ -4090,10 +4111,27 @@ function renderSibList(){
 
 async function openSiblings(sku){
   if(!hasBackend()){ errorBeep(); flash('err','需要連線','',1600); return; }
-  flash('ok', '查詢同款規格中…', sku, 1200);
+  // 原本是閃 1.2 秒「查詢中」就消失，但查詢常常不只 1.2 秒——
+  // 字不見了、視窗還沒出來，中間那段看起來就是「按了沒反應」。
+  // 改成先把視窗打開、裡面寫查詢中，資料回來再換成清單。等待的每一秒都看得到東西。
+  if(openSiblings._busy) return;          // 連點不要送出兩個查詢
+  openSiblings._busy = true;
+  sibCandidates = [];
+  document.getElementById('sibTitle').textContent = '同款其他規格';
+  document.getElementById('sibHint').textContent = sku;
+  document.getElementById('sibList').innerHTML =
+    '<p class="hint" style="padding:16px;margin:0;">查詢中…請稍候</p>';
+  document.getElementById('sibMask').classList.add('show');
   let res;
   try{ res = await apiPost('findSiblingSkus', {sku: sku}); }
-  catch(err){ errorBeep(); flash('err','查詢失敗', err.message||'', 2200); return; }
+  catch(err){
+    openSiblings._busy = false;
+    document.getElementById('sibMask').classList.remove('show');
+    errorBeep(); flash('err','查詢失敗', err.message||'', 2600); return;
+  }
+  openSiblings._busy = false;
+  // 等待期間人可能已經把視窗關了，那就不要又彈出來
+  if(!document.getElementById('sibMask').classList.contains('show')) return;
   const list = (res && res.siblings) || [];
   const already = {};
   locBatch.forEach(function(x){ if(x.ok) already[x.sku] = 1; });
@@ -4104,6 +4142,7 @@ async function openSiblings(sku){
     return Object.assign({}, x, {hasStock: hasStock, checked: hasStock});
   });
   if(!sibCandidates.length){
+    document.getElementById('sibMask').classList.remove('show');
     flash('err', '沒有可加入的同款規格', list.length ? '同款的都已經在清單裡了' : '找不到同款其他規格', 2400);
     return;
   }
