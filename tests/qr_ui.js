@@ -30,6 +30,7 @@ const outDir = process.argv[2] || null;
 
   const VOCAB = {ok:true,
     zones:[{code:'A', slots:[1,2,3,4], levels:[1,2,3], usedSlots:[1,4], pad:true},
+           {code:'C', slots:[5,6], levels:[1,2,4], usedSlots:[5,6], pad:true},
            {code:'K', slots:[9,10], levels:[1,2], usedSlots:[9], pad:true}],
     textZones:[{code:'門口棧板'}], suffixes:['上','下'],
     known:['A01-1','A01-2','A04-3','K9-1','K10-2','C06-2上','門口棧板']};
@@ -38,7 +39,18 @@ const outDir = process.argv[2] || null;
     window.rawApiPost = async (action, payload) => {
       window.__calls.push({action, payload});
       if(action === 'getLocationVocab') return VOCAB;
-      if(action === 'listLocationContents') return {ok:true, total:0, items:[]};
+      if(action === 'listLocationContents'){
+        // C 區第 6 格第 2 層：地圖上同一格有「上」「下」兩種寫法
+        if(payload.zone === 'C' && String(payload.slot) === '6'){
+          return {ok:true, total:2, locations:[{location:'C06-2上'},{location:'C06-2下'}],
+            items:[{sku:'S1', baseName:'甲', matched:'C06-2上', location:'C06-2上', alsoAt:['A01-1']},
+                   {sku:'S2', baseName:'乙', matched:'C06-2下', location:'C06-2下', alsoAt:['A01-1']}]};
+        }
+        if(payload.zone === 'A' && String(payload.slot) === '4'){
+          return {ok:true, total:1, locations:[{location:'A04-3'}], items:[{sku:'S3', baseName:'丙', matched:'A04-3', location:'A04-3', alsoAt:[]}]};
+        }
+        return {ok:true, total:0, locations:[], items:[]};
+      }
       return {ok:true};
     };
     window.__printed = 0;
@@ -71,7 +83,7 @@ const outDir = process.argv[2] || null;
 
   console.log('\n【清單】整區加入、已有儲位、手打、去重複');
   ck('視窗打開', await pg.isVisible('#qrMask'));
-  ck('區的選單有貨架區跟文字區', (await pg.locator('#qrZone option').count()) === 3);
+  ck('區的選單有貨架區跟文字區', (await pg.locator('#qrZone option').count()) === 4);
   await pg.selectOption('#qrFrom', '1'); await pg.selectOption('#qrTo', '2');
   await pg.click('#qrAddGrid');
   let list = (await pg.inputValue('#qrList')).split('\n');
@@ -202,6 +214,89 @@ const outDir = process.argv[2] || null;
   await pg.evaluate(() => { window.__calls = []; });
   await pg.evaluate(() => locScan('LOC:ZZ99-9'));
   ck('地圖上沒有的位置不會亂開查詢', !(await pg.isVisible('#shelfMask')) && !(await pg.evaluate(() => window.__calls.some(c => c.action === 'listLocationContents'))));
+
+  console.log('\n【查詢貨架視窗】掃儲位標籤直接帶入並查詢');
+  await pg.evaluate(() => { window.__calls = []; });
+  await pg.click('#btnShelfQuery');
+  await pg.waitForSelector('#shelfMask.show');
+  await pg.waitForFunction(() => document.activeElement && document.activeElement.id === 'qScanInput');
+  ck('打開時游標就在掃描框', true);
+  await pg.evaluate(() => { window.__calls = []; });
+  await pg.keyboard.type('LOC:A04-3'); await pg.keyboard.press('Enter');
+  await pg.waitForFunction(() => window.__calls.some(c => c.action === 'listLocationContents'));
+  r = await pg.evaluate(() => ({ z: qZone.value, s: qSlot.value, l: qLevel.value, v: document.getElementById('qScanInput').value,
+    p: window.__calls.find(c => c.action === 'listLocationContents').payload }));
+  ck('區／格位／層帶成 A／4／3', r.z === 'A' && r.s === '4' && r.l === '3', r);
+  ck('而且直接查了，不用再按查詢', r.p.zone === 'A' && String(r.p.slot) === '4' && String(r.p.level) === '3', r.p);
+  ck('掃描框清空，可以接著掃下一張', r.v === '', r);
+
+  await pg.evaluate(() => { window.__calls = []; });
+  await pg.fill('#qScanInput', 'ｃ６－２'); await pg.press('#qScanInput', 'Enter');
+  await pg.waitForFunction(() => window.__calls.some(c => c.action === 'listLocationContents'));
+  r = await pg.evaluate(() => ({ z: qZone.value, s: qSlot.value, l: qLevel.value }));
+  ck('直接手打（小寫、全形、沒補零）也帶得進去', r.z === 'C' && r.s === '6' && r.l === '2', r);
+
+  await pg.evaluate(() => { window.__calls = []; });
+  await pg.fill('#qScanInput', '4710123456789'); await pg.press('#qScanInput', 'Enter');
+  await pg.waitForTimeout(200);
+  r = await pg.evaluate(() => ({ called: window.__calls.some(c => c.action === 'listLocationContents'), z: qZone.value }));
+  ck('誤掃商品條碼：不查、選單不動', !r.called && r.z === 'C', r);
+  await pg.click('#qClose');
+
+  console.log('\n【紀錄儲位商品視窗】掃標籤直接開始紀錄');
+  await pg.evaluate(() => { window.__audit = []; window.startLocAudit = (loc) => { window.__audit.push(loc); }; });
+  await pg.click('#btnRecordLoc');
+  await pg.waitForSelector('#recordLocPickMask.show');
+  await pg.waitForFunction(() => document.activeElement && document.activeElement.id === 'rScanInput');
+  await pg.keyboard.type('LOC:C06-2%E4%B8%8A'); await pg.keyboard.press('Enter');
+  await pg.waitForFunction(() => window.__audit.length === 1);
+  r = await pg.evaluate(() => ({ a: window.__audit, shown: document.getElementById('recordLocPickMask').classList.contains('show') }));
+  ck('這格有「上」「下」兩種寫法，標籤是「上」就直接用「上」，不用再選', r.a[0] === 'C06-2上', r);
+  ck('視窗自己關掉，進入紀錄', r.shown === false, r);
+
+  await pg.evaluate(() => { window.__audit = []; });
+  await pg.click('#btnRecordLoc');
+  await pg.waitForSelector('#recordLocPickMask.show');
+  await pg.fill('#rScanInput', '4710123456789'); await pg.press('#rScanInput', 'Enter');
+  await pg.waitForTimeout(250);
+  r = await pg.evaluate(() => ({ a: window.__audit, zone: rZone.value, free: document.getElementById('rFreeInput').value,
+    shown: document.getElementById('recordLocPickMask').classList.contains('show') }));
+  ck('誤掃商品條碼：不會被當成臨時儲位名稱拿去開始紀錄', r.a.length === 0 && r.zone !== '__free__' && r.free === '' && r.shown, r);
+
+  await pg.fill('#rScanInput', 'LOC:' + encodeURIComponent('花車1')); await pg.press('#rScanInput', 'Enter');
+  await pg.waitForFunction(() => window.__audit.length === 1);
+  r = await pg.evaluate(() => window.__audit);
+  ck('標籤上是選單裡沒有的臨時儲位（花車1）：照標籤的名稱開始紀錄', r[0] === '花車1', r);
+
+  await pg.click('#btnRecordLoc');
+  await pg.waitForSelector('#recordLocPickMask.show');
+  await pg.evaluate(() => { window.__audit = []; });
+  await pg.selectOption('#rZone', 'A'); await pg.selectOption('#rSlot', '4');
+  await pg.click('#rStart');
+  await pg.waitForFunction(() => window.__audit.length === 1);
+  ck('原本用選單選再按「開始紀錄」的做法照常能用', (await pg.evaluate(() => window.__audit[0])) === 'A04-3');
+
+  console.log('\n【清空儲位視窗】掃標籤查出這個位置，還是要再按確定才清');
+  await pg.evaluate(() => { window.__clear = []; window.__calls = [];
+    const orig = window.startClearForLocation; window.startClearForLocation = (loc) => { window.__clear.push(loc); return orig(loc); }; });
+  await pg.click('#btnClearLoc');
+  await pg.waitForSelector('#clearLocPickMask.show');
+  await pg.waitForFunction(() => document.activeElement && document.activeElement.id === 'cScanInput');
+  await pg.keyboard.type('LOC:C06-2%E4%B8%8B'); await pg.keyboard.press('Enter');
+  await pg.waitForFunction(() => window.__clear.length === 1);
+  r = await pg.evaluate(() => ({ c: window.__clear, confirmShown: document.getElementById('clearLocMask').classList.contains('show'),
+    label: document.getElementById('clearLocLabel').textContent,
+    wrote: window.__calls.filter(c => c.action !== 'listLocationContents' && c.action !== 'getLocationVocab').map(c => c.action) }));
+  ck('帶入的是標籤上的「C06-2下」', r.c[0] === 'C06-2下' && r.label === 'C06-2下', r);
+  ck('停在確認畫面，還沒有真的清任何東西', r.confirmShown === true && r.wrote.length === 0, r);
+  ck('確認畫面只列「下」那一格的商品，沒有把「上」的也算進來',
+     (await pg.textContent('#clearLocResult')).indexOf('S2') >= 0 && (await pg.textContent('#clearLocResult')).indexOf('S1') < 0);
+  await pg.click('#clearLocCancel');
+
+  console.log('\n【相機】從視窗裡開相機，相機畫面要蓋在視窗上面');
+  r = await pg.evaluate(() => ({ cam: parseInt(getComputedStyle(document.getElementById('cameraMask')).zIndex, 10) || 0,
+    modal: parseInt(getComputedStyle(document.getElementById('shelfMask')).zIndex, 10) || 0 }));
+  ck('相機畫面的層級高於視窗', r.cam > r.modal, r);
 
   ck('全程沒有 JS 錯誤', errs.length === 0, errs);
   await b.close(); srv.close();

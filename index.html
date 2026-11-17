@@ -440,6 +440,10 @@
     <div class="confirm-box" style="max-width:520px;">
       <h3>查詢貨架商品</h3>
       <p class="hint" style="margin-top:0;">選到哪一層就查那一層；格位或層選「全部」就查整格、整區。</p>
+      <div class="scan-row" style="margin-bottom:10px;">
+        <input id="qScanInput" class="scan-input" type="text" placeholder="掃描儲位 QR 碼（或直接打儲位，例如 A04-3）" autocomplete="off">
+        <button type="button" class="btn-camera" onclick="openCameraScan(qScanLoc)" title="用相機掃描儲位 QR 碼">📷</button>
+      </div>
       <div class="row" style="gap:8px;align-items:flex-end;">
         <label class="field" style="flex:1.2;margin-bottom:0;"><span>區</span><select id="qZone"></select></label>
         <label class="field" style="flex:1;margin-bottom:0;" id="qSlotField"><span>格位</span><select id="qSlot"></select></label>
@@ -457,6 +461,10 @@
     <div class="confirm-box" style="max-width:520px;">
       <h3>紀錄儲位商品</h3>
       <p class="hint" style="margin-top:0;">至少選到格位（層可以先不選），系統會自己找出這個位置目前真正的名稱，直接開始掃描登記。文山有開放零售，掛衣架、花車這種臨時儲位不在貨架的區/格系統裡，選「其他（自行輸入）」直接打名稱就能建立。</p>
+      <div class="scan-row" style="margin-bottom:10px;">
+        <input id="rScanInput" class="scan-input" type="text" placeholder="掃描儲位 QR 碼（或直接打儲位，例如 A04-3）" autocomplete="off">
+        <button type="button" class="btn-camera" onclick="openCameraScan(rScanLoc)" title="用相機掃描儲位 QR 碼">📷</button>
+      </div>
       <div class="row" style="gap:8px;align-items:flex-end;">
         <label class="field" style="flex:1.2;margin-bottom:0;"><span>區</span><select id="rZone"></select></label>
         <label class="field" style="flex:1;margin-bottom:0;" id="rSlotField"><span>格位</span><select id="rSlot"></select></label>
@@ -478,6 +486,10 @@
     <div class="confirm-box" style="max-width:520px;">
       <h3>清空儲位</h3>
       <p class="hint" style="margin-top:0;">臨時儲位（花車、掛衣架）撤掉時，用這裡把地圖上還掛著這個位置的商品一次清掉。選一個位置，系統會列出目前登記在那裡的商品讓你確認。</p>
+      <div class="scan-row" style="margin-bottom:10px;">
+        <input id="cScanInput" class="scan-input" type="text" placeholder="掃描儲位 QR 碼（或直接打儲位，例如 A04-3）" autocomplete="off">
+        <button type="button" class="btn-camera" onclick="openCameraScan(cScanLoc)" title="用相機掃描儲位 QR 碼">📷</button>
+      </div>
       <div class="row" style="gap:8px;align-items:flex-end;">
         <label class="field" style="flex:1.2;margin-bottom:0;"><span>區</span><select id="cZone"></select></label>
         <label class="field" style="flex:1;margin-bottom:0;" id="cSlotField"><span>格位</span><select id="cSlot"></select></label>
@@ -3348,7 +3360,9 @@ async function resolveLocationQuery_(query){
 // 字串——查到剛好一個位置就直接用；查到好幾個（同一格位底下有好幾種寫法）
 // 讓使用者自己選一個；查到零筆才視為全新儲位，退回用選單組出來的字串
 // （並明講這是用猜的、之後如果跟現場習慣的後綴寫法不一樣要手動調整）。
-async function startRecordFromPicker(){
+async function startRecordFromPicker(prefer){
+  // 按鈕點擊進來的時候第一個參數是事件物件，不是字串
+  if(typeof prefer !== 'string') prefer = '';
   const errBox = document.getElementById('recordLocPickError');
   errBox.style.display = 'none';
   const query = buildLocQueryFromPicker_('rZone', 'rSlot', 'rLevel', 'rFreeInput');
@@ -3359,7 +3373,17 @@ async function startRecordFromPicker(){
   if(!result.ok){ errBox.textContent = result.error; errBox.style.display = ''; return; }
   shelfResult = result.res;
 
-  if(result.found.length === 1){
+  if(prefer && result.found.indexOf(prefer) >= 0){
+    // 掃標籤進來的：標籤上寫的就是確切位置，而且地圖上真的有這個寫法，直接用
+    document.getElementById('recordLocPickMask').classList.remove('show');
+    startLocAudit(prefer);
+  }else if(prefer && !result.found.length){
+    // 地圖上還沒有任何東西在這裡。用標籤上的字串當位置名稱——
+    // 那是實際貼在貨架上的名字，比選單組出來的猜測可靠。
+    document.getElementById('recordLocPickMask').classList.remove('show');
+    startLocAudit(prefer);
+    flash('ok', '這是全新的位置：' + prefer, '地圖上目前沒有任何商品登記在這裡，掃進來的會登記到這個位置', 3200);
+  }else if(result.found.length === 1){
     document.getElementById('recordLocPickMask').classList.remove('show');
     startLocAudit(result.found[0]);
   }else if(result.found.length > 1){
@@ -3383,7 +3407,8 @@ async function startRecordFromPicker(){
   }
 }
 
-async function startClearFromPicker(){
+async function startClearFromPicker(prefer){
+  if(typeof prefer !== 'string') prefer = '';
   const errBox = document.getElementById('clearLocPickError');
   errBox.style.display = 'none';
   const query = buildLocQueryFromPicker_('cZone', 'cSlot', 'cLevel', 'cFreeInput');
@@ -3394,7 +3419,10 @@ async function startClearFromPicker(){
   if(!result.ok){ errBox.textContent = result.error; errBox.style.display = ''; return; }
   shelfResult = result.res;
 
-  if(result.found.length === 1){
+  if(prefer && result.found.indexOf(prefer) >= 0){
+    document.getElementById('clearLocPickMask').classList.remove('show');
+    startClearForLocation(prefer);
+  }else if(result.found.length === 1){
     document.getElementById('clearLocPickMask').classList.remove('show');
     startClearForLocation(result.found[0]);
   }else if(result.found.length > 1){
@@ -4378,6 +4406,100 @@ function locQrDecode(code){
   return loc;
 }
 
+// 把一個儲位字串帶進某一組「區／格位／層」選單。帶得進去回 true。
+//   ids       ：那組選單的元素 id（zone/slot/level，有的還有 free 自行輸入）
+//   refill    ：選完區之後要呼叫的「重畫格位與層」函式（三個視窗各有各的）
+//   allowFree ：帶不進選單時，可不可以退到「其他（自行輸入）」。
+//               只有掃到帶 LOC: 前綴的標籤才給 true——那是我們自己印的，字串可信。
+//               手打或掃錯東西（例如把商品條碼掃進來）不能退到自行輸入，
+//               不然一串條碼數字會被當成一個「臨時儲位名稱」直接拿去開始登記。
+function presetLocPicker_(ids, refill, loc, allowFree){
+  const zSel = document.getElementById(ids.zone);
+  const hasOpt = function(sel, v){ return Array.prototype.some.call(sel.options, function(o){ return o.value === v; }); };
+  const m = /^([A-Za-z]{1,2})(\d{1,3})(?:-(\d+))?/.exec(loc);
+  if(m){
+    const zone = hasOpt(zSel, m[1]) ? m[1] : (hasOpt(zSel, m[1].toUpperCase()) ? m[1].toUpperCase() : '');
+    if(zone){
+      zSel.value = zone; refill();
+      const slot = String(parseInt(m[2], 10));
+      const sSel = document.getElementById(ids.slot), lSel = document.getElementById(ids.level);
+      if(hasOpt(sSel, slot)){
+        sSel.value = slot;
+        lSel.value = (m[3] && hasOpt(lSel, m[3])) ? m[3] : '';
+        return true;
+      }
+    }
+  }
+  if(hasOpt(zSel, '__t__' + loc)){ zSel.value = '__t__' + loc; refill(); return true; }
+  if(allowFree && ids.free && hasOpt(zSel, '__free__')){
+    zSel.value = '__free__'; refill();
+    document.getElementById(ids.free).value = loc;
+    return true;
+  }
+  return false;
+}
+
+// 這三個視窗的掃描框只收「儲位」，所以除了標籤（LOC:…）也接受直接打儲位字串。
+// 回傳 {loc, fromLabel}；什麼都沒輸入回 null。
+function readLocScan_(code){
+  const raw = String(code||'').trim();
+  if(!raw) return null;
+  const fromLabel = locQrDecode(raw);
+  if(fromLabel) return {loc: fromLabel, fromLabel: true};
+  // 手打的：先把全形轉半形，再借用同一套「大小寫對回地圖寫法」的處理
+  const half = raw.replace(/[\uff01-\uff5e]/g, function(ch){ return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); });
+  const typed = locQrDecode(LOC_QR_PREFIX + encodeURIComponent(half));
+  return typed ? {loc: typed, fromLabel: false} : null;
+}
+// 開視窗時把游標直接放進掃描框：手持掃描槍是模擬鍵盤打字，
+// 游標不在框裡就等於掃到空氣。
+function focusLocScan_(inputId){
+  const el = document.getElementById(inputId);
+  if(!el) return;
+  el.value = '';
+  setTimeout(function(){ el.focus(); }, 60);
+}
+function locScanReject_(inputId, raw){
+  errorBeep();
+  flash('err', '認不得這個儲位', String(raw||'').slice(0, 30) + '　請掃儲位標籤，或用下面的選單選', 2800);
+  const el = document.getElementById(inputId); if(el) el.focus();
+}
+
+// 查詢貨架：掃到就直接查
+async function qScanLoc(code){
+  const r = readLocScan_(code);
+  if(!r) return;
+  if(!presetLocPicker_({zone:'qZone', slot:'qSlot', level:'qLevel'}, qFillSlots, r.loc, false)){
+    locScanReject_('qScanInput', code); return;
+  }
+  okBeep();
+  await runShelfQuery();
+}
+
+// 紀錄儲位商品：掃到就直接開始紀錄。標籤上的字串是確切的位置（含「上／下」這種
+// 選單選不出來的寫法），所以把它當成偏好傳下去——查到的結果裡有它就直接用它，
+// 不用再跳出「這格有好幾種寫法請選一個」。
+async function rScanLoc(code){
+  const r = readLocScan_(code);
+  if(!r) return;
+  if(!presetLocPicker_(Object.assign({free:'rFreeInput'}, R_PICKER_IDS), rFillSlots, r.loc, r.fromLabel)){
+    locScanReject_('rScanInput', code); return;
+  }
+  okBeep();
+  await startRecordFromPicker(r.loc);
+}
+
+// 清空儲位：掃到就查出這個位置有什麼，後面還有一道「確定清空」才會真的動資料
+async function cScanLoc(code){
+  const r = readLocScan_(code);
+  if(!r) return;
+  if(!presetLocPicker_(Object.assign({free:'cFreeInput'}, C_PICKER_IDS), cFillSlots, r.loc, r.fromLabel)){
+    locScanReject_('cScanInput', code); return;
+  }
+  okBeep();
+  await startClearFromPicker(r.loc);
+}
+
 // 在儲位頁掃到儲位標籤：
 //   清單裡有商品 → 這就是「要搬去哪」，直接帶進新儲位。先掃商品、再掃貨架，手不用碰螢幕。
 //   清單是空的   → 人站在貨架前想知道這格有什麼，打開貨架查詢。
@@ -4401,18 +4523,7 @@ async function handleLocQrScan(loc){
   }
   await loadLocVocab();
   qFillZones();
-  const zSel = document.getElementById('qZone');
-  const m = /^([A-Za-z]{1,2})(\d{1,3})(?:-(\d+))?/.exec(loc);
-  const hasOpt = function(sel, v){ return Array.prototype.some.call(sel.options, function(o){ return o.value === v; }); };
-  let preset = false;
-  if(m && hasOpt(zSel, m[1])){
-    zSel.value = m[1]; qFillSlots();
-    const slot = String(parseInt(m[2], 10));
-    const sSel = document.getElementById('qSlot'), lSel = document.getElementById('qLevel');
-    if(hasOpt(sSel, slot)){ sSel.value = slot; if(m[3] && hasOpt(lSel, m[3])) lSel.value = m[3]; preset = true; }
-  }else if(hasOpt(zSel, '__t__' + loc)){
-    zSel.value = '__t__' + loc; qFillSlots(); preset = true;
-  }
+  const preset = presetLocPicker_({zone:'qZone', slot:'qSlot', level:'qLevel'}, qFillSlots, loc, false);
   if(!preset){
     errorBeep(); flash('err', '儲位 ' + loc, '地圖上還沒有這個位置。先掃商品、再掃這張標籤，就能把商品放進來', 3200);
     return;
@@ -6792,6 +6903,7 @@ document.getElementById('btnShelfQuery').addEventListener('click', async functio
   document.getElementById('qResult').innerHTML = '';
   shelfResult = null;
   document.getElementById('shelfMask').classList.add('show');
+  focusLocScan_('qScanInput');
 });
 document.getElementById('qZone').addEventListener('change', qFillSlots);
 document.getElementById('qRun').addEventListener('click', runShelfQuery);
@@ -6807,6 +6919,7 @@ document.getElementById('btnRecordLoc').addEventListener('click', async function
   rFillZones();
   document.getElementById('recordLocPickError').style.display = 'none';
   document.getElementById('recordLocPickMask').classList.add('show');
+  focusLocScan_('rScanInput');
 });
 document.getElementById('rZone').addEventListener('change', rFillSlots);
 document.getElementById('rStart').addEventListener('click', startRecordFromPicker);
@@ -6822,6 +6935,7 @@ document.getElementById('btnClearLoc').addEventListener('click', async function(
   cFillZones();
   document.getElementById('clearLocPickError').style.display = 'none';
   document.getElementById('clearLocPickMask').classList.add('show');
+  focusLocScan_('cScanInput');
 });
 document.getElementById('cZone').addEventListener('change', cFillSlots);
 document.getElementById('cQuery').addEventListener('click', startClearFromPicker);
@@ -6862,6 +6976,9 @@ document.getElementById('locAuditMask').addEventListener('click', function(e){
 });
 document.getElementById('sibOk').addEventListener('click', function(){ closeSiblings(true); });
 document.getElementById('sibCancel').addEventListener('click', function(){ closeSiblings(false); });
+wireScanInput(document.getElementById('qScanInput'), qScanLoc);
+wireScanInput(document.getElementById('rScanInput'), rScanLoc);
+wireScanInput(document.getElementById('cScanInput'), cScanLoc);
 document.getElementById('btnQrGen').addEventListener('click', openQrGen);
 document.getElementById('qrZone').addEventListener('change', qrFillSlots);
 document.getElementById('qrAddGrid').addEventListener('click', qrAddGrid);
