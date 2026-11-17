@@ -70,7 +70,7 @@ const sandbox = {
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2],'utf8')
-  + "\n;globalThis.__x = {ORDERS_HEADER, HEADER_LABELS, SHEET_ORDERS, SHEET_PICKLOG, PICKLOG_HEADER, statusToText,"
+  + "\n;globalThis.__x = {ORDERS_HEADER, HEADER_LABELS, SHEET_ORDERS, SHEET_PICKLOG, PICKLOG_HEADER, statusToText, PICKLOG_TEXTFINDER_MIN_ROWS,"
   + " markPickedBatch, markPickDone, countPickEvents_, readOrderRows, diagnosePickTransfer, orderIndexCacheClear_};\n",
   sandbox, { filename:'Code.gs' });
 const X = sandbox.__x;
@@ -126,22 +126,34 @@ rows = X.readOrderRows(); rows.forEach(x => by[x.orderNo] = x);
 ck('N200 拿到 A、B', Object.keys(JSON.parse(by.N200.pickedJson)).sort().join(',') === 'A,B', by.N200.pickedJson);
 ck('位移後落在 N200 原本位置的 N210 沒被寫到', !by.N210.pickedJson, by.N210.pickedJson);
 
-console.log('\n【揀貨完成】數取消／掃錯次數，結果要跟整張讀一樣');
-const list = [];
-for(let i = 0; i < 2000; i++) list.push(['X' + (i % 400), i % 3 ? '揀貨' : '取消揀貨']);
-list.push(['N150', '揀貨'], ['N150', '取消揀貨'], ['N150', '掃描不符'], ['N150', '取消揀貨'], ['N1500', '取消揀貨'], ['XN150', '掃描不符']);
-let pl = buildPickLog(list);
+console.log('\n【揀貨完成】小表（現場實際 52 列）：直接讀一趟，不用 TextFinder');
+const small = [];
+for(let i = 0; i < 60; i++) small.push(['X' + (i % 20), i % 3 ? '揀貨' : '取消揀貨']);
+small.push(['N150', '揀貨'], ['N150', '取消揀貨'], ['N150', '掃描不符'], ['N150', '取消揀貨'], ['N1500', '取消揀貨'], ['XN150', '掃描不符']);
+let pl = buildPickLog(small);
 EVENTS.length = 0;
 r = X.countPickEvents_('N150');
 ck('N150：取消 2 次、掃錯 1 次（不會把 N1500、XN150 算進來）', r.cancelCount === 2 && r.scanMiss === 1, r);
-ck('沒有整張讀揀貨紀錄', !EVENTS.some(e => e.t === 'read' && e.sheet === X.SHEET_PICKLOG && e.nr > 50), EVENTS.filter(e=>e.t==='read'));
-ck('用的是 TextFinder', EVENTS.some(e => e.t === 'find'));
+const plReads = EVENTS.filter(e => e.t === 'read' && e.sheet === X.SHEET_PICKLOG && e.nr > 1);
+ck('只讀一趟', plReads.length === 1, plReads);
+ck('只讀訂單號～動作那一段欄位，不是整張 12 欄', plReads[0] && plReads[0].nc < X.PICKLOG_HEADER.length, plReads);
+ck('小表不用 TextFinder（它有固定成本，小表反而慢）', !EVENTS.some(e => e.t === 'find'));
 r = X.countPickEvents_('NOT-THERE');
 ck('沒有紀錄的單回 0/0', r.cancelCount === 0 && r.scanMiss === 0, r);
 
+console.log('\n【揀貨完成】大表（超過門檻）：改用 TextFinder，結果一樣');
+const big = [];
+for(let i = 0; i < 5200; i++) big.push(['X' + (i % 400), i % 3 ? '揀貨' : '取消揀貨']);
+big.push(['N150', '揀貨'], ['N150', '取消揀貨'], ['N150', '掃描不符'], ['N150', '取消揀貨'], ['N1500', '取消揀貨'], ['XN150', '掃描不符']);
+pl = buildPickLog(big);
+EVENTS.length = 0;
+r = X.countPickEvents_('N150');
+ck('結果一樣：取消 2、掃錯 1', r.cancelCount === 2 && r.scanMiss === 1, r);
+ck('用了 TextFinder', EVENTS.some(e => e.t === 'find'));
+ck('沒有把整欄拉回來', !EVENTS.some(e => e.t === 'read' && e.sheet === X.SHEET_PICKLOG && e.nr > 50), EVENTS.filter(e=>e.t==='read'));
 pl._noTextFinder = true;
 r = X.countPickEvents_('N150');
-ck('TextFinder 不能用時退回讀兩欄，結果一樣', r.cancelCount === 2 && r.scanMiss === 1, r);
+ck('TextFinder 不能用時退回直接讀，結果一樣', r.cancelCount === 2 && r.scanMiss === 1, r);
 pl._noTextFinder = false;
 
 console.log('\n【揀貨完成】整支跑一次');
@@ -152,13 +164,15 @@ ck('差異明細有算到取消 1 次、掃錯 1 次', r.差異明細 === '取�
 rows = X.readOrderRows();
 ck('訂單上記了揀貨完成時間與人', rows[5].pickDoneAt === '2026/11/17 上午10:00:00' && rows[5].pickDoneBy === '甲', rows[5]);
 
-console.log('\n【診斷】只讀，跑得完，兩種算法一致');
-buildOrders(30); buildPickLog([['N3','揀貨'],['N3','取消揀貨']]);
+console.log('\n【診斷】只讀，跑得完，兩種算法一致，樣本挑還在訂單表裡的');
+buildOrders(30); buildPickLog([['N3','揀貨'],['N3','取消揀貨'],['ARCHIVED-1','揀貨']]);   // 最後一筆是已歸檔的單
 EVENTS.length = 0;
 let txt = '';
 try{ txt = X.diagnosePickTransfer(); }catch(e){ txt = 'ERR ' + e.message; }
 ck('跑得完', txt.indexOf('揀貨／調撥效能診斷') === 0, txt);
 ck('取消次數兩種算法一致', txt.indexOf('一樣，OK') >= 0, txt);
+ck('不會挑到已歸檔的單', txt.indexOf('樣本訂單：N3') >= 0 && txt.indexOf('ARCHIVED-1') < 0, txt.split('\n').slice(0,6));
+ck('冷、熱索引分開量，而且都找得到', /索引剛過期.*\d+ ms/.test(txt) && /索引熱的.*\d+ ms/.test(txt) && txt.indexOf('找不到這張單') < 0, txt);
 ck('沒有寫入任何東西', !EVENTS.some(e => e.t === 'write'), EVENTS.filter(e => e.t === 'write'));
 
 console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：只讀動到的單、位移不寫錯、次數跟整張讀一致、退路有效、診斷只讀');

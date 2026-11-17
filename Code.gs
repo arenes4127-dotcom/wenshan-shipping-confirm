@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-17.215';
+const BACKEND_VERSION = '2026-11-17.216';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -7683,11 +7683,12 @@ function buildPickDifference_(d){
 // 而紀錄不會。
 // 數這張單在揀貨紀錄裡被「取消揀貨」幾次、「掃描不符」幾次。
 //
-// 原本是 readRows(揀貨紀錄) 整張讀（12 欄全部），而揀貨紀錄是累積的、從來不清——
-// 每按一次「揀貨完成」要讀的量就多一點，而且是在寫入鎖裡讀。
-// 改成用 TextFinder 在「訂單號」那一欄找出這張單的列（搜尋在 Google 那邊做，
-// 不用把整欄拉回來），再只讀那幾列的「動作」欄。
-// TextFinder 萬一不能用，退回只讀訂單號、動作兩欄，還是比整張 12 欄讀少很多。
+// 11/17 實測（diagnosePickTransfer，揀貨紀錄 52 列）：整張讀 113 ms，TextFinder 375 ms。
+// TextFinder 有約 300 ms 的固定成本，表小的時候反而比直接讀慢。我原本的前提是
+// 「這張表從不清、會越來越大」，但實際量到只有 52 列——前提錯了。
+// 所以：表不大就直接讀（只讀訂單號到動作那一段欄位，一趟），超過門檻才改用 TextFinder。
+// 門檻 5000 列是保守估：讀 2 欄 × 5000 列大約還在幾百毫秒內，跟 TextFinder 打平。
+const PICKLOG_TEXTFINDER_MIN_ROWS = 5000;
 function countPickEvents_(orderNo){
   const want = String(orderNo||'').trim();
   let cancel = 0, miss = 0;
@@ -7703,7 +7704,7 @@ function countPickEvents_(orderNo){
     else if(a === '掃描不符') miss++;
   };
   let rows = null;
-  try{
+  if(last - 1 >= PICKLOG_TEXTFINDER_MIN_ROWS) try{
     rows = sh.getRange(2, oCol, last - 1, 1).createTextFinder(want)
              .matchEntireCell(true).matchCase(true).findAll()
              .map(function(r){ return r.getRow(); });
@@ -7721,10 +7722,11 @@ function countPickEvents_(orderNo){
     });
     return {cancelCount: cancel, scanMiss: miss};
   }
-  const nos = sh.getRange(2, oCol, last - 1, 1).getValues();
-  const acts = sh.getRange(2, aCol, last - 1, 1).getValues();
-  for(let i = 0; i < nos.length; i++){
-    if(String(nos[i][0]||'').trim() === want) tally(acts[i][0]);
+  // 直接讀：訂單號到動作那一段欄位一次讀回來（一趟），不是整張 12 欄。
+  const lo = Math.min(oCol, aCol), width = Math.abs(aCol - oCol) + 1;
+  const vals = sh.getRange(2, lo, last - 1, width).getValues();
+  for(let i = 0; i < vals.length; i++){
+    if(String(vals[i][oCol - lo]||'').trim() === want) tally(vals[i][aCol - lo]);
   }
   return {cancelCount: cancel, scanMiss: miss};
 }
@@ -10829,23 +10831,38 @@ function diagnosePickTransfer(){
              + ' 列（這張是累積的，從來不清）');
   lines.push('');
 
-  // 拿一張最近有揀貨紀錄的訂單當樣本
+  // 樣本要「還在訂單表裡」的單——現場揀貨時訂單一定在表裡。
+  // 第一版是從揀貨紀錄挑最近一張，結果那張已經歸檔，量到的是「找不到→重建索引再找」
+  // 那條最慢、現場根本不會走的路（11/17 那次 1416 ms 就是這樣來的）。
+  // 優先挑揀貨紀錄裡有、而且還在訂單表裡的；都沒有就挑訂單表最後一張。
+  const oLast = osh.getLastRow();
+  if(oLast < 2){ lines.push('訂單表是空的，沒有樣本可以量。'); Logger.log(lines.join('\n')); return lines.join('\n'); }
+  const orderNos = osh.getRange(2, colOf(ORDERS_HEADER, 'orderNo'), oLast - 1, 1).getValues()
+                      .map(function(r){ return String(r[0]||'').trim(); });
+  const inOrders = {}; orderNos.forEach(function(n){ if(n) inOrders[n] = 1; });
   let sample = '';
   const last = plsh.getLastRow();
   if(last >= 2){
-    const from = Math.max(2, last - 200);
+    const from = Math.max(2, last - 500);
     const tail = plsh.getRange(from, colOf(PICKLOG_HEADER, 'orderNo'), last - from + 1, 1).getValues();
-    for(let i = tail.length - 1; i >= 0 && !sample; i--){ sample = String(tail[i][0]||'').trim(); }
+    for(let i = tail.length - 1; i >= 0 && !sample; i--){
+      const n = String(tail[i][0]||'').trim();
+      if(n && inOrders[n]) sample = n;
+    }
   }
-  if(!sample){ lines.push('揀貨紀錄裡找不到任何訂單號，沒有樣本可以量。'); Logger.log(lines.join('\n')); return lines.join('\n'); }
-  lines.push('樣本訂單：' + sample);
+  if(!sample){ for(let i = orderNos.length - 1; i >= 0 && !sample; i--) sample = orderNos[i]; }
+  lines.push('樣本訂單：' + sample + '（確認還在訂單表裡）');
   lines.push('');
 
   lines.push('【點件送出（markPickedBatch）每一批都要做的讀取】');
   const oldOrders = t(function(){ return readOrderRows().length; });
-  const newOrder = t(function(){ return findOrderRow_(osh, sample) ? 1 : 0; });
-  lines.push('   改之前：整張讀訂單表　' + oldOrders.ms + ' ms');
-  lines.push('   改之後：只讀這張單　　' + newOrder.ms + ' ms' + (newOrder.r ? '' : '（這張單已不在訂單表，可能已歸檔）'));
+  lines.push('   改之前：整張讀訂單表　　　　　　　' + oldOrders.ms + ' ms');
+  try{ orderIndexCacheClear_(); }catch(e){}
+  const coldOrder = t(function(){ return findOrderRow_(osh, sample) ? 1 : 0; });
+  lines.push('   改之後（索引剛過期，要重建）　　' + coldOrder.ms + ' ms' + (coldOrder.r ? '' : '　**找不到這張單，有問題**'));
+  const warmOrder = t(function(){ return findOrderRow_(osh, sample) ? 1 : 0; });
+  lines.push('   改之後（索引熱的，揀貨中的常態）' + warmOrder.ms + ' ms' + (warmOrder.r ? '' : '　**找不到這張單，有問題**'));
+  lines.push('   （揀貨時每隔幾秒送一批，索引 5 分鐘內都是熱的，所以常態是最後一行）');
   lines.push('');
 
   lines.push('【揀貨完成（markPickDone）數取消／掃錯次數】');
@@ -10858,8 +10875,8 @@ function diagnosePickTransfer(){
     return c + '/' + m;
   });
   const newCount = t(function(){ const x = countPickEvents_(sample); return x.cancelCount + '/' + x.scanMiss; });
-  lines.push('   改之前：整張讀揀貨紀錄　' + oldCount.ms + ' ms（取消/掃錯 = ' + oldCount.r + '）');
-  lines.push('   改之後：只找這張單的列　' + newCount.ms + ' ms（取消/掃錯 = ' + newCount.r + '）');
+  lines.push('   改之前：整張讀揀貨紀錄（12 欄）　' + oldCount.ms + ' ms（取消/掃錯 = ' + oldCount.r + '）');
+  lines.push('   改之後：' + (Math.max(plsh.getLastRow() - 1, 0) >= PICKLOG_TEXTFINDER_MIN_ROWS ? 'TextFinder 只找這張單　' : '只讀訂單號～動作那幾欄') + '　' + newCount.ms + ' ms（取消/掃錯 = ' + newCount.r + '）');
   lines.push('   兩種算法結果' + (oldCount.r === newCount.r ? '一樣，OK' : '**不一樣，有問題**'));
   lines.push('');
 
