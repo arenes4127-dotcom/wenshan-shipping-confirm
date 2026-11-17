@@ -282,6 +282,10 @@
   .q-item .t b{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;}
   .q-item .st{font-size:12px;white-space:nowrap;text-align:right;}
   .q-item .st .zero{color:var(--danger);}
+  #shipIssueBanner{background:#5a1d1d;border-bottom:2px solid var(--danger);padding:10px 16px;}
+  #shipIssueBanner .it{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:4px 0;font-size:14px;line-height:1.5;}
+  #shipIssueBanner .it + .it{border-top:1px solid rgba(255,255,255,.12);}
+  #shipQueueChip.warn{background:var(--danger);color:#fff;}
   /* 貨架查詢結果：整列可以點，加入／移出異動清單 */
   .q-item.pickable{cursor:pointer;border-radius:8px;}
   .q-item.pickable:active{background:var(--panel2);}
@@ -351,7 +355,7 @@
      沒有這條規則的話 flash('warn') 會變成一片透明的遮罩，看起來像畫面壞掉。 */
   .flash.warn{background:rgba(224,167,47,.95);}
   .flash .big{font-size:56px;color:#fff;font-weight:800;}
-  .flash .sub{font-size:20px;color:#fff;max-width:600px;}
+  .flash .sub{font-size:20px;color:#fff;max-width:600px;white-space:pre-line;}
 
   /* ---- bottom nav ---- */
   nav.tabbar{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--panel);border-top:1px solid var(--border);
@@ -397,8 +401,12 @@
     <div class="title">文山出貨確認系統</div>
     <span class="tag" id="connStatus">單機模式</span>
     <div class="badge" id="pendingBadge">0 張待出貨</div>
+    <div class="badge" id="shipQueueChip" style="display:none;cursor:pointer;" title="點一下看細節"></div>
     <div class="staff-chip">包貨：<b id="headerStaffName">未選擇</b></div>
   </header>
+  <!-- 背景送出的完成出貨，後端說「已經被別人出掉了」時的警示。
+       人可能已經在包下一張，所以不能用一閃就消失的提示：一直掛著，按「我知道了」才收。 -->
+  <div id="shipIssueBanner" style="display:none;"></div>
 
   <div class="confirm-mask" id="countQtyMask">
     <div class="confirm-box">
@@ -1216,6 +1224,8 @@ const LS = {
   orders: 'ssz_orders', log: 'ssz_log', staff: 'ssz_staff',
   currentStaff: 'ssz_current_staff', settings: 'ssz_settings',
   netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue',
+  // 完成出貨：先過、後送。排隊中的出貨、需要人看的出貨問題、最近一次看到的後端版本
+  shipQueue: 'ssz_ship_queue', shipIssues: 'ssz_ship_issues', backendVersion: 'ssz_backend_version',
   // 待送出的調撥驗收掃描，跟 pickQueue 同樣道理：關掉分頁/斷線也不會掉，開起來繼續送
   transferQueue: 'ssz_transfer_queue',
   // 上一次拿到的待驗收清單。進調撥頁先畫這份，不用空等一趟網路（見 showTransferCache_）
@@ -1231,6 +1241,17 @@ const LS = {
   countSession: 'ssz_count_session', countItems: 'ssz_count_items',
   countQueue: 'ssz_count_queue', countStores: 'ssz_count_stores'
 };
+
+// 完成出貨「先過、後送」的狀態（說明見 flushShipQueue_ 上面）。
+// 刻意宣告在檔案前段：refreshFromBackend 啟動時很早就會讀到 backendVersion／shipQueue，
+// let 在宣告之前被讀到會直接丟 ReferenceError（暫時性死區）。
+const SHIP_OUTBOX_MIN_VERSION = '2026-11-17.217';
+const SHIP_STUCK_TRIES = 4;            // 連續失敗幾次之後在畫面上轉成紅色提醒（還是會繼續重試）
+let shipQueue = loadJSON(LS.shipQueue, []);
+let shipIssues = loadJSON(LS.shipIssues, []);
+let backendVersion = loadJSON(LS.backendVersion, '');
+let shipFlushing = false;
+let shipFlushTimer = null;
 function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
 // localStorage 寫入失敗不可以中斷正在進行的作業。
 // 最常見的失敗是 QuotaExceededError：單一來源上限約 5MB，而 orders 整包序列化
@@ -1651,6 +1672,12 @@ async function refreshFromBackend(silent, lean){
     const _tNet = (performance && performance.now ? performance.now() : Date.now());
     orders = data.orders || {};
     Object.values(orders).forEach(o=>{ o.date = normalizeDateField(o.date); });
+    if(data.version && data.version !== backendVersion){
+      const wasOn = shipOutboxEnabled_();
+      backendVersion = data.version; saveJSON(LS.backendVersion, backendVersion);
+      // 後端剛升級到支援「先過後送」的版本，佇列裡如果有東西（理論上不會）就開始送
+      if(!wasOn && shipOutboxEnabled_()) flushShipQueue_();
+    }
     // 只有這次真的有拿出貨紀錄才覆蓋。lean 模式後端不回 log 這個鍵，
     // 寫成 data.log || [] 會把本機已經有的紀錄清成空的。
     if(data.log){
@@ -1658,6 +1685,7 @@ async function refreshFromBackend(silent, lean){
       log.forEach(l=>{ l.orderDate = normalizeDateField(l.orderDate); });
       saveJSON(LS.log, log);
     }
+    applyShipQueueOverlay_(!!data.log);
     if(data.staff && data.staff.length) staff = data.staff;
     saveOrdersCache_();
     saveJSON(LS.staff, staff);
@@ -6014,6 +6042,152 @@ document.getElementById('btnAbort').addEventListener('click', async ()=>{
   }
 });
 
+// ============================================================
+// 完成出貨：先過、後送
+// ============================================================
+// 按下「完成出貨」之後，原本要等 Apps Script 一整趟來回（2～4 秒，搶到鎖還要更久）
+// 才能掃下一張。那幾秒是門口的固定成本，後端程式再怎麼改都省不掉。
+// 改成：按下去本機立刻當成完成、畫面立刻回到「掃下一張」，出貨資料排進佇列在背景送。
+//
+// 為什麼這樣不會重複出貨：
+//   1. 訂單在後端仍是「我正在掃描中」（認領還在），別台裝置認領不到這張。
+//   2. 背景送出逾時會自動重送；後端用「出貨完成時間」認得出是同一次出貨的重送，
+//      回成功、不會再寫一筆（.217 起）。後端還是舊版時不啟用這個功能，照舊同步等待。
+//   3. 真的被別人出掉了（例如斷線太久、認領逾時被釋放），後端會擋下來，
+//      這邊掛一條紅色警示一直到有人按「我知道了」——人可能已經在包下一張，不能一閃就過。
+// 佇列存在本機：關掉分頁、重新整理、斷線都不會掉，開回來繼續送。
+// （狀態變數宣告在檔案前段、LS 旁邊：refreshFromBackend 啟動時很早就會用到它們。）
+
+function shipOutboxEnabled_(){
+  return hasBackend() && !!backendVersion && backendVersion >= SHIP_OUTBOX_MIN_VERSION;
+}
+function shipKey_(e){ return String(e.orderNo) + '|' + String(e.time); }
+
+// 後端拿回來的訂單／出貨紀錄，還沒包含佇列裡那幾筆——重新套上去，
+// 不然背景輪詢一回來，剛出完的單又會出現在待出貨清單上。
+function applyShipQueueOverlay_(logReplaced){
+  if(!shipQueue.length) return;
+  const inLog = {};
+  if(logReplaced) log.forEach(function(l){ inLog[shipKey_(l)] = 1; });
+  const add = [];
+  shipQueue.forEach(function(q){
+    const o = orders[q.entry.orderNo];
+    if(o) o.status = 'shipped';
+    if(logReplaced && !inLog[shipKey_(q.entry)]) add.push(Object.assign({}, q.entry, {_pending: true}));
+  });
+  if(add.length){ log = add.concat(log); saveJSON(LS.log, log); }
+}
+
+function enqueueShipment_(entry){
+  shipQueue.push({entry: entry, tries: 0, nextAt: 0, queuedAt: Date.now()});
+  saveJSON(LS.shipQueue, shipQueue);
+  renderShipStatus_();
+  flushShipQueue_();
+}
+
+function markLogDelivered_(entry){
+  const k = shipKey_(entry);
+  log.forEach(function(l){ if(shipKey_(l) === k) delete l._pending; });
+  saveJSON(LS.log, log);
+}
+function dropLogEntry_(entry){
+  const k = shipKey_(entry);
+  log = log.filter(function(l){ return shipKey_(l) !== k; });
+  saveJSON(LS.log, log);
+}
+
+async function flushShipQueue_(){
+  if(shipFlushTimer){ clearTimeout(shipFlushTimer); shipFlushTimer = null; }
+  if(shipFlushing || !shipQueue.length || !hasBackend()) return;
+  shipFlushing = true;
+  try{
+    // 一次送一筆、照順序送。不並行：每一筆都要拿寫入鎖，並行只會自己跟自己搶。
+    while(shipQueue.length){
+      const now = Date.now();
+      const q = shipQueue.find(function(x){ return (x.nextAt || 0) <= now; });
+      if(!q) break;
+      let res;
+      try{
+        res = await apiPost('finalizeShipment', {entry: q.entry});
+      }catch(err){
+        // 送不出去（斷線、逾時、後端忙到重試三次都拿不到鎖…）：留在佇列裡，
+        // 等一下再送。間隔越拉越長，最多一分鐘一次。
+        q.tries = (q.tries || 0) + 1;
+        q.lastError = String(err && err.message || err);
+        q.nextAt = Date.now() + Math.min(60000, 2000 * Math.pow(2, q.tries - 1));
+        saveJSON(LS.shipQueue, shipQueue);
+        renderShipStatus_();
+        continue;          // 別筆可能已經到時間了；沒有的話上面 find 會找不到而跳出
+      }
+      shipQueue = shipQueue.filter(function(x){ return x !== q; });
+      saveJSON(LS.shipQueue, shipQueue);
+      if(res && res.ok === false && res.reason === 'already_shipped'){
+        // 後端沒有記錄這一次——拿掉本機先記的那筆，警示一直掛著直到有人確認
+        dropLogEntry_(q.entry);
+        shipIssues.push({orderNo: q.entry.orderNo, waybill: q.entry.waybill,
+          myTime: q.entry.time, shippedAt: (res.shippedAt || ''), staffName: q.entry.staffName || ''});
+        saveJSON(LS.shipIssues, shipIssues);
+        errorBeep();
+        renderShipIssues_();
+        refreshFromBackend(true).then(function(ok){ if(ok) renderDataViews(); });
+      }else{
+        markLogDelivered_(q.entry);
+      }
+      renderShipStatus_();
+      if(document.querySelector('#view-log.active')) renderLog();
+    }
+  } finally {
+    shipFlushing = false;
+  }
+  // 還有沒送出去的：在最早該重試的時間再叫一次
+  if(shipQueue.length){
+    const next = Math.min.apply(null, shipQueue.map(function(x){ return x.nextAt || 0; }));
+    shipFlushTimer = setTimeout(flushShipQueue_, Math.max(500, next - Date.now()));
+  }
+}
+
+function renderShipStatus_(){
+  const chip = document.getElementById('shipQueueChip');
+  if(!chip) return;
+  if(!shipQueue.length){ chip.style.display = 'none'; return; }
+  const stuck = shipQueue.filter(function(x){ return (x.tries || 0) >= SHIP_STUCK_TRIES; });
+  chip.style.display = '';
+  chip.classList.toggle('warn', stuck.length > 0);
+  chip.textContent = stuck.length
+    ? '⚠ ' + shipQueue.length + ' 筆出貨還沒送出'
+    : '⏳ ' + shipQueue.length + ' 筆出貨送出中';
+}
+
+function showShipQueueDetail_(){
+  if(!shipQueue.length) return;
+  const lines = shipQueue.map(function(x){
+    return x.entry.orderNo + (x.tries ? '　已重試 ' + x.tries + ' 次' + (x.lastError ? '（' + x.lastError + '）' : '') : '　送出中');
+  });
+  flash(shipQueue.some(function(x){ return (x.tries||0) >= SHIP_STUCK_TRIES; }) ? 'err' : 'ok',
+    shipQueue.length + ' 筆出貨在背景送出',
+    lines.slice(0, 6).join('\n') + (lines.length > 6 ? '\n…' : '') + '\n資料存在這台裝置上，不會掉；網路恢復會自動送完。不要清除瀏覽器資料。',
+    5000);
+  flushShipQueue_();      // 順便馬上再試一次
+}
+
+function renderShipIssues_(){
+  const box = document.getElementById('shipIssueBanner');
+  if(!box) return;
+  if(!shipIssues.length){ box.style.display = 'none'; box.innerHTML = ''; return; }
+  box.style.display = '';
+  box.innerHTML = shipIssues.map(function(x, i){
+    return '<div class="it"><div>⚠ <b>訂單 ' + escapeHtml(x.orderNo) + '</b> 已經在 ' +
+      escapeHtml(x.shippedAt || '稍早') + ' 被別台裝置完成出貨，<b>你這次（運單 ' + escapeHtml(x.waybill) +
+      '）沒有被記錄</b>。請確認實際寄出的是哪一個運單，多出來的那份要攔下來。</div>' +
+      '<button class="btn gray sm" onclick="dismissShipIssue_(' + i + ')" style="white-space:nowrap;">我知道了</button></div>';
+  }).join('');
+}
+function dismissShipIssue_(i){
+  shipIssues.splice(i, 1);
+  saveJSON(LS.shipIssues, shipIssues);
+  renderShipIssues_();
+}
+
 async function finalizeShipment(waybillOverride){
   if(!current) return;
   // 「完成出貨」按鈕點擊事件會把 MouseEvent 當成第一個參數傳進來，不是字串，
@@ -6052,6 +6226,20 @@ async function finalizeShipment(waybillOverride){
     checkResult,
     differenceDetails
   };
+
+  if(shipOutboxEnabled_()){
+    // 先過、後送：本機立刻當成完成，畫面立刻回到「掃下一張」，資料在背景送。
+    if(orders[entry.orderNo]) orders[entry.orderNo].status = 'shipped';
+    log.unshift(Object.assign({}, entry, {_pending: true}));
+    saveOrdersCache_();
+    saveJSON(LS.log, log);
+    enqueueShipment_(entry);
+    scanSession++; // 這張已經結案，任何還在路上的認領回應都不該再動畫面
+    inputFinalWaybill.value = '';
+    closeScanScreen();
+    renderLog();
+    return;
+  }
 
   document.getElementById('btnConfirm').disabled = true;
   let alreadyShipped = false;
@@ -6113,7 +6301,7 @@ function renderLog(){
     <td>${l.staffId?`${l.staffId} `:''}${l.staffName||''}</td><td>${l.time}</td>
     <td>${l.hadIssue?'<span class="tag danger">有</span>':'<span class="tag">無</span>'}</td>
     <td>${l.hadManualEdit?'<span class="tag warn">有</span>':'<span class="tag">無</span>'}</td>
-    <td>${l.importedExternal?'<span class="tag blue">外部匯入</span>':'<span class="tag">本系統掃描</span>'}</td>
+    <td>${l._pending?'<span class="tag warn">送出中</span>':(l.importedExternal?'<span class="tag blue">外部匯入</span>':'<span class="tag">本系統掃描</span>')}</td>
   </tr>`).join('');
 }
 document.getElementById('btnExportCsv').addEventListener('click', ()=>{
@@ -6941,6 +7129,17 @@ function finishCount(){
   }).catch(function(err){ errorBeep(); flash('err','結束失敗', err.message || '', 3000); });
 }
 
+renderShipStatus_();
+renderShipIssues_();
+if(shipQueue.length) setTimeout(flushShipQueue_, 300);   // 上次沒送完的，開起來就繼續送
+document.getElementById('shipQueueChip').addEventListener('click', showShipQueueDetail_);
+window.addEventListener('online', function(){ flushShipQueue_(); });
+// 還有出貨沒送出去就關頁面：資料其實存在本機、下次開會繼續送，
+// 但如果這台裝置之後不會再開（或要清瀏覽器資料），那幾筆就永遠送不出去了。提醒一下。
+window.addEventListener('beforeunload', function(e){
+  if(!shipQueue.length) return;
+  e.preventDefault(); e.returnValue = '';
+});
 pickQueue = loadJSON(LS.pickQueue, []);
 if(pickQueue.length) schedulePickFlush();   // 上次沒送完的，開起來就繼續送
 // ---- 門市盤點：接回上次沒做完的場次與沒送完的掃描 ----
