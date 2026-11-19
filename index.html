@@ -614,6 +614,20 @@
     </div>
   </div>
 
+  <div class="confirm-mask" id="tbindMask">
+    <div class="confirm-box">
+      <h3>這個條碼是哪一件？</h3>
+      <p class="hint" style="margin-top:0;">條碼 <b id="tbindCode" style="font-family:ui-monospace,monospace;"></b> 還不在國際碼對照表裡。
+        從下面的待驗收清單點出是哪一件（看圖、看品名規格對一下）：這次會算這一件，<b>而且系統會記住</b>，
+        之後出貨、揀貨、盤點掃到這個條碼都認得。</p>
+      <input id="tbindFilter" class="scan-input" type="text" placeholder="打品名或品號縮小範圍" autocomplete="off" style="margin-bottom:8px;">
+      <div class="confirm-list" id="tbindList"></div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn gray" id="tbindCancel">都不是，取消</button>
+      </div>
+    </div>
+  </div>
+
   <div class="confirm-mask" id="findMask">
     <div class="confirm-box">
       <h3>用品號或品名找商品</h3>
@@ -1226,6 +1240,8 @@ const LS = {
   netFails: 'ssz_net_fails', pickQueue: 'ssz_pick_queue',
   // 完成出貨：先過、後送。排隊中的出貨、需要人看的出貨問題、最近一次看到的後端版本
   shipQueue: 'ssz_ship_queue', shipIssues: 'ssz_ship_issues', backendVersion: 'ssz_backend_version',
+  // 現場綁定的條碼（後端「條碼補充」表）的本機副本，斷線時也認得
+  barcodePatch: 'ssz_barcode_patch',
   // 待送出的調撥驗收掃描，跟 pickQueue 同樣道理：關掉分頁/斷線也不會掉，開起來繼續送
   transferQueue: 'ssz_transfer_queue',
   // 上一次拿到的待驗收清單。進調撥頁先畫這份，不用空等一趟網路（見 showTransferCache_）
@@ -2180,6 +2196,57 @@ function toExportCsvUrl(input){
 }
 
 // 讀取條碼對照表（國際碼分頁：條碼,品號,條碼,品名,規格——只用第一個「條碼」欄）
+// 同一個國際碼常有好幾種寫法：UPC-A 12 碼、前面補 0 的 EAN-13、GTIN-14，
+// 以及開頭的 0 被吃掉的 11 碼（11/02 調撥驗收實際掃到過 43619147155）。
+// 建對照表時把每種寫法都放進去，任何一個呼叫點用 barcodeMap[掃到的] 就對得到，
+// 不用每個地方各自處理。跟後端 barcodeVariants_ 是同一套規則。
+function barcodeVariants(code){
+  const c = String(code||'').trim();
+  if(!c) return [];
+  if(!/^\d+$/.test(c)) return [c];
+  const core = c.replace(/^0+/, '');
+  if(!core) return [c];
+  const out = {}; out[c] = 1; out[core] = 1;
+  [12, 13, 14].forEach(function(n){ if(core.length < n) out[('00000000000000' + core).slice(-n)] = 1; });
+  return Object.keys(out);
+}
+function addBarcodeToMap_(map, code, sku, onlyIfNew){
+  barcodeVariants(code).forEach(function(v){
+    if(onlyIfNew && map[v] && map[v].length) return;      // 上游已經有的不蓋
+    if(!map[v]) map[v] = [];
+    if(map[v].indexOf(sku) < 0) map[v].push(sku);
+  });
+}
+// 國際條碼的檢查碼（EAN-8／UPC-A／EAN-13／GTIN-14 都是同一套 mod 10）。
+// 用來分辨「真的是一個條碼」還是「掃到一半、讀錯了」——讀錯的不該拿去綁定。
+function gtinCheckOk(code){
+  const c = String(code||'');
+  if(!/^\d+$/.test(c)) return false;
+  let d = c;
+  if(d.length === 11) d = '0' + d;                  // 開頭 0 被吃掉的 UPC-A
+  if([8, 12, 13, 14].indexOf(d.length) < 0) return false;
+  let sum = 0;
+  for(let i = d.length - 2, k = 0; i >= 0; i--, k++) sum += Number(d[i]) * (k % 2 === 0 ? 3 : 1);
+  return (10 - (sum % 10)) % 10 === Number(d[d.length - 1]);
+}
+// 後端「條碼補充」表合併進來（只補上游沒有的）。先用本機副本，背景再跟後端要最新的。
+let barcodePatchList = loadJSON(LS.barcodePatch, []);
+function mergeBarcodePatch_(){
+  (barcodePatchList || []).forEach(function(x){ if(x && x.code && x.sku) addBarcodeToMap_(barcodeMap, x.code, x.sku, true); });
+}
+async function loadBarcodePatch(){
+  mergeBarcodePatch_();
+  if(!hasBackend()) return;
+  try{
+    const res = await apiPost('getBarcodePatch', {});
+    if(res && res.ok && Array.isArray(res.items)){
+      barcodePatchList = res.items;
+      saveJSON(LS.barcodePatch, barcodePatchList);
+      mergeBarcodePatch_();
+    }
+  }catch(err){ /* 拿不到就用本機副本 */ }
+}
+
 async function loadBarcodeMap(silent){
   const url = toExportCsvUrl(settings.barcodeSheetUrl);
   if(!url){ if(!silent) throw new Error('條碼對照表連結看起來無效'); return false; }
@@ -2202,10 +2269,10 @@ async function loadBarcodeMap(silent){
       const bc = (row[iBarcode]||'').trim();
       const sku = (row[iSku]||'').trim();
       if(!bc || !sku) return;
-      if(!map[bc]) map[bc] = [];
-      if(map[bc].indexOf(sku) < 0) map[bc].push(sku);
+      addBarcodeToMap_(map, bc, sku, false);
     });
     barcodeMap = map;
+    mergeBarcodePatch_();      // 對照表重新載入會整個換掉，現場綁定的要再補回去
     settings.barcodeMapLoadedAt = new Date().toLocaleString('zh-TW');
     saveJSON(LS.settings, settings);
     return true;
@@ -4117,6 +4184,157 @@ function transferRowHtml(it, isDone){
 
 // 找本機清單裡「這個品號還缺件數、且是最早匯入」的那一筆，跟後端 FIFO 邏輯同一套規則。
 // 純粹用來決定「掃到這個條碼時要不要顯示樂觀提示」，真正扣件數還是等後端回應為準。
+// 調撥驗收掃到認不得的條碼。回傳 true 代表已經處理（呼叫端不要再做別的）。
+//
+// 從山物倉、ODM 門市調回來的商品，國際碼很多不在國際碼對照表裡，系統裡也沒有別的資料
+// 能自動補齊。但這一刻有調撥單當依據：候選只有待驗收的那幾十件。所以：
+//   1. 吊牌上的網址 QR 碼：講清楚那不是商品條碼。
+//   2. 對照表認得、但不在這批調撥單上的：講清楚是哪個品號，不要只說「找不到」。
+//   3. 掃到的碼剛好是某一件的品號結尾、或寫在它的規格裡（例如 3222C8809817182488、
+//      規格「8809817182488 軍綠」），而且只對到一件：直接算那件，並記住。
+//   4. 看起來是完整的條碼：跳出待驗收清單請人點是哪一件，這次算那件，並記住。
+//   5. 數字但檢查碼不對：多半是沒掃完整，請再掃一次——讀錯的碼不能拿去綁定。
+function transferHandleUnknown_(raw, staffObj){
+  const code = String(raw||'').trim();
+  if(/:\/\/|^www\./i.test(code)){
+    errorBeep();
+    flash('err', '這是網址 QR 碼，不是商品條碼', '吊牌上常有品牌網址的 QR 碼，請改掃一維條碼（直條紋那個）', 2800);
+    return true;
+  }
+  const known = barcodeMap[code];
+  if(known && known.length){
+    errorBeep();
+    flash('err', '這張調撥單上沒有它', '「' + code + '」是 ' + known.join('、') + '，目前沒有調撥單在等它，或已經收滿了', 3000);
+    transferQueue.push({sku: known[0], staffId: staffObj.id, staffName: staffObj.name,
+      time: new Date().toLocaleString('zh-TW'), localRow: null, raw: code});   // 後端留一筆 no_match 稽核
+    saveJSON(LS.transferQueue, transferQueue); scheduleTransferFlush(); renderTransferLists();
+    return true;
+  }
+  // 掃到的其實是某件商品的「品號」（品號標籤），只是不在這批調撥單上。
+  // 不能拿去問「這是哪一件」——那等於要人把 A 商品的品號記成 B 商品的條碼。
+  if(productImages[code] || specImages[code]){
+    errorBeep();
+    flash('err', '這張調撥單上沒有它', '「' + code + '」是一個品號，目前沒有調撥單在等它，或已經收滿了', 3000);
+    transferQueue.push({sku: code, staffId: staffObj.id, staffName: staffObj.name,
+      time: new Date().toLocaleString('zh-TW'), localRow: null, raw: code});
+    saveJSON(LS.transferQueue, transferQueue); scheduleTransferFlush(); renderTransferLists();
+    return true;
+  }
+  const open = transferPending.filter(function(it){ return it.scannedQty < it.qty; });
+  // 3. 從單子上自動對
+  if(/^\d{8,14}$/.test(code)){
+    const vars = barcodeVariants(code);
+    const hits = {};
+    open.forEach(function(it){
+      const sku = String(it.sku||'');
+      const tokens = String(it.spec||'').split(/[\s,，/|()（）]+/);
+      const hit = vars.some(function(v){ return v.length >= 8 && (sku.slice(-v.length) === v || tokens.indexOf(v) >= 0); });
+      if(hit) hits[it.sku] = it;
+    });
+    const skus = Object.keys(hits);
+    if(skus.length === 1){
+      transferBindAndScan_(code, hits[skus[0]], staffObj, '調撥驗收（品號／規格內含此碼）');
+      return true;
+    }
+  }
+  // 4／5. 請人點是哪一件——只限「通過檢查碼的國際條碼」。
+  // 不是純數字的（多半是別件商品的品號標籤、或店內自編碼）照原本的「找不到」處理。
+  if(!/^\d+$/.test(code)) return false;
+  if(!gtinCheckOk(code)){
+    if([8, 11, 12, 13, 14].indexOf(code.length) < 0) return false;   // 長度就不像國際條碼，照原本處理
+    errorBeep();
+    flash('err', '條碼可能沒掃完整', '「' + code + '」讀起來不像完整的國際條碼（可能沒掃完整，或是不在清單上的品號），請再掃一次', 2800);
+    return true;
+  }
+  if(!open.length) return false;              // 沒有待驗收的可以選，照原本的「找不到」處理
+  openTransferBind_(code, staffObj);
+  return true;
+}
+
+let tbindCtx = null;
+function openTransferBind_(code, staffObj){
+  tbindCtx = {code: code, staffObj: staffObj};
+  okBeep();     // 不是錯誤，是「請幫忙認一下」——不要讓人以為掃壞了
+  document.getElementById('tbindCode').textContent = code;
+  document.getElementById('tbindFilter').value = '';
+  renderTransferBindList_();
+  document.getElementById('tbindMask').classList.add('show');
+  setTimeout(function(){ document.getElementById('tbindFilter').focus(); }, 60);
+}
+function renderTransferBindList_(){
+  const q = String(document.getElementById('tbindFilter').value || '').trim().toLowerCase();
+  const open = transferPending.filter(function(it){ return it.scannedQty < it.qty; })
+    .filter(function(it){
+      if(!q) return true;
+      return (String(it.sku) + ' ' + (it.baseName||'') + ' ' + (it.spec||'')).toLowerCase().indexOf(q) >= 0;
+    });
+  const box = document.getElementById('tbindList');
+  if(!open.length){
+    box.innerHTML = '<p class="hint" style="padding:12px;margin:0;">' + (q ? '沒有符合的待驗收品項。' : '目前沒有待驗收的品項。') + '</p>';
+    return;
+  }
+  box.innerHTML = open.map(function(it){
+    return '<div class="q-item pickable" data-row="' + it.row + '">' + thumbHtml(it.sku, it.baseName) +
+      '<div class="t"><b>' + escapeHtml(it.sku) + '</b><div>' + escapeHtml(it.baseName || '') + '</div>' +
+      (it.spec ? '<div style="color:var(--muted);">' + escapeHtml(it.spec) + '</div>' : '') + '</div>' +
+      '<div class="st">還差 ' + (it.qty - it.scannedQty) + '</div></div>';
+  }).join('');
+}
+function closeTransferBind_(){
+  document.getElementById('tbindMask').classList.remove('show');
+  tbindCtx = null;
+  setTimeout(function(){ const el = document.getElementById('transferScanInput'); if(el) el.focus(); }, 60);
+}
+async function pickTransferBind_(row){
+  if(!tbindCtx) return;
+  const it = transferPending.find(function(x){ return x.row === row; });
+  if(!it) return;
+  // 確認框跟這個視窗是同一種遮罩，疊在一起時誰在上面看頁面順序——先收起來比較保險
+  document.getElementById('tbindMask').classList.remove('show');
+  const ok = await confirmWithImage({
+    title: '把這個條碼記成這一件？',
+    lines: [
+      {text: '條碼 ' + tbindCtx.code, strong: true},
+      {text: it.sku + '　' + (it.baseName || '')},
+      {text: it.spec || ''}
+    ],
+    warn: '記住之後，出貨掃描掃到這個條碼也會當成這一件。記錯的話會讓出錯的貨通過核對——不確定就按取消，寧可這件手動確認。',
+    okText: '對，就是這件',
+    hideCancel: false,
+    sku: it.sku
+  });
+  if(!ok){ if(tbindCtx) document.getElementById('tbindMask').classList.add('show'); return; }
+  const ctx = tbindCtx;
+  closeTransferBind_();
+  transferBindAndScan_(ctx.code, it, ctx.staffObj, '調撥驗收（人工指認）');
+}
+
+// 記住這個條碼，並把這次掃描算進這一件。
+// 本機先記上（馬上認得），後端記不進去（例如別人剛把這個碼記成別的品號）就撤回並說明。
+function transferBindAndScan_(code, item, staffObj, source){
+  addBarcodeToMap_(barcodeMap, code, item.sku, true);
+  barcodePatchList.push({code: code, sku: item.sku});
+  saveJSON(LS.barcodePatch, barcodePatchList);
+  transferScan(item.sku);
+  flash('ok', '已記住這個條碼', code + ' → ' + item.sku + '　之後掃到都認得', 2200);
+  if(!hasBackend()) return;
+  apiPost('bindBarcode', {code: code, sku: item.sku, name: item.baseName || '',
+    staffId: staffObj ? staffObj.id : '', staffName: staffObj ? staffObj.name : '', source: source})
+    .then(function(res){
+      if(res && res.ok) return;
+      // 後端不收：本機那一筆撤回，下次掃到會照實際狀況處理
+      barcodePatchList = barcodePatchList.filter(function(x){ return !(x.code === code && x.sku === item.sku); });
+      saveJSON(LS.barcodePatch, barcodePatchList);
+      barcodeVariants(code).forEach(function(v){
+        if(barcodeMap[v]) barcodeMap[v] = barcodeMap[v].filter(function(s){ return s !== item.sku; });
+        if(barcodeMap[v] && !barcodeMap[v].length) delete barcodeMap[v];
+      });
+      errorBeep();
+      flash('err', '這個條碼沒有記住', (res && res.error) || '後端拒絕', 4000);
+    })
+    .catch(function(){ /* 送不出去：本機副本還在，下次開頁面跟後端同步時會再拿到最新的 */ });
+}
+
 function transferFindLocalRow(sku){
   let best = null;
   transferPending.forEach(function(it){
@@ -4172,6 +4390,10 @@ function transferScan(code){
     transferLastRow[target] = local.row.row;
     transferBumpLocal_(local.row, 1);
     flash('ok', local.row.baseName || target, '已掃 ' + local.row.scannedQty + ' / ' + local.row.qty, 1400);
+  }else if(transferConfirmedAt && !transferLoading && transferHandleUnknown_(raw, staffObj)){
+    // 認不得的條碼交給 transferHandleUnknown_：從單子上自動對、或請人點是哪一件。
+    // 那邊會自己決定要不要再呼叫 transferScan，這一次掃描到此為止。
+    return;
   }else if(!transferConfirmedAt || transferLoading){
     // 清單還沒跟後端確認過（畫面上是本機上次存的、或正在更新）。本機查不到不代表
     // 真的沒有——可能是剛匯入的新調撥單。這時候先不響錯誤，送出去等後端判定，
@@ -7315,6 +7537,13 @@ document.getElementById('sibCancel').addEventListener('click', function(){ close
 wireScanInput(document.getElementById('qScanInput'), qScanLoc);
 wireScanInput(document.getElementById('rScanInput'), rScanLoc);
 wireScanInput(document.getElementById('cScanInput'), cScanLoc);
+document.getElementById('tbindFilter').addEventListener('input', renderTransferBindList_);
+document.getElementById('tbindCancel').addEventListener('click', closeTransferBind_);
+document.getElementById('tbindList').addEventListener('click', function(e){
+  if(e.target.closest('img')) return;               // 點圖是看大圖
+  const row = e.target.closest('.q-item[data-row]');
+  if(row) pickTransferBind_(Number(row.dataset.row));
+});
 document.getElementById('btnQrGen').addEventListener('click', openQrGen);
 document.getElementById('qrZone').addEventListener('change', qrFillSlots);
 document.getElementById('qrAddGrid').addEventListener('click', qrAddGrid);
@@ -7416,9 +7645,11 @@ if(hasBackend()){
 } else {
   setConnStatus('', '單機模式');
 }
+mergeBarcodePatch_();          // 對照表還沒載完之前，至少現場綁定過的先認得
 if(settings.barcodeSheetUrl){
   loadBarcodeMap(true).then(()=>renderBarcodeMapStatus());
 }
+loadBarcodePatch();
 // 圖片對照表1MB左右，載入時不擋畫面：沒載完之前縮圖顯示「無圖」，載完再重畫一次。
 // 揀貨/掃描本來就不依賴圖片，圖只是輔助確認，所以慢一點到沒關係，但不能拖慢開啟速度。
 if(settings.productImageSheetUrl){
