@@ -135,6 +135,28 @@ const path = require('path');
   r = await pg2.evaluate(() => (barcodeMap['4943161421986']||[]).join());
   ck('開頁面就認得（本機副本）', r === '3020MB1150104', r);
 
+  console.log('\n【後端還沒部署】綁定送不到，部署後同步時自動補送');
+  await pg.evaluate(() => {
+    window.__srv.down = true;
+    const orig = window.rawApiPost;
+    window.rawApiPost = async (a, p) => { if(window.__srv.down && (a === 'bindBarcode' || a === 'getBarcodePatch')) throw new Error('後端還沒更新到支援這個功能的版本'); return orig(a, p); };
+    window.__srv.items.push({row:9, batchId:'B2', sku:'NEW-ODM', baseName:'ODM 門市商品', spec:'', qty:1, scannedQty:0, importedAt:'2026/11/19 09:00'});
+  });
+  await pg.evaluate(() => loadTransferPending());
+  await pg.waitForFunction(() => transferPending.some(x => x.sku === 'NEW-ODM'));
+  await pg.evaluate(() => { window.__beeps = []; transferScan('4548801148102'); });
+  await pg.locator('#tbindList .q-item', {hasText: 'ODM'}).click();
+  await pg.waitForSelector('#confirmMask.show');
+  await pg.click('#confirmOk');
+  await pg.waitForTimeout(300);
+  r = await pg.evaluate(() => ({ pend: barcodePatchList.filter(x => x.pending).map(x => x.code), srv: window.__srv.patch.map(x => x.code) }));
+  ck('送不到：這次照樣算件數，本機標成待送', (await scanned('NEW-ODM')) === 1 && r.pend.indexOf('4548801148102') >= 0 && r.srv.indexOf('4548801148102') < 0, r);
+  await pg.evaluate(() => { window.__srv.down = false; return loadBarcodePatch(); });
+  await pg.waitForFunction(() => window.__srv.patch.some(x => x.code === '4548801148102'), null, {timeout: 3000});
+  r = await pg.evaluate(() => ({ pend: barcodePatchList.filter(x => x.pending).length, note: window.__srv.binds.filter(x => x.code === '4548801148102').pop().note }));
+  ck('部署後同步時自動補送到後端', r.pend === 0, r);
+  ck('補送的那筆有註明是補送', /補送/.test(r.note), r);
+
   ck('全程沒有 JS 錯誤', errs.length === 0, errs);
   await b.close();
   console.log(fail ? '\n有 '+fail+' 項失敗' : '\n介面全部通過');

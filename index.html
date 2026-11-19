@@ -2240,11 +2240,32 @@ async function loadBarcodePatch(){
   try{
     const res = await apiPost('getBarcodePatch', {});
     if(res && res.ok && Array.isArray(res.items)){
-      barcodePatchList = res.items;
+      // 本機綁了、但當時沒送到後端的（斷線、或後端還沒部署到支援這個功能的版本）：
+      // 留著，並在這裡補送。不留的話會被後端那份蓋掉，現場教過的就白教了。
+      const pending = (barcodePatchList || []).filter(function(x){ return x && x.pending; });
+      barcodePatchList = res.items.concat(pending.filter(function(p){
+        return !res.items.some(function(x){ return x.code === p.code; });
+      }));
       saveJSON(LS.barcodePatch, barcodePatchList);
       mergeBarcodePatch_();
+      pending.forEach(function(p){ resendBarcodeBind_(p); });
     }
   }catch(err){ /* 拿不到就用本機副本 */ }
+}
+function resendBarcodeBind_(p){
+  apiPost('bindBarcode', {code: p.code, sku: p.sku, name: p.name || '', staffId: p.staffId || '',
+    staffName: p.staffName || '', source: p.source || '', note: '補送（當時沒送到後端）'})
+    .then(function(res){
+      const it = barcodePatchList.find(function(x){ return x.code === p.code && x.sku === p.sku; });
+      if(res && res.ok){ if(it) delete it.pending; }
+      else {
+        // 後端不收（例如期間別人把它記成別的品號）：以後端為準，拿掉本機這筆
+        barcodePatchList = barcodePatchList.filter(function(x){ return !(x.code === p.code && x.sku === p.sku); });
+        flash('err', '有一個先前記住的條碼沒有被系統接受', p.code + '：' + ((res && res.error) || ''), 4000);
+      }
+      saveJSON(LS.barcodePatch, barcodePatchList);
+    })
+    .catch(function(){ /* 還是送不出去，下次同步再試 */ });
 }
 
 async function loadBarcodeMap(silent){
@@ -4313,7 +4334,10 @@ async function pickTransferBind_(row){
 // 本機先記上（馬上認得），後端記不進去（例如別人剛把這個碼記成別的品號）就撤回並說明。
 function transferBindAndScan_(code, item, staffObj, source){
   addBarcodeToMap_(barcodeMap, code, item.sku, true);
-  barcodePatchList.push({code: code, sku: item.sku});
+  // 先標成「待送」，後端確認收下才拿掉；送不到的下次同步時補送（見 loadBarcodePatch）
+  const rec = {code: code, sku: item.sku, name: item.baseName || '', pending: true, source: source,
+               staffId: staffObj ? staffObj.id : '', staffName: staffObj ? staffObj.name : ''};
+  barcodePatchList.push(rec);
   saveJSON(LS.barcodePatch, barcodePatchList);
   transferScan(item.sku);
   flash('ok', '已記住這個條碼', code + ' → ' + item.sku + '　之後掃到都認得', 2200);
@@ -4321,7 +4345,7 @@ function transferBindAndScan_(code, item, staffObj, source){
   apiPost('bindBarcode', {code: code, sku: item.sku, name: item.baseName || '',
     staffId: staffObj ? staffObj.id : '', staffName: staffObj ? staffObj.name : '', source: source})
     .then(function(res){
-      if(res && res.ok) return;
+      if(res && res.ok){ delete rec.pending; saveJSON(LS.barcodePatch, barcodePatchList); return; }
       // 後端不收：本機那一筆撤回，下次掃到會照實際狀況處理
       barcodePatchList = barcodePatchList.filter(function(x){ return !(x.code === code && x.sku === item.sku); });
       saveJSON(LS.barcodePatch, barcodePatchList);
