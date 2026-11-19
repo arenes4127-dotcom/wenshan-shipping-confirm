@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-17.217';
+const BACKEND_VERSION = '2026-11-19.218';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -145,7 +145,7 @@ function doGet(e){
 const NO_LOCK_ACTIONS = {
   lookupLocation: 1, lookupLocations: 1, getLocationVocab: 1, findSiblingSkus: 1,
   listLocationContents: 1, getShopeePriceInfo: 1, getTransferPending: 1, __versioncheck__: 1,
-  getCountSession: 1, listCountSessions: 1, searchLocations: 1
+  getCountSession: 1, listCountSessions: 1, searchLocations: 1, getBarcodePatch: 1
 };
 
 // ---------------- 寫入鎖 ----------------
@@ -167,6 +167,8 @@ const NO_LOCK_ACTIONS = {
 // 旗標放模組層級是安全的：Apps Script 每次執行都是全新的全域作用域
 // （跟 _ssMemo_ / _headerOk_ 同樣道理），不會殘留到下一次請求。
 let _scriptLockHeld_ = false;
+// 放鎖之後才做的事（見 runAfterLock_）
+let _afterLockTasks_ = [];
 // 鎖裡的工作可以在這裡留一句「我的時間花在哪幾段」，withScriptLock_ 只有在真的慢的時候
 // 才會把它跟著寫進「系統紀錄」。平常不產生任何成本。
 let _lockNote_ = '';
@@ -189,6 +191,18 @@ const USER_LOCK_WAIT_MS = 25000;
 // syncLogisticsConfirm_、closeBasketConfirmedPending_、syncSpecialNotes_），
 // 每件都要讀外部表。但這題我已經猜錯三次了，不再憑嫌疑動手，先量出來。
 const LOCK_SLOW_MS = 8000;
+
+// 排一件「放鎖之後才做」的事。現在沒拿著鎖就直接做。
+//
+// 為什麼需要：調撥驗收每送一批掃描，就順便把資料鏡射到「文山出貨 工作區」（開外部
+// 試算表、讀整張驗收紀錄、寫上千格），每 8 秒一次，而且是在寫入鎖裡做。驗收時每
+// 1.2 秒送一批，等於一路都佔著鎖；人一轉去出貨，「完成出貨」就得排在它後面——
+// 現場說的「驗收完調撥接著出貨會明顯延遲」。
+// 鏡射寫的是另一份試算表，跟我們自己的表沒有搶寫的問題，不需要擋住別人。
+function runAfterLock_(fn){
+  if(_scriptLockHeld_){ _afterLockTasks_.push(fn); return; }
+  try{ fn(); }catch(err){}
+}
 
 function withScriptLock_(label, fn, waitMs){
   if(_scriptLockHeld_) return fn();          // 本次執行已經持有，直接跑
@@ -224,6 +238,9 @@ function withScriptLock_(label, fn, waitMs){
           + (_lockNote_ ? '　｜' + _lockNote_ : ''));
       }catch(err){ /* 診斷寫不進去就算了 */ }
     }
+    // 鎖已經放掉了，別人可以進來了——這時候才做那些「要做、但不需要佔著鎖做」的事。
+    const tasks = _afterLockTasks_; _afterLockTasks_ = [];
+    tasks.forEach(function(fn){ try{ fn(); }catch(err){ /* 鎖外的附帶工作失敗不影響主結果 */ } });
   }
 }
 
@@ -253,6 +270,8 @@ function doPost(e){
       case 'getLocationVocab': result = getLocationVocab(body); break;
       case 'findSiblingSkus': result = findSiblingSkus(body); break;
       case 'searchLocations': result = searchLocations(body); break;
+      case 'getBarcodePatch': result = getBarcodePatch(); break;
+      case 'bindBarcode': result = bindBarcode(body); break;
       case 'listLocationContents': result = listLocationContents(body); break;
       case 'getShopeePriceInfo': result = getShopeePriceInfo_(body); break;
       case 'getTransferPending': result = getTransferPending(); break;
@@ -4313,7 +4332,7 @@ function scanTransferBatch(ops){
     TRANSFER_HEADER.forEach(function(h, idx){ o[h] = r[idx]; });
     return o;
   });
-  try{ mirrorTransferToWorkspaceDebounced_(mirrorRows); }catch(err){}
+  runAfterLock_(function(){ mirrorTransferToWorkspaceDebounced_(mirrorRows); });
   return {ok:true, results: results};
 }
 
@@ -4339,7 +4358,7 @@ function closeTransferItem(body){
   getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER).appendRow([now,
     v[colOf(TRANSFER_HEADER, 'batchId') - 1], sku, v[colOf(TRANSFER_HEADER, 'baseName') - 1],
     staffId, staffName, 'cancelled', reason]);
-  try{ mirrorTransferToWorkspaceDebounced_(); }catch(err){}
+  runAfterLock_(function(){ mirrorTransferToWorkspaceDebounced_(); });
   return {ok:true, row: row, sku: sku};
 }
 
@@ -9784,6 +9803,83 @@ function testShopeeUpdateStage_(){
 // LOC_SYNC_STOCK_COLS=[9,10]（I、J）正好可以互相驗證對照沒算錯。
 // 上游「國際碼對照表」還沒收進去的品號，品名補在這張。詳見 namePatchMap_。
 const SHEET_NAME_PATCH = '品名補充';
+
+// ---------------- 條碼補充（現場教一次就記住） ----------------
+// 從山物倉、ODM 門市調回來的商品，很多國際碼不在「國際碼對照表」裡（11/19 查過：
+// 那幾個掃不到的碼只出現在廠商的訂貨檔裡，ERP 庫存匯出檔與調撥單也都沒有國際碼欄位）。
+// 系統裡沒有任何一份資料能自動補齊，所以改成：驗收時認不得，讓驗收人從待驗收清單
+// 點出是哪一件——那一刻有調撥單當依據，候選只有幾十件，人一看就知道——然後記在這張表。
+// 之後出貨、揀貨、盤點、儲位、查價都認得。
+//
+// 這張表跟「品名補充」同一個原則：上游優先。國際碼對照表裡已經有的條碼不會被這裡蓋掉，
+// 等上游補齊了，這裡那一筆就自動不起作用。記錯了直接刪那一列即可。
+const SHEET_BARCODE_PATCH = '條碼補充';
+const BARCODE_PATCH_HEADER = ['條碼', '品號', '品名', '綁定人', '綁定時間', '來源', '備註'];
+
+// 同一個國際碼常有好幾種寫法：UPC-A 12 碼、前面補 0 的 EAN-13、GTIN-14，
+// 以及掃描槍或試算表把開頭的 0 吃掉後的 11 碼（11/02 實際掃到過 43619147155）。
+// 全部展開成同一組，任何一種寫法都對得到。不是純數字的照原樣。
+function barcodeVariants_(code){
+  const c = String(code||'').trim();
+  if(!c) return [];
+  if(!/^\d+$/.test(c)) return [c];
+  const core = c.replace(/^0+/, '');
+  if(!core) return [c];
+  const out = {}; out[c] = 1; out[core] = 1;
+  [12, 13, 14].forEach(function(n){ if(core.length < n) out[('00000000000000' + core).slice(-n)] = 1; });
+  return Object.keys(out);
+}
+
+function barcodePatchRows_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_BARCODE_PATCH);
+  if(!sh) return [];
+  const last = sh.getLastRow();
+  if(last < 2) return [];
+  return sh.getRange(2, 1, last - 1, 3).getValues().map(function(r){
+    return {code: String(r[0]||'').trim(), sku: String(r[1]||'').trim(), name: String(r[2]||'').trim()};
+  }).filter(function(x){ return x.code && x.sku; });
+}
+
+// 給前端：條碼補充表的全部內容（不拿鎖）。前端合併進自己的條碼對照。
+function getBarcodePatch(){
+  return {ok:true, items: barcodePatchRows_().map(function(x){ return {code: x.code, sku: x.sku}; })};
+}
+
+// 現場綁定一個條碼到品號。
+// 擋三種情況：條碼看起來不像條碼、上游已經把它對到別的品號（不能蓋）、補充表裡已經
+// 對到別的品號（要人先去表裡確認哪個對，不能悄悄改掉）。
+function bindBarcode(body){
+  const code = String((body && body.code) || '').trim();
+  const sku = String((body && body.sku) || '').trim();
+  const who = String((body && body.staffName) || (body && body.staffId) || '').trim();
+  if(!code || !sku) return {ok:false, error:'缺少條碼或品號'};
+  if(/\s/.test(code) || code.length > 40 || /:\/\//.test(code)) return {ok:false, error:'這看起來不是商品條碼：' + code};
+  const vars = barcodeVariants_(code);
+  // 上游（國際碼對照表）
+  const up = barcodeToSkuMap_({skipPatch: true});
+  for(let i = 0; i < vars.length; i++){
+    const hit = up[vars[i]];
+    // 包含「掃到的其實是另一件商品的品號」：那也不能拿來當這件的條碼
+    if(hit && hit.sku && hit.sku !== sku){
+      return {ok:false, reason:'conflict', existing: hit.sku, error:'這個條碼在國際碼對照表裡已經是 ' + hit.sku};
+    }
+    if(hit && hit.sku === sku) return {ok:true, duplicate:true};
+  }
+  const rows = barcodePatchRows_();
+  for(let i = 0; i < rows.length; i++){
+    if(vars.indexOf(rows[i].code) < 0) continue;
+    if(rows[i].sku === sku) return {ok:true, duplicate:true};
+    return {ok:false, reason:'conflict', existing: rows[i].sku,
+            error:'「條碼補充」表裡這個條碼已經記成 ' + rows[i].sku + '，請先到表裡確認哪一個才對'};
+  }
+  const sh = getSheet(SHEET_BARCODE_PATCH, BARCODE_PATCH_HEADER);
+  const start = sh.getLastRow() + 1;
+  sh.getRange(start, 1, 1, 2).setNumberFormat('@');     // 條碼、品號一律文字，開頭的 0 才不會被吃掉
+  sh.getRange(start, 1, 1, BARCODE_PATCH_HEADER.length).setValues([[
+    code, sku, String((body && body.name) || '').trim(), who, nowStamp_(),
+    String((body && body.source) || '').trim(), String((body && body.note) || '').trim()]]);
+  return {ok:true, code: code, sku: sku};
+}
 const NAME_PATCH_HEADER = ['品號','品名','規格','備註'];
 
 const SHEET_COUNT_SESSION = '盤點場次';
@@ -9953,7 +10049,7 @@ function namePatchMap_(){
   return map;
 }
 
-function barcodeToSkuMap_(){
+function barcodeToSkuMap_(opts){
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('條碼轉品號');
   const map = {};
   if(!sh) return map;
@@ -9964,9 +10060,18 @@ function barcodeToSkuMap_(){
     const sku  = String(r[0]||'').trim();
     const code = String(r[1]||'').trim();
     const name = String(r[2]||'').trim();
-    if(code && !map[code]) map[code] = {sku: sku, name: name};
+    // 條碼的各種寫法（11／12／13／14 碼）都收，掃到哪一種都對得到
+    barcodeVariants_(code).forEach(function(v){ if(!map[v]) map[v] = {sku: sku, name: name}; });
     if(sku  && !map[sku])  map[sku]  = {sku: sku, name: name};
   });
+  // 現場綁定的條碼（條碼補充表）。上游優先：已經有的不蓋。
+  if(!(opts && opts.skipPatch)){
+    try{
+      barcodePatchRows_().forEach(function(x){
+        barcodeVariants_(x.code).forEach(function(v){ if(!map[v]) map[v] = {sku: x.sku, name: x.name}; });
+      });
+    }catch(err){ /* 補充表讀不到不能拖垮主流程 */ }
+  }
   // 補充表只補鏡像沒有的。上游永遠優先——等「國際碼對照表」補齊了，
   // 這裡的補充就自動退場，不會變成兩個版本的品名在打架。
   try{
