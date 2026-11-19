@@ -1,7 +1,16 @@
 // 調撥驗收：國際碼辨識、現場綁定 的介面測試
 // 用法：node tests/transfer_barcode_ui.js
 const { chromium } = require('playwright');
-const path = require('path');
+const path = require('path'), fs = require('fs'), http = require('http');
+// 用本機 http 伺服器開頁面，不用 file://。Chromium 對 file:// 的 localStorage 在不同分頁間
+// 不保證共用（實測 14 次有 4 次第二頁拿到空的），而這支測試正好要驗「重新開頁面後本機資料還在」。
+const _root = path.resolve('.');
+const _srv = http.createServer((q, r) => {
+  const f = path.join(_root, decodeURIComponent(q.url.split('?')[0]).replace(/^\/+/, '') || 'index.html');
+  fs.readFile(f, (e, d) => { if(e){ r.writeHead(404); r.end(); return; }
+    r.writeHead(200, {'Content-Type': f.endsWith('.js') ? 'text/javascript' : 'text/html; charset=utf-8'}); r.end(d); });
+}).listen(0);
+const PAGE_URL = () => 'http://127.0.0.1:' + _srv.address().port + '/index.html';
 (async () => {
   const b = await chromium.launch();
   const _PROD = /script\.google\.com|script\.googleusercontent\.com|docs\.google\.com/;
@@ -13,7 +22,7 @@ const path = require('path');
   let fail = 0;
   const ck = (id, cond, extra) => { if(!cond){ console.log('  FAIL', id, extra===undefined?'':JSON.stringify(extra)); fail++; } else console.log('  ok  ', id); };
   await pg.addInitScript(() => localStorage.setItem('ssz_settings', JSON.stringify({backendUrl:'https://example.invalid/exec', store:'odm_shilin'})));
-  await pg.goto('file://' + path.resolve('index.html'));
+  await pg.goto(PAGE_URL());
 
   await pg.evaluate(() => {
     const S = window.__srv = { items: [
@@ -131,7 +140,7 @@ const path = require('path');
   pg2.on('pageerror', e => errs.push(String(e)));
   await pg2.addInitScript(() => localStorage.setItem('ssz_settings', JSON.stringify({backendUrl:'https://example.invalid/exec', store:'odm_shilin'})));
   // 同一個瀏覽器 context 的 localStorage 是共用的：本機副本在
-  await pg2.goto('file://' + path.resolve('index.html'));
+  await pg2.goto(PAGE_URL());
   r = await pg2.evaluate(() => (barcodeMap['4943161421986']||[]).join());
   ck('開頁面就認得（本機副本）', r === '3020MB1150104', r);
 
@@ -158,7 +167,7 @@ const path = require('path');
   ck('補送的那筆有註明是補送', /補送/.test(r.note), r);
 
   ck('全程沒有 JS 錯誤', errs.length === 0, errs);
-  await b.close();
+  await b.close(); _srv.close();
   console.log(fail ? '\n有 '+fail+' 項失敗' : '\n介面全部通過');
   process.exit(fail?1:0);
 })();

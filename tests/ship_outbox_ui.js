@@ -5,7 +5,16 @@
 // 走真的流程：掃訂單號 → 掃商品 → 掃運單 → 完成出貨。後端換成可以控制的假後端：
 // 可以讓它慢、讓它逾時（但其實已寫入）、讓它回「已經被別人出掉了」。
 const { chromium } = require('playwright');
-const path = require('path');
+const path = require('path'), fs = require('fs'), http = require('http');
+// 用本機 http 伺服器開頁面，不用 file://。Chromium 對 file:// 的 localStorage 在不同分頁間
+// 不保證共用（實測 14 次有 4 次第二頁拿到空的），而這支測試正好要驗「重新開頁面後本機資料還在」。
+const _root = path.resolve('.');
+const _srv = http.createServer((q, r) => {
+  const f = path.join(_root, decodeURIComponent(q.url.split('?')[0]).replace(/^\/+/, '') || 'index.html');
+  fs.readFile(f, (e, d) => { if(e){ r.writeHead(404); r.end(); return; }
+    r.writeHead(200, {'Content-Type': f.endsWith('.js') ? 'text/javascript' : 'text/html; charset=utf-8'}); r.end(d); });
+}).listen(0);
+const PAGE_URL = () => 'http://127.0.0.1:' + _srv.address().port + '/index.html';
 (async () => {
   const b = await chromium.launch();
   const _PROD = /script\.google\.com|script\.googleusercontent\.com|docs\.google\.com/;
@@ -23,7 +32,7 @@ const path = require('path');
       localStorage.setItem('ssz_current_staff', 'S06');
       if(v) localStorage.setItem('ssz_backend_version', JSON.stringify(v));
     }, version);
-    await pg.goto('file://' + path.resolve('index.html'));
+    await pg.goto(PAGE_URL());
     await pg.evaluate(() => {
       // 假後端。srv 在 localStorage 外面的記憶體裡，模擬「後端那邊的真相」
       const S = window.__srv = { shipped: {}, logRows: [], mode: 'ok', delayMs: 0, calls: [] };
@@ -172,7 +181,7 @@ const path = require('path');
   ck('照舊等後端寫完才回來（' + ms + ' ms）', ms >= 1400 && r.q === 0 && r.srv === 1, {ms, r});
 
   ck('全程沒有 JS 錯誤', errs.length === 0, errs);
-  await b.close();
+  await b.close(); _srv.close();
   console.log(fail ? '\n有 '+fail+' 項失敗' : '\n介面全部通過');
   process.exit(fail?1:0);
 })();
