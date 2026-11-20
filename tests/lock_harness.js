@@ -78,6 +78,7 @@ vm.createContext(sandbox);
 const src = fs.readFileSync(process.argv[2],'utf8')
   + "\n;globalThis.__x = {ORDERS_HEADER, HEADER_LABELS, SHEET_ORDERS, MIRROR_ORDER_SHEET_NAME, statusToText,"
   + " STALE_CLAIM_MINUTES, releaseStaleClaims_, hasStaleClaimCandidate_, hourlySync_, autoSyncOrders_,"
+  + " mirrorTransferScheduled_, runUnlockedStep_,"
   + " mergeOrders, readOrderRows, withScriptLock_, finalizeShipment, diagnoseLockHolds,"
   + " SHEET_SYSLOG, SYSLOG_HEADER, SHEET_LOG, LOG_HEADER, LOCK_SLOW_MS};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
@@ -130,9 +131,12 @@ ck('寫入都發生在鎖裡', EVENTS.filter(e=>e.t==='write' && e.sheet===X.SHE
    EVENTS.filter(e=>e.t==='write'));
 ck('放鎖之前有 flush', LOCK.flushWhileHeld >= 1, LOCK.flushWhileHeld);
 
-console.log('\n【每小時同步】四件事各拿各的鎖，中間要讓出來');
+console.log('\n【每小時同步】native 不佔鎖；物流籃先在鎖外讀；其餘各拿各的鎖');
 const calls = [];
-function spy(name, opts){ return function(){ calls.push({name, held: LOCK.held}); if(opts && opts.boom) throw new Error('故意失敗'); return name; }; }
+function spy(name, opts){ return function(){ calls.push({name, held: LOCK.held, args: Array.prototype.slice.call(arguments)}); if(opts && opts.boom) throw new Error('故意失敗'); return name; }; }
+const LOGI = {L1:'上午 10:00:00'};
+const logiReads = [];
+sandbox.readLogisticsScans_ = function(){ logiReads.push({held: LOCK.held}); return LOGI; };
 sandbox.syncNativeOrderSheet_ = spy('native');
 sandbox.syncLogisticsConfirm_ = spy('logistics');
 sandbox.closeBasketConfirmedPending_ = spy('closeBasket');
@@ -140,11 +144,37 @@ sandbox.syncSpecialNotes_ = spy('notes');
 reset(); calls.length = 0;
 X.hourlySync_();
 ck('四件都做了、順序沒變', calls.map(c=>c.name).join(',') === 'native,logistics,closeBasket,notes', calls);
-ck('每一件都在鎖裡做', calls.every(c=>c.held), calls);
-ck('鎖拿了 4 次（不是 1 次佔到底）', LOCK.acquires === 4, LOCK.acquires);
+ck('native 沒有佔鎖', calls[0].held === false, calls[0]);
+ck('其餘三件都在鎖裡做', calls.slice(1).every(c=>c.held), calls);
+ck('物流籃來源在鎖外讀、只讀一次', logiReads.length === 1 && logiReads[0].held === false, logiReads);
+ck('鎖裡的物流籃那步拿到的是鎖外讀好的那份', calls[1].args[0] === LOGI, calls[1].args);
+ck('鎖拿了 3 次', LOCK.acquires === 3, LOCK.acquires);
 const seq = EVENTS.filter(e=>['lock','unlock','sleep'].indexOf(e.t)>=0).map(e=>e.t).join(' ');
-ck('件與件之間：放鎖 → 停一下 → 再拿', seq === 'lock unlock sleep lock unlock sleep lock unlock sleep lock unlock', seq);
+ck('件與件之間：放鎖 → 停一下 → 再拿（不佔鎖的步驟後面不用停）', seq === 'lock unlock sleep lock unlock sleep lock unlock', seq);
 ck('停的那一下鎖是放開的', EVENTS.filter(e=>e.t==='sleep').every(e=>e.held===false));
+ck('跑完沒有留下「正在做」的旗標', !Object.keys(CACHE).some(k=>k.indexOf('bgStepRunning:')===0), Object.keys(CACHE));
+
+console.log('\n【不佔鎖的步驟】另一支排程正在做同一件事就跳過');
+CACHE['bgStepRunning:native'] = '1';
+reset(); calls.length = 0;
+X.hourlySync_();
+ck('native 被跳過，其餘照做', calls.map(c=>c.name).join(',') === 'logistics,closeBasket,notes', calls);
+ck('別人的旗標沒被我們清掉', CACHE['bgStepRunning:native'] === '1');
+delete CACHE['bgStepRunning:native'];
+sandbox.readLogisticsScans_ = function(){ throw new Error('外部檔打不開'); };
+reset(); calls.length = 0;
+X.hourlySync_();
+ck('鎖外讀物流籃失敗：鎖裡那步改成自己讀（不傳參數）', calls[1].name === 'logistics' && calls[1].args[0] === undefined, calls[1]);
+sandbox.readLogisticsScans_ = function(){ logiReads.push({held: LOCK.held}); return LOGI; };
+
+console.log('\n【調撥鏡射排程】不佔鎖');
+const mirrorCalls = [];
+sandbox.mirrorTransferToWorkspace_ = function(rows){ mirrorCalls.push({held: LOCK.held, rows}); return {ok:true}; };
+reset();
+X.mirrorTransferScheduled_();
+ck('有鏡射', mirrorCalls.length === 1, mirrorCalls);
+ck('鏡射時沒有佔鎖', mirrorCalls[0] && mirrorCalls[0].held === false, mirrorCalls);
+ck('整段沒有拿鎖', LOCK.acquires === 0, LOCK.acquires);
 
 console.log('\n【每小時同步】其中一件出錯，後面的還是要做');
 sandbox.syncLogisticsConfirm_ = spy('logistics', {boom:true});
@@ -174,7 +204,7 @@ const mirrorReads = EVENTS.filter(e=>e.t==='read' && e.sheet===X.MIRROR_ORDER_SH
 ck('有讀鏡像', mirrorReads.length >= 1);
 ck('讀鏡像時沒有佔鎖', mirrorReads.every(e=>e.held===false), mirrorReads);
 ck('寫訂單表都在鎖裡', EVENTS.filter(e=>e.t==='write' && e.sheet===X.SHEET_ORDERS).every(e=>e.held));
-ck('六步各拿一次鎖', LOCK.acquires === 6, LOCK.acquires);
+ck('五步各拿一次鎖（native、讀物流籃不拿）', LOCK.acquires === 5, LOCK.acquires);
 ck('後續五步順序正確', calls.map(c=>c.name).join(',') === 'detail,colors,native,logistics,notes', calls);
 ck('每一步都回報成功', steps.every(s=>s.ok), steps);
 const merged = X.readOrderRows();
@@ -201,7 +231,9 @@ reset(); calls.length = 0; LOCK.busy = true;
 let threw = false, steps2;
 try{ steps2 = X.autoSyncOrders_(); }catch(e){ threw = true; }
 ck('沒有丟例外', !threw);
-ck('每一步都回報失敗而不是假裝成功', steps2 && steps2.every(s=>s.ok===false), steps2);
+const NOLOCK_STEPS = {native:1, logisticsRead:1};
+ck('要鎖的每一步都回報失敗而不是假裝成功', steps2 && steps2.filter(s=>!NOLOCK_STEPS[s.step]).every(s=>s.ok===false), steps2);
+ck('不需要鎖的 native 照樣做完（鎖被佔著也不受影響）', steps2 && steps2.filter(s=>NOLOCK_STEPS[s.step]).every(s=>s.ok===true), steps2);
 ck('訂單表沒有被寫入', !EVENTS.some(e=>e.t==='write' && e.sheet===X.SHEET_ORDERS));
 LOCK.busy = false;
 
@@ -259,7 +291,10 @@ SHEETS[X.SHEET_SYSLOG] = makeSheet(X.SHEET_SYSLOG, [SH.slice(),
 ]);
 const txt = X.diagnoseLockHolds(14);
 ck('有工作時段的排行', txt.indexOf('工作時段 9:00–19:00 誰佔最久') >= 0, txt);
-const work = txt.split('【工作時段 9:00–19:00 誰佔最久】')[1].split('【工作時段、佔用超過 20 秒】')[0];
+const work = txt.split('【工作時段 9:00–19:00 誰佔最久】')[1].split('【工作時段逐日】')[0];
+const perDay = txt.split('【工作時段逐日】')[1].split('【工作時段、佔用超過 20 秒】')[0];
+const dk = today.getFullYear()+'/'+('0'+(today.getMonth()+1)).slice(-2)+'/'+('0'+today.getDate()).slice(-2);
+ck('逐日：今天白天 3 筆、2 筆超過 20 秒、最久是出貨那筆', perDay.indexOf(dk+'：3 筆，合計 103 秒，超過20秒 2 筆，最久 52.0 秒（doPost:finalizeShipment）') >= 0, perDay);
 ck('工作時段排行不含半夜的 hourlySync_', work.indexOf('hourlySync_') < 0, work);
 ck('工作時段排行第一名是佔最久的', work.trim().split('\n')[1].indexOf('doPost:finalizeShipment') >= 0, work);
 const kill = txt.split('【工作時段、佔用超過 20 秒】')[1].split('【哪一小時】')[0];

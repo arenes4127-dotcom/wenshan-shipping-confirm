@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-19.218';
+const BACKEND_VERSION = '2026-11-20.219';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -1404,13 +1404,14 @@ function autoSyncOrders_(){
   // 真正需要不可分割的只有「合併」那一步（讀訂單表→算→寫回），它還是整段在鎖裡。
   const parsed = autoSyncParseMirror_();
   if(!parsed) return;
-  let result = null;
+  let result = null, logiScans;
   const steps = runLockedSteps_('autoSync', [
     ['merge',     function(){ result = mergeOrdersCore_(parsed.orders); return result; }],
     ['detail',    rebuildOrderDetailSheet_],
     ['colors',    setupOrderSheetColors],
-    ['native',    syncNativeOrderSheet_],     // 順便把核對結果同步回舊的核對表單
-    ['logistics', syncLogisticsConfirm_],     // 以及物流籃確認狀態
+    ['native',    syncNativeOrderSheet_, {noLock:true}],     // 順便把核對結果同步回舊的核對表單（不佔鎖，見 hourlySync_）
+    ['logisticsRead', function(){ logiScans = readLogisticsScans_(); return {ok: logiScans !== null}; }, {noLock:true}],
+    ['logistics', function(){ return syncLogisticsConfirm_(logiScans); }],     // 以及物流籃確認狀態
     ['notes',     syncSpecialNotes_]          // 以及客服寫的特殊註記
   ]);
   if(result){
@@ -4723,9 +4724,14 @@ function mirrorTransferScheduled_(){
   //
   // 先在鎖外面讀完再進去寫。讀完到寫入之間如果剛好有人掃了一筆，差別只是這一輪
   // 少鏡射那一筆，下一輪補上——那張分頁本來就最多落後一輪，這個代價是零。
+  //
+  // .219：寫入也不拿鎖了。.218 起掃描那條路的鏡射本來就是放鎖之後才做（runAfterLock_），
+  // 這裡再拿鎖已經擋不住它，只剩擋住現場——診斷量到白天一次佔 13–21 秒。
+  // 鏡射是整片覆寫成「當下的快照」，兩邊剛好同時寫，結果就是後寫的那份，
+  // 最多落後一輪，下一次掃描或半小時後的排程就會蓋成最新的。
   try{
     const rows = readRows(SHEET_TRANSFER, TRANSFER_HEADER);
-    withScriptLock_('mirrorTransferScheduled_', function(){
+    runUnlockedStep_('mirrorTransferScheduled_:mirror', function(){
       return mirrorTransferToWorkspace_(rows);
     });
   }
@@ -8075,8 +8081,10 @@ function isShippedToday_(updatedAt){
       === Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
 }
 
-function syncLogisticsConfirm_(){
-  const scans = readLogisticsScans_();
+// scansIn：呼叫端已經在鎖外讀好物流籃來源就傳進來（null＝讀不到，照樣略過）；
+// 沒傳（undefined，例如手動執行，或鎖外那一步出錯）就自己讀。
+function syncLogisticsConfirm_(scansIn){
+  const scans = scansIn !== undefined ? scansIn : readLogisticsScans_();
   if(scans === null){
     Logger.log('讀不到「'+LOGISTICS_TAB+'」分頁，為安全起見略過物流確認同步');
     return {ok:false, reason:'找不到來源分頁'};
@@ -8141,9 +8149,15 @@ function hourlySync_(){
   // 變成「最慢那一件」，而且每件做完都會讓出鎖，排隊中的出貨可以插進來。
   // 順序維持不變：要先更新完物流籃狀態，才知道哪些訂單該結案。
   // 掛在每小時而不是每天19:30，是因為留在清單裡的每一分鐘都可能被人重複揀一次。
+  //
+  // .219：診斷（.217，11/17–11/20）顯示拆鎖之後白天每小時還剩 native 佔 10–20 秒。
+  // native 只讀我們的表、寫的是舊核對表單（現場的動作不會寫那張），不需要擋住任何人，
+  // 改成不拿鎖。物流籃那一步則是先在鎖外把外部來源讀進來，鎖裡只剩算＋寫回訂單表。
+  let logiScans;
   runLockedSteps_('hourlySync', [
-    ['native',    syncNativeOrderSheet_],
-    ['logistics', syncLogisticsConfirm_],
+    ['native',    syncNativeOrderSheet_, {noLock:true}],
+    ['logisticsRead', function(){ logiScans = readLogisticsScans_(); return {ok: logiScans !== null}; }, {noLock:true}],
+    ['logistics', function(){ return syncLogisticsConfirm_(logiScans); }],
     ['closeBasket', closeBasketConfirmedPending_],
     ['notes',     syncSpecialNotes_]
   ]);
@@ -8157,13 +8171,16 @@ function hourlySync_(){
 // 回傳每一件的結果，給診斷用。
 const BG_STEP_LOCK_WAIT_MS = 60000;
 const BG_STEP_YIELD_MS = 1000;
+// 第三個元素寫 {noLock:true} 的步驟不拿鎖直接跑：只讀我們的表、寫的是別人的表
+// （或只是先把外部資料讀進來），跟現場的寫入沒有搶同一格的問題，不需要擋住任何人。
 function runLockedSteps_(prefix, steps){
   const out = [];
   for(let i = 0; i < steps.length; i++){
-    const name = steps[i][0], fn = steps[i][1];
+    const name = steps[i][0], fn = steps[i][1], opt = steps[i][2] || {};
     const t0 = Date.now();
     try{
-      const r = withScriptLock_(prefix + ':' + name, fn, BG_STEP_LOCK_WAIT_MS);
+      const r = opt.noLock ? runUnlockedStep_(prefix + ':' + name, fn)
+                           : withScriptLock_(prefix + ':' + name, fn, BG_STEP_LOCK_WAIT_MS);
       out.push({step: name, ok: true, ms: Date.now() - t0, result: r});
     }catch(err){
       out.push({step: name, ok: false, ms: Date.now() - t0, error: String(err && err.message || err)});
@@ -8172,9 +8189,28 @@ function runLockedSteps_(prefix, steps){
     }
     // 讓出鎖之後停一下再搶下一把。不停的話，同一支排程會立刻把鎖搶回去，
     // 排隊中的「完成出貨」根本沒有機會插進來，拆鎖就白拆了。
-    if(i < steps.length - 1) Utilities.sleep(BG_STEP_YIELD_MS);
+    // 不拿鎖的步驟本來就沒佔著，後面不用停。
+    if(i < steps.length - 1 && !opt.noLock) Utilities.sleep(BG_STEP_YIELD_MS);
   }
   return out;
+}
+
+// 不拿鎖的排程步驟。同一個步驟兩支排程剛好同時跑（例如 hourlySync_ 跟 09:15 的
+// autoSyncOrders_ 撞在一起）就讓後到的那支跳過——兩支算出來的是同一份東西，
+// 做兩次只是白花時間。旗標放快取、5 分鐘自動失效，萬一執行中途被砍也不會永遠卡住。
+const BG_UNLOCKED_GUARD_SEC = 300;
+function runUnlockedStep_(label, fn){
+  const cache = CacheService.getScriptCache();
+  const key = 'bgStepRunning:' + label.split(':').pop();
+  try{ if(cache.get(key)) return {skipped:true, reason:'另一支排程正在做同一件事'}; }catch(err){}
+  try{ cache.put(key, '1', BG_UNLOCKED_GUARD_SEC); }catch(err){}
+  try{
+    const r = fn();
+    try{ SpreadsheetApp.flush(); }catch(err){}
+    return r;
+  }finally{
+    try{ cache.remove(key); }catch(err){}
+  }
 }
 
 // 唯讀診斷用：看某個分頁的資料列是靜態值還是公式（公式才看得出資料是從哪裡串過來的）。
@@ -11040,7 +11076,7 @@ function diagnoseLockHolds(days){
   const cutoff = Date.now() - back * 86400000;
 
   const byLabel = {}, byHour = {}, raw = [];
-  const byLabelWork = {}, killers = [];
+  const byLabelWork = {}, killers = [], byDayWork = {};
   vals.forEach(function(r){
     if(String(r[iE]||'').trim() !== '鎖佔用過久') return;
     const t = parseRowStamp_(r[iT]);
@@ -11066,6 +11102,15 @@ function diagnoseLockHolds(days){
       const w = byLabelWork[label];
       w.次數++; w.總佔用ms += held;
       if(held > w.最久佔用ms) w.最久佔用ms = held;
+      const dm = /(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/.exec(String(r[iT]||''));
+      if(dm){
+        const dk = dm[1] + '/' + ('0'+dm[2]).slice(-2) + '/' + ('0'+dm[3]).slice(-2);
+        if(!byDayWork[dk]) byDayWork[dk] = {n:0, total:0, max:0, maxLabel:'', over20:0};
+        const d = byDayWork[dk];
+        d.n++; d.total += held;
+        if(held > d.max){ d.max = held; d.maxLabel = label; }
+        if(held >= 20000) d.over20++;
+      }
       // 現場最多等 25 秒，所以「工作時段、佔用超過 20 秒」的每一筆都可能直接造成出貨失敗
       if(held >= 20000) killers.push(String(r[iT]||'') + '  ' + det);
     }
@@ -11094,6 +11139,17 @@ function diagnoseLockHolds(days){
     const w = byLabelWork[k];
     lines.push('      ' + k + '：' + w.次數 + ' 次，合計 ' + (w.總佔用ms/1000).toFixed(0) + ' 秒'
       + '，最久 ' + (w.最久佔用ms/1000).toFixed(1) + ' 秒');
+  });
+  lines.push('');
+  // 14 天的總排行會把「改版之前」的舊數字一起算進去，看不出改了之後有沒有變好。
+  // 逐日列出來，部署那天前後一比就知道。
+  lines.push('【工作時段逐日】每天 ' + LOCK_WORK_HOUR_FROM + ':00–' + LOCK_WORK_HOUR_TO + ':00 超過門檻的筆數／合計／最久那一筆');
+  const dayKeys = Object.keys(byDayWork).sort();
+  if(!dayKeys.length) lines.push('      （沒有）');
+  dayKeys.forEach(function(k){
+    const d = byDayWork[k];
+    lines.push('      ' + k + '：' + d.n + ' 筆，合計 ' + (d.total/1000).toFixed(0) + ' 秒，'
+      + '超過20秒 ' + d.over20 + ' 筆，最久 ' + (d.max/1000).toFixed(1) + ' 秒（' + d.maxLabel + '）');
   });
   lines.push('');
   lines.push('【工作時段、佔用超過 20 秒】每一筆都可能讓「完成出貨」直接失敗（最多列 40 筆）');
