@@ -27,12 +27,14 @@ function makeSheet(name, rows){
       return api;
     },
     appendRow(v){ this._rows.push(v.slice()); },
+    deleteRow(r){ this._writes++; this._rows.splice(r - 1, 1); },
     isSheetHidden(){ return this._hidden; }, hideSheet(){ this._hidden = true; },
   };
   return sh;
 }
 
 const PROPS = {};
+const DAY = {d: '2026/11/24'};
 const SHEETS = {};
 const BACKEND = {
   getSheetByName: n => SHEETS[n] || null, getSheets: () => Object.values(SHEETS),
@@ -43,7 +45,7 @@ let SRC;   // 「山物地圖(快取)」
 const SOURCE = { getSheetByName: n => (n === '山物地圖(快取)' ? SRC : null), getSheets: () => [SRC] };
 const sandbox = {
   console, Logger:{ log(){} },
-  Utilities:{ formatDate: () => '2026/11/24 10:00:00', sleep(){} },
+  Utilities:{ formatDate: (d, tz, fmt) => (fmt === 'yyyy/MM/dd' ? DAY.d : DAY.d + ' 10:00:00'), sleep(){} },
   CacheService:{ getScriptCache: () => ({ get:()=>null, put(){}, remove(){}, getAll:()=>({}), putAll(){} }) },
   PropertiesService:{ getScriptProperties: () => ({
     getProperty: k => (PROPS[k] === undefined ? null : PROPS[k]), setProperty: (k,v) => { PROPS[k] = String(v); } }) },
@@ -110,14 +112,14 @@ const row = sku => L.find(x => x[H.indexOf('priceSku')] === sku);
 const r5 = row('0100005');
 ck('定價改了：原始 1005 → 現行 1999，特惠價兩邊都是 905', r5 && r5[H.indexOf('oldListPrice')] === '1005' && r5[H.indexOf('newListPrice')] === '1999'
    && r5[H.indexOf('oldSpecialPrice')] === '905' && r5[H.indexOf('newSpecialPrice')] === '905', r5);
-ck('有品名、規格、來源版本', r5 && r5[H.indexOf('baseName')] === '商品0100005' && r5[H.indexOf('spec')] === '規格0100005' && r5[H.indexOf('srcVersion')] === '1125更', r5);
+ck('有日期、品名、規格、來源版本', r5 && r5[H.indexOf('priceDate')] === '2026/11/24' && r5[H.indexOf('baseName')] === '商品0100005' && r5[H.indexOf('spec')] === '規格0100005' && r5[H.indexOf('srcVersion')] === '1125更', r5);
 const r6 = row('0100007');
 ck('取消特惠：原始特惠 907 → 現行空白', r6 && r6[H.indexOf('oldSpecialPrice')] === '907' && r6[H.indexOf('newSpecialPrice')] === '', r6);
 const r3 = row('0100003');
 ck('新增特惠：原始空白 → 555', r3 && r3[H.indexOf('oldSpecialPrice')] === '' && r3[H.indexOf('newSpecialPrice')] === '555', r3);
 ck('千分位寫法不同不算異動', !row('0100009'));
 ck('新貨號不算異動', !row('NEW001'));
-ck('分頁標題是中文', SHEETS[X.SHEET_PRICE_LOG]._rows[0].join(',') === '時間,來源版本,貨號,品名,規格,原始定價,原始特惠價,現行定價,現行特惠價', SHEETS[X.SHEET_PRICE_LOG]._rows[0]);
+ck('分頁標題是中文', SHEETS[X.SHEET_PRICE_LOG]._rows[0].join(',') === '日期,貨號,品名,規格,原始定價,原始特惠價,現行定價,現行特惠價,來源版本,最後更新時間', SHEETS[X.SHEET_PRICE_LOG]._rows[0]);
 
 console.log('\n【同樣的資料再比一次】不能重複記');
 r = X.checkPriceChanges_({force:true});
@@ -146,6 +148,33 @@ buildSource('1126更', loading);
 r = X.checkPriceChanges_({});
 ck('格子是 Loading...：那些列這輪不判斷', r.ok && r.價格異動 === 0 && r.讀不懂略過 === 1200, r);
 ck('讀不懂的列快照沒被弄丟', SHEETS[X.SHEET_PRICE_SNAP]._rows.filter(x=>x[0]).length >= 1201, SHEETS[X.SHEET_PRICE_SNAP]._rows.length);
+
+console.log('\n【以天為單位】同一天同一個貨號只有一列');
+buildSource('1126更', rows3);            // 先恢復正常來源
+PROPS[X.PRICE_WATCH_PROP_FULLAT] = '0';
+X.checkPriceChanges_({});
+const before = logRows().length;
+const rows4 = rows3.map(x=>x.slice()); rows4[5][12] = 2500;      // 0100005 今天第二次改：1999 → 2500
+buildSource('1126更B', rows4);
+r = X.checkPriceChanges_({});
+let L2 = logRows();
+const same = L2.filter(x => x[H.indexOf('priceSku')] === '0100005');
+ck('同一天第二次改價：還是只有一列', same.length === 1 && L2.length === before, {n: same.length, before, now: L2.length});
+ck('原始定價留著當天開始的 1005、現行更新成 2500', same[0] && same[0][H.indexOf('oldListPrice')] === '1005' && same[0][H.indexOf('newListPrice')] === '2500', same[0]);
+ck('回報「今天再次變動 1」', r.今天再次變動 === 1 && r.今天新增 === 0, r);
+const rows5 = rows4.map(x=>x.slice()); rows5[5][12] = 1005;      // 又改回原價
+buildSource('1126更C', rows5);
+r = X.checkPriceChanges_({});
+L2 = logRows();
+ck('當天改回原價：那一列拿掉', !L2.some(x => x[H.indexOf('priceSku')] === '0100005') && r.今天改回原價移除 === 1, r);
+ck('其他貨號的列沒被動到', L2.length === before - 1 && L2.some(x => x[H.indexOf('priceSku')] === '0100007'), L2.map(x=>x[H.indexOf('priceSku')]));
+DAY.d = '2026/11/25';
+const rows6 = rows5.map(x=>x.slice()); rows6[5][12] = 1100;
+buildSource('1127更', rows6);
+r = X.checkPriceChanges_({});
+L2 = logRows();
+const nextDay = L2.filter(x => x[H.indexOf('priceSku')] === '0100005');
+ck('隔天再改：新的一天新的一列', nextDay.length === 1 && nextDay[0][H.indexOf('priceDate')] === '2026/11/25' && r.今天新增 === 1, {nextDay, r});
 
 console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：第一次只建基準、改價才記、寫法不同不算、新貨號不算、沒載入完不亂記、來源不寫');
 process.exit(fail?1:0);

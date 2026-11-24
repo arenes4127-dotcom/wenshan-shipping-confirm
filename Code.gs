@@ -114,7 +114,7 @@ const HEADER_LABELS = {
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
   // 價格異動紀錄。貨號用另一個 key：sku 在別的分頁已經翻成「品號」，這張表使用者要的是「貨號」。
-  priceSku:'貨號', srcVersion:'來源版本', listPrice:'定價', specialPrice:'特惠價',
+  priceSku:'貨號', srcVersion:'來源版本', listPrice:'定價', specialPrice:'特惠價', priceDate:'日期', lastSeenAt:'最後更新時間',
   oldListPrice:'原始定價', oldSpecialPrice:'原始特惠價', newListPrice:'現行定價', newSpecialPrice:'現行特惠價',
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
   logTime:'時間', event:'事件', detail:'說明',
@@ -11413,8 +11413,10 @@ function diagnoseStoreStock(){
 // 一樣的話，距離上次整張比超過 PRICE_WATCH_FULL_EVERY_H 小時也整張比一次——
 // 「1124更」只有月日，同一天更新第二次 A2 不會變，靠這個補。
 const SHEET_PRICE_LOG = '價格異動紀錄';
-const PRICE_LOG_HEADER = ['logTime','srcVersion','priceSku','baseName','spec',
-  'oldListPrice','oldSpecialPrice','newListPrice','newSpecialPrice'];
+// 以天為單位：同一個貨號同一天只有一列。原始＝當天第一次變動前的價格，
+// 現行＝當天最後一次看到的價格；當天又改回原價，那一列就拿掉（那天等於沒變）。
+const PRICE_LOG_HEADER = ['priceDate','priceSku','baseName','spec',
+  'oldListPrice','oldSpecialPrice','newListPrice','newSpecialPrice','srcVersion','lastSeenAt'];
 const SHEET_PRICE_SNAP = '價格快照';
 const PRICE_SNAP_HEADER = ['priceSku','listPrice','specialPrice'];
 const PRICE_WATCH_FULL_EVERY_H = 6;
@@ -11515,15 +11517,58 @@ function checkPriceChanges_(opts){
   }
 
   const now = nowStamp_();
+  let dayAdded = 0, dayUpdated = 0, dayReverted = 0;
   if(changes.length){
+    const today = Utilities.formatDate(new Date(), SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy/MM/dd');
+    const W = PRICE_LOG_HEADER.length;
+    const P = {}; PRICE_LOG_HEADER.forEach(function(h, i){ P[h] = i; });
     const logSh = getSheet(SHEET_PRICE_LOG, PRICE_LOG_HEADER);
-    const start = logSh.getLastRow() + 1;
-    // 貨號、價格都用純文字存：貨號開頭的 0 不能被吃掉；價格存成文字才看得出「原本是空白」
-    logSh.getRange(start, 1, changes.length, PRICE_LOG_HEADER.length).setNumberFormat('@');
-    logSh.getRange(start, 1, changes.length, PRICE_LOG_HEADER.length).setValues(changes.map(function(x){
+    // 今天已經記過的列：紀錄是照時間往下長的，從最後一列往上讀到不是今天為止就好，不用整張讀
+    const lastRow = logSh.getLastRow();
+    const todayRows = {};   // 貨號 → {row, vals}
+    if(lastRow >= 2){
+      const CHUNK = 500;
+      for(let end = lastRow; end >= 2; end -= CHUNK){
+        const startR = Math.max(2, end - CHUNK + 1);
+        const block = logSh.getRange(startR, 1, end - startR + 1, W).getValues();
+        let hitOther = false;
+        for(let i = block.length - 1; i >= 0; i--){
+          if(String(block[i][P.priceDate]||'').trim() !== today){ hitOther = true; break; }
+          const sku = String(block[i][P.priceSku]||'').trim();
+          if(sku && !todayRows[sku]) todayRows[sku] = {row: startR + i, vals: block[i]};
+        }
+        if(hitOther) break;
+      }
+    }
+    const appendRows = [], removeRows = [];
+    changes.forEach(function(x){
       const sku = x[0], c = x[1], p = x[2];
-      return [now, version, sku, c.name, c.spec, p.list, p.special, c.list, c.special];
-    }));
+      const ex = todayRows[sku];
+      if(!ex){
+        appendRows.push([today, sku, c.name, c.spec, p.list, p.special, c.list, c.special, version, now]);
+        return;
+      }
+      // 今天已經變過一次：原始價格留著（那才是今天開始時的價格），只更新現行價格
+      const oldList = String(ex.vals[P.oldListPrice]), oldSpecial = String(ex.vals[P.oldSpecialPrice]);
+      if(oldList === c.list && oldSpecial === c.special){ removeRows.push(ex.row); return; }
+      const v = ex.vals.slice();
+      v[P.newListPrice] = c.list; v[P.newSpecialPrice] = c.special;
+      v[P.baseName] = c.name; v[P.spec] = c.spec;
+      v[P.srcVersion] = version; v[P.lastSeenAt] = now;
+      logSh.getRange(ex.row, 1, 1, W).setNumberFormat('@');
+      logSh.getRange(ex.row, 1, 1, W).setValues([v]);
+      dayUpdated++;
+    });
+    if(appendRows.length){
+      const start = logSh.getLastRow() + 1;
+      // 貨號、價格都用純文字存：貨號開頭的 0 不能被吃掉；價格存成文字才看得出「原本是空白」
+      logSh.getRange(start, 1, appendRows.length, W).setNumberFormat('@');
+      logSh.getRange(start, 1, appendRows.length, W).setValues(appendRows);
+      dayAdded = appendRows.length;
+    }
+    // 從下往上刪，前面的列號才不會跟著位移
+    removeRows.sort(function(a, b){ return b - a; }).forEach(function(r){ logSh.deleteRow(r); });
+    dayReverted = removeRows.length;
   }
 
   // 快照換成這次的（第一次執行就是建立基準）。看不懂的列沿用舊值，不要因為一次讀不到就把它弄丟。
@@ -11542,7 +11587,8 @@ function checkPriceChanges_(opts){
   props.setProperty(PRICE_WATCH_PROP_HEADER, version);
   props.setProperty(PRICE_WATCH_PROP_FULLAT, String(Date.now()));
 
-  return {ok:true, 來源版本: version, 比對貨號: compared, 價格異動: changes.length, 新貨號: added,
+  return {ok:true, 來源版本: version, 比對貨號: compared, 價格異動: changes.length,
+          今天新增: dayAdded, 今天再次變動: dayUpdated, 今天改回原價移除: dayReverted, 新貨號: added,
           建立基準: firstRun ? order.length : 0, 讀不懂略過: unreadable};
 }
 
