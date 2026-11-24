@@ -21,7 +21,7 @@
 // 每次改完這個檔案要重新部署時，把這個版本號也順手改一下（例如日期+序號）。
 // 部署後直接用瀏覽器打開 .../exec 網址，檢查回傳JSON裡的 "version" 是不是這個數字，
 // 就能確認 Apps Script 編輯器裡真的是最新內容、部署也真的套用了最新版本，不用再用其他方式猜。
-const BACKEND_VERSION = '2026-11-20.219';
+const BACKEND_VERSION = '2026-11-24.220';
 
 // 開外部試算表（SpreadsheetApp.openById）實測要350-570ms，同一次執行裡如果重複開
 // 同一份試算表（例如查儲位時「文山地圖」被開了一次，找不到又在 cacheInfoFor_ 裡
@@ -113,6 +113,9 @@ const HEADER_LABELS = {
   requiredCount:'需求件數', scannedCount:'掃描件數', routingStatus:'訂單狀態', checkResult:'核對結果',
   differenceDetails:'差異明細', startTime:'確認訂單開始時間',
   baseName:'品名', spec:'規格', sku:'品號', qty:'數量', scanned:'已掃數量',
+  // 價格異動紀錄。貨號用另一個 key：sku 在別的分頁已經翻成「品號」，這張表使用者要的是「貨號」。
+  priceSku:'貨號', srcVersion:'來源版本', listPrice:'定價', specialPrice:'特惠價',
+  oldListPrice:'原始定價', oldSpecialPrice:'原始特惠價', newListPrice:'現行定價', newSpecialPrice:'現行特惠價',
   hadNoBarcodeConfirm:'曾無條碼手動核對', manualClose:'人工結案',
   logTime:'時間', event:'事件', detail:'說明',
   logisticsConfirmed:'確認物流', logisticsTime:'物流確認時間',
@@ -238,6 +241,7 @@ function withScriptLock_(label, fn, waitMs){
           + (_lockNote_ ? '　｜' + _lockNote_ : ''));
       }catch(err){ /* 診斷寫不進去就算了 */ }
     }
+    _lockNote_ = '';   // 同一次執行可能拿好幾次鎖（排程），上一段的說明不能掛到下一段
     // 鎖已經放掉了，別人可以進來了——這時候才做那些「要做、但不需要佔著鎖做」的事。
     const tasks = _afterLockTasks_; _afterLockTasks_ = [];
     tasks.forEach(function(fn){ try{ fn(); }catch(err){ /* 鎖外的附帶工作失敗不影響主結果 */ } });
@@ -873,7 +877,7 @@ function systemSheetNotesMap_(){
   notes[SHEET_ORDERS] = ORDERS_SHEET_WARNING;
   notes[SHEET_STAFF] = STAFF_SHEET_WARNING;
   [SHEET_LOG, SHEET_SYSLOG, SHEET_PICKLOG, SHEET_LOCLOG, SHEET_TRANSFER, SHEET_TRANSFERLOG,
-   SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL]
+   SHEET_COUNT_SESSION, SHEET_COUNT_DETAIL, SHEET_PRICE_LOG, SHEET_PRICE_SNAP]
     .forEach(function(n){ notes[n] = SYSTEM_SHEET_WARNING; });
   // 這 5 張版面是自訂的（不是走 getSheet()），各自的建立函式裡本來就有各自的附註，
   // 這裡是給「回填」用的同一套文字，跟那幾個函式裡寫的內容一致。
@@ -4214,10 +4218,14 @@ function getTransferPending(){
 function scanTransferBatch(ops){
   ops = ops || [];
   if(!ops.length) return {ok:true, results:[]};
+  // 分段計時：11/20 15:56 有一次佔鎖 132 秒（平常 1 秒），光看總數不知道卡在哪一段。
+  // 只有真的慢（超過門檻）才會跟著鎖紀錄寫出來，平常零成本。
+  const _t0 = Date.now();
   const sh = getSheet(SHEET_TRANSFER, TRANSFER_HEADER);
   const last = sh.getLastRow();
   const n = Math.max(last - 1, 0);
   const vals = n ? sh.getRange(2, 1, n, TRANSFER_HEADER.length).getValues() : [];
+  const _tRead = Date.now() - _t0;
   const col = {};
   TRANSFER_HEADER.forEach(function(h){ col[h] = colOf(TRANSFER_HEADER, h) - 1; });
 
@@ -4290,6 +4298,7 @@ function scanTransferBatch(ops){
   // 的範圍一次寫回scannedQty+status（兩欄相鄰，一次setValues）、doneAt（另一次），
   // 沒改動的列寫回去的還是它原本的值，不會被覆蓋錯。範圍異常大（例如同一批
   // 掃描剛好命中表格頭尾兩端）才退回逐列寫，避免真的很分散時反而多寫一堆無謂的儲存格。
+  const _tW0 = Date.now();
   const changedIdxs = Object.keys(changedRows).map(Number);
   if(changedIdxs.length){
     const minI = Math.min.apply(null, changedIdxs), maxI = Math.max.apply(null, changedIdxs);
@@ -4317,6 +4326,7 @@ function scanTransferBatch(ops){
     }
   }
 
+  const _tWrite = Date.now() - _tW0, _tL0 = Date.now();
   if(logRows.length){
     const logSh = getSheet(SHEET_TRANSFERLOG, TRANSFERLOG_HEADER);
     const start = logSh.getLastRow() + 1;
@@ -4324,6 +4334,8 @@ function scanTransferBatch(ops){
     logSh.getRange(start, 1, logRows.length, TRANSFERLOG_HEADER.length)
          .setValues(logRows.map(function(o){ return TRANSFERLOG_HEADER.map(function(h){ return o[h]; }); }));
   }
+  _lockNote_ = '讀調撥單 ' + _tRead + 'ms（' + n + ' 列）／寫調撥單 ' + _tWrite + 'ms／寫驗收紀錄 '
+    + (Date.now() - _tL0) + 'ms／' + ops.length + ' 筆（其餘是最後送出的時間）';
 
   // vals 就是這個函式一開始整張讀出來、而且已經套用完這批改動的權威內容，跟鏡射函式
   // 自己再 readRows 一次會得到的東西一模一樣（差別只在物件包裝）。整張表重讀一次是
@@ -8159,7 +8171,9 @@ function hourlySync_(){
     ['logisticsRead', function(){ logiScans = readLogisticsScans_(); return {ok: logiScans !== null}; }, {noLock:true}],
     ['logistics', function(){ return syncLogisticsConfirm_(logiScans); }],
     ['closeBasket', closeBasketConfirmedPending_],
-    ['notes',     syncSpecialNotes_]
+    ['notes',     syncSpecialNotes_],
+    // 價格異動：讀 ERP 庫存表、寫我們自己的兩張表（別人不會寫），不需要鎖
+    ['priceWatch', function(){ return checkPriceChanges_({}); }, {noLock:true}]
   ]);
 }
 
@@ -8189,8 +8203,9 @@ function runLockedSteps_(prefix, steps){
     }
     // 讓出鎖之後停一下再搶下一把。不停的話，同一支排程會立刻把鎖搶回去，
     // 排隊中的「完成出貨」根本沒有機會插進來，拆鎖就白拆了。
-    // 不拿鎖的步驟本來就沒佔著，後面不用停。
-    if(i < steps.length - 1 && !opt.noLock) Utilities.sleep(BG_STEP_YIELD_MS);
+    // 這一步或下一步不拿鎖，就沒有「搶回去」的問題，不用停。
+    const next = steps[i + 1];
+    if(next && !opt.noLock && !(next[2] && next[2].noLock)) Utilities.sleep(BG_STEP_YIELD_MS);
   }
   return out;
 }
@@ -11383,4 +11398,159 @@ function diagnoseStoreStock(){
   }catch(err){ out.結論 = '拋錯：' + err; }
   Logger.log(JSON.stringify(out, null, 2));
   return JSON.stringify(out, null, 2);
+}
+
+
+// ================= 商品價格異動紀錄 =================
+// 來源：「山物地圖(快取)」分頁（LOCMAP_SOURCE_ID，用 IMPORTRANGE 從 ERP 庫存表拉進來）。
+// A2 是來源自己的表頭，第一格寫的是更新日期（例「1124更」），資料每更新一次它就會變。
+// 第 3 列起：A 貨號、B 品名、C 規格、D~K 各倉庫存、L 總計、M 定價、N 特惠價。
+//
+// 做法：後端留一份「上次看到的價格」快照，跟來源比，定價或特惠價不一樣的就記一筆，
+// 然後把快照換成這次的。只讀來源，來源那邊一格都不寫。
+//
+// 什麼時候比：每小時排程先只讀 A2 一格（幾乎零成本），跟上次不一樣才整張比；
+// 一樣的話，距離上次整張比超過 PRICE_WATCH_FULL_EVERY_H 小時也整張比一次——
+// 「1124更」只有月日，同一天更新第二次 A2 不會變，靠這個補。
+const SHEET_PRICE_LOG = '價格異動紀錄';
+const PRICE_LOG_HEADER = ['logTime','srcVersion','priceSku','baseName','spec',
+  'oldListPrice','oldSpecialPrice','newListPrice','newSpecialPrice'];
+const SHEET_PRICE_SNAP = '價格快照';
+const PRICE_SNAP_HEADER = ['priceSku','listPrice','specialPrice'];
+const PRICE_WATCH_FULL_EVERY_H = 6;
+const PRICE_WATCH_PROP_HEADER = 'priceWatchSrcHeader';
+const PRICE_WATCH_PROP_FULLAT = 'priceWatchFullAt';
+// 預設欄位（找不到表頭字樣時才用）：M 定價、N 特惠價
+const PRICE_SRC_DEFAULT_COL = {sku:1, name:2, spec:3, list:13, special:14};
+
+// 價格正規化成可以比的字串：數字一律去掉千分位、轉成數字再轉回字串（1280、"1,280"、1280.0 都是 "1280"）；
+// 空白就是空字串；其他看不懂的（#N/A、Loading...）回 null＝這一列這次不判斷。
+function normPrice_(v){
+  if(v === null || v === undefined) return '';
+  if(typeof v === 'number') return isFinite(v) ? String(Math.round(v * 100) / 100) : null;
+  const t = String(v).replace(/[,，\s$＄元]/g, '');
+  if(t === '') return '';
+  const n = Number(t);
+  return isFinite(n) ? String(Math.round(n * 100) / 100) : null;
+}
+
+function priceSrcColumns_(headerRow){
+  const col = Object.assign({}, PRICE_SRC_DEFAULT_COL);
+  headerRow.forEach(function(h, i){
+    const t = String(h||'').trim();
+    if(t === '品名') col.name = i + 1;
+    else if(t === '規格') col.spec = i + 1;
+    else if(t === '定價') col.list = i + 1;
+    else if(t === '特惠價') col.special = i + 1;
+  });
+  return col;
+}
+
+// opts.force：不管 A2 有沒有變都整張比（手動執行用）
+function checkPriceChanges_(opts){
+  opts = opts || {};
+  const props = PropertiesService.getScriptProperties();
+  const ss = openSheetMemo_(LOCMAP_SOURCE_ID);
+  const src = ss.getSheetByName(LOC_SYNC_TAB);
+  if(!src) return {ok:false, error:'找不到「' + LOC_SYNC_TAB + '」分頁'};
+
+  const lastCol = Math.max(src.getLastColumn(), PRICE_SRC_DEFAULT_COL.special);
+  const header = src.getRange(LOC_SYNC_FIRST_ROW - 1, 1, 1, lastCol).getValues()[0];
+  const version = String(header[0]||'').trim();
+  const prevVersion = props.getProperty(PRICE_WATCH_PROP_HEADER) || '';
+  const fullAt = Number(props.getProperty(PRICE_WATCH_PROP_FULLAT) || 0);
+  const due = Date.now() - fullAt >= PRICE_WATCH_FULL_EVERY_H * 3600000;
+  if(!opts.force && version === prevVersion && !due){
+    return {ok:true, skipped:true, reason:'來源沒有更新', 來源版本: version};
+  }
+
+  const col = priceSrcColumns_(header);
+  const n = src.getLastRow() - LOC_SYNC_FIRST_ROW + 1;
+  if(n < LOC_SYNC_MIN_SOURCE_ROWS){
+    // IMPORTRANGE 還在載入時整張是空的。這時候比下去等於宣告「所有商品價格都被清掉了」。
+    return {ok:false, error:'來源只有 ' + Math.max(n, 0) + ' 列，看起來還在載入，這次不比', 來源版本: version};
+  }
+  const width = Math.max(col.sku, col.name, col.spec, col.list, col.special);
+  const vals = src.getRange(LOC_SYNC_FIRST_ROW, 1, n, width).getValues();
+
+  // 來源這次的價格
+  const cur = {}, order = [];
+  let unreadable = 0;
+  vals.forEach(function(r){
+    const sku = String(r[col.sku - 1]||'').trim();
+    if(!sku || cur[sku]) return;            // 同一個貨號出現兩次只看第一列
+    const lp = normPrice_(r[col.list - 1]), sp = normPrice_(r[col.special - 1]);
+    if(lp === null || sp === null){ unreadable++; return; }
+    cur[sku] = {list: lp, special: sp, name: String(r[col.name - 1]||'').trim(), spec: String(r[col.spec - 1]||'').trim()};
+    order.push(sku);
+  });
+
+  // 上次的快照
+  const snapSh = getSheet(SHEET_PRICE_SNAP, PRICE_SNAP_HEADER);
+  const snapRows = snapSh.getLastRow() > 1
+    ? snapSh.getRange(2, 1, snapSh.getLastRow() - 1, 3).getValues() : [];
+  const prev = {};
+  snapRows.forEach(function(r){
+    const sku = String(r[0]||'').trim();
+    if(sku) prev[sku] = {list: normPrice_(r[1]) || '', special: normPrice_(r[2]) || ''};
+  });
+  const firstRun = snapRows.length === 0;
+
+  const changes = [];
+  let blanked = 0, compared = 0, added = 0;
+  if(!firstRun){
+    order.forEach(function(sku){
+      const p = prev[sku], c = cur[sku];
+      if(!p){ added++; return; }            // 新上架的貨號：沒有「原始價格」可比，只進快照
+      compared++;
+      if(p.list === c.list && p.special === c.special) return;
+      if(c.list === '' && c.special === '' && (p.list !== '' || p.special !== '')) blanked++;
+      changes.push([sku, c, p]);
+    });
+    // 一大片「有價格→全空白」幾乎一定是來源讀到一半（IMPORTRANGE 重算中），不是真的有人把價格清掉。
+    // 寧可這輪不記，下一輪再比，也不要寫進幾千筆假的異動。
+    if(blanked > 50 && blanked > compared * 0.2){
+      return {ok:false, error:'有 ' + blanked + ' 個貨號的價格同時變空白，判斷來源還沒載入完，這次不記', 來源版本: version};
+    }
+  }
+
+  const now = nowStamp_();
+  if(changes.length){
+    const logSh = getSheet(SHEET_PRICE_LOG, PRICE_LOG_HEADER);
+    const start = logSh.getLastRow() + 1;
+    // 貨號、價格都用純文字存：貨號開頭的 0 不能被吃掉；價格存成文字才看得出「原本是空白」
+    logSh.getRange(start, 1, changes.length, PRICE_LOG_HEADER.length).setNumberFormat('@');
+    logSh.getRange(start, 1, changes.length, PRICE_LOG_HEADER.length).setValues(changes.map(function(x){
+      const sku = x[0], c = x[1], p = x[2];
+      return [now, version, sku, c.name, c.spec, p.list, p.special, c.list, c.special];
+    }));
+  }
+
+  // 快照換成這次的（第一次執行就是建立基準）。看不懂的列沿用舊值，不要因為一次讀不到就把它弄丟。
+  if(firstRun || changes.length || added){
+    const rows = order.map(function(sku){ return [sku, cur[sku].list, cur[sku].special]; });
+    Object.keys(prev).forEach(function(sku){
+      if(!cur[sku]) rows.push([sku, prev[sku].list, prev[sku].special]);
+    });
+    if(snapSh.getLastRow() > 1) snapSh.getRange(2, 1, snapSh.getLastRow() - 1, 3).clearContent();
+    if(rows.length){
+      snapSh.getRange(2, 1, rows.length, 3).setNumberFormat('@');
+      snapSh.getRange(2, 1, rows.length, 3).setValues(rows);
+    }
+    try{ if(!snapSh.isSheetHidden()) snapSh.hideSheet(); }catch(err){ /* 藏不起來不影響功能 */ }
+  }
+  props.setProperty(PRICE_WATCH_PROP_HEADER, version);
+  props.setProperty(PRICE_WATCH_PROP_FULLAT, String(Date.now()));
+
+  return {ok:true, 來源版本: version, 比對貨號: compared, 價格異動: changes.length, 新貨號: added,
+          建立基準: firstRun ? order.length : 0, 讀不懂略過: unreadable};
+}
+
+// 手動執行：不管來源有沒有更新都整張比一次（沒有底線結尾，編輯器選單看得到）。
+function checkPriceChangesNow(){
+  const r = checkPriceChanges_({force:true});
+  const text = '價格異動檢查　' + BACKEND_VERSION + '\n' + JSON.stringify(r, null, 2)
+    + (r.建立基準 ? '\n\n第一次執行：已建立價格基準，從下一次來源更新開始記錄異動。' : '');
+  Logger.log(text);
+  return text;
 }

@@ -141,11 +141,13 @@ sandbox.syncNativeOrderSheet_ = spy('native');
 sandbox.syncLogisticsConfirm_ = spy('logistics');
 sandbox.closeBasketConfirmedPending_ = spy('closeBasket');
 sandbox.syncSpecialNotes_ = spy('notes');
+sandbox.checkPriceChanges_ = spy('priceWatch');
 reset(); calls.length = 0;
 X.hourlySync_();
-ck('四件都做了、順序沒變', calls.map(c=>c.name).join(',') === 'native,logistics,closeBasket,notes', calls);
+ck('五件都做了、順序沒變', calls.map(c=>c.name).join(',') === 'native,logistics,closeBasket,notes,priceWatch', calls);
 ck('native 沒有佔鎖', calls[0].held === false, calls[0]);
-ck('其餘三件都在鎖裡做', calls.slice(1).every(c=>c.held), calls);
+ck('中間三件都在鎖裡做', calls.slice(1,4).every(c=>c.held), calls);
+ck('價格異動檢查沒有佔鎖', calls[4].held === false, calls[4]);
 ck('物流籃來源在鎖外讀、只讀一次', logiReads.length === 1 && logiReads[0].held === false, logiReads);
 ck('鎖裡的物流籃那步拿到的是鎖外讀好的那份', calls[1].args[0] === LOGI, calls[1].args);
 ck('鎖拿了 3 次', LOCK.acquires === 3, LOCK.acquires);
@@ -158,7 +160,7 @@ console.log('\n【不佔鎖的步驟】另一支排程正在做同一件事就�
 CACHE['bgStepRunning:native'] = '1';
 reset(); calls.length = 0;
 X.hourlySync_();
-ck('native 被跳過，其餘照做', calls.map(c=>c.name).join(',') === 'logistics,closeBasket,notes', calls);
+ck('native 被跳過，其餘照做', calls.map(c=>c.name).join(',') === 'logistics,closeBasket,notes,priceWatch', calls);
 ck('別人的旗標沒被我們清掉', CACHE['bgStepRunning:native'] === '1');
 delete CACHE['bgStepRunning:native'];
 sandbox.readLogisticsScans_ = function(){ throw new Error('外部檔打不開'); };
@@ -180,7 +182,7 @@ console.log('\n【每小時同步】其中一件出錯，後面的還是要做')
 sandbox.syncLogisticsConfirm_ = spy('logistics', {boom:true});
 reset(); calls.length = 0;
 X.hourlySync_();
-ck('第二件爆了，第三、四件照做', calls.map(c=>c.name).join(',') === 'native,logistics,closeBasket,notes', calls);
+ck('第二件爆了，後面的照做', calls.map(c=>c.name).join(',') === 'native,logistics,closeBasket,notes,priceWatch', calls);
 ck('爆掉之後鎖有放', LOCK.held === false);
 sandbox.syncLogisticsConfirm_ = spy('logistics');
 
