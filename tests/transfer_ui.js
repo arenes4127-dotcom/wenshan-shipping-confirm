@@ -1,7 +1,15 @@
 // 調撥驗收前端：先顯示本機清單、載入中掃描不誤響、背景送出不重複計算
 // 用法：node tests/transfer_ui.js
 const { chromium } = require('playwright');
-const path = require('path');
+const path = require('path'), fs = require('fs'), http = require('http');
+// 用本機 http 開頁面：file:// 的 localStorage 在不同分頁間不保證共用，
+// 而「重新開頁面先畫上次的清單」正好要靠第二頁讀到第一頁存的東西（file:// 時約三次失敗一次）。
+const _root = path.resolve('.');
+const _srv = http.createServer((q, r) => {
+  const f = path.join(_root, decodeURIComponent(q.url.split('?')[0]).replace(/^\/+/, '') || 'index.html');
+  fs.readFile(f, (e, d) => { if(e){ r.writeHead(404); r.end(); return; }
+    r.writeHead(200, {'Content-Type': f.endsWith('.js') ? 'text/javascript' : 'text/html; charset=utf-8'}); r.end(d); });
+}).listen(0);
 (async () => {
   const b = await chromium.launch();
   // 測試絕對不能碰到正式環境：預設設定裡帶著正式後端與試算表的網址。
@@ -21,7 +29,7 @@ const path = require('path');
     await pg.addInitScript(() => {
       localStorage.setItem('ssz_settings', JSON.stringify({backendUrl:'https://example.invalid/exec', store:'odm_shilin', staff:'x'}));
     });
-    await pg.goto('file://' + path.resolve('index.html'));
+    await pg.goto('http://127.0.0.1:' + _srv.address().port + '/index.html');
     await pg.evaluate(() => {
       window.__srv = { items:[
           {row:2, batchId:'B1', sku:'T1', baseName:'水壺', qty:3, scannedQty:0, importedAt:'2026/11/17 08:00'},
@@ -49,7 +57,7 @@ const path = require('path');
       window.okBeep = () => window.__beeps.push('ok'); window.errorBeep = () => window.__beeps.push('err');
     });
   }
-  const pick = async (pg) => { await pg.evaluate(() => { renderStaffSelects(); const s = document.getElementById('transferStaffSelect'); s.value = 'S1'; }); };
+  const pick = async (pg) => { await pg.evaluate(() => { setCurrentStaff('S1'); opMarkConfirmed_(); }); };
 
   console.log('【第一次進調撥頁】沒有快取，等後端');
   const pg = await ctx.newPage();
@@ -137,7 +145,7 @@ const path = require('path');
   ck('說清楚讀不到、原因、怎麼重試', r.indexOf('HTTP 503') >= 0 && r.indexOf('重新讀') >= 0, r);
 
   ck('全程沒有 JS 錯誤', errs.length === 0, errs);
-  await b.close();
+  await b.close(); _srv.close();
   console.log(fail ? '\n有 '+fail+' 項失敗' : '\n介面全部通過');
   process.exit(fail?1:0);
 })();

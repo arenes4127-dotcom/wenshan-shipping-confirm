@@ -66,7 +66,7 @@ const PAGE_URL = () => 'http://127.0.0.1:' + _srv.address().port + '/index.html'
       window.errorBeep = () => window.__beeps.push('err');
     });
     await pg.evaluate(() => refreshFromBackend(true));
-    await pg.evaluate(() => { staff = [{id:'S06', name:'郭'}]; currentStaffId = 'S06'; gotoView('scan'); });
+    await pg.evaluate(() => { staff = [{id:'S06', name:'郭'}]; currentStaffId = 'S06'; opMarkConfirmed_(); gotoView('scan'); });
     return pg;
   }
   async function shipOne(pg, no, waybill){

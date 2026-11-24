@@ -239,6 +239,13 @@
   .confirm-box .meta b{font-size:16px;}
   .confirm-box .warn-line{color:#d98324;font-size:13px;line-height:1.5;margin:10px 0 16px;}
   .confirm-box .row{display:flex;gap:10px;}
+  /* 操作人員確認：要一眼看懂、一下點得到——手持機上站著用 */
+  .op-who{font-size:20px;line-height:1.5;margin:2px 0 12px;}
+  .op-who b{font-size:24px;}
+  .op-yes{font-size:18px;padding:14px;}
+  .op-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;max-height:38vh;overflow:auto;}
+  .op-grid button{padding:12px 6px;font-size:15px;}
+  .op-grid button.recent{border-color:var(--accent, #3c78d8);}
   .confirm-box .row .btn{flex:1;}
   /* 一次確認多件（批次移動儲位）：件數可能十幾件，要能捲動又要看得到圖，
      不然「一併移動」等於閉著眼睛按確定。 */
@@ -611,6 +618,21 @@
         <button class="btn gray" id="qrClose">關閉</button>
         <button class="btn" id="qrPrint">列印</button>
       </div>
+    </div>
+  </div>
+
+  <!-- 操作人員確認：不能按 X 關掉，一定要選一個人。掃描槍的按鍵在這裡一律吞掉，
+       避免「掃下一件時的 Enter」直接幫人按下「是我」。 -->
+  <div class="confirm-mask" id="opMask" tabindex="-1">
+    <div class="confirm-box">
+      <h3>請確認操作人員</h3>
+      <p class="hint" id="opWhy" style="margin-top:0;"></p>
+      <div id="opWhoWrap">
+        <div class="op-who">你是 <b id="opWho"></b> 嗎？</div>
+        <button type="button" class="btn block op-yes" id="opYes">是我，繼續</button>
+        <p class="hint" style="margin:14px 0 8px;">不是的話，點你的名字：</p>
+      </div>
+      <div class="op-grid" id="opGrid"></div>
     </div>
   </div>
 
@@ -1242,6 +1264,8 @@ const LS = {
   shipQueue: 'ssz_ship_queue', shipIssues: 'ssz_ship_issues', backendVersion: 'ssz_backend_version',
   // 現場綁定的條碼（後端「條碼補充」表）的本機副本，斷線時也認得
   barcodePatch: 'ssz_barcode_patch',
+  // 操作人員確認：今天確認過的是誰、最後一次有人碰這台的時間、最近用過的人（排在前面）
+  opConfirm: 'ssz_op_confirm', lastActivity: 'ssz_last_activity', recentStaff: 'ssz_recent_staff',
   // 待送出的調撥驗收掃描，跟 pickQueue 同樣道理：關掉分頁/斷線也不會掉，開起來繼續送
   transferQueue: 'ssz_transfer_queue',
   // 上一次拿到的待驗收清單。進調撥頁先畫這份，不用空等一趟網路（見 showTransferCache_）
@@ -1321,6 +1345,8 @@ let scanPerfCur = null;
 let orders = loadJSON(LS.orders, {});
 let log = loadJSON(LS.log, []);
 let staff = loadJSON(LS.staff, [{id:'S01',name:'王小明'},{id:'S02',name:'陳小華'}]);
+// 五頁共用同一個「目前操作人員」（見 renderStaffSelects）。放這麼前面是因為載入過程中就會用到。
+const STAFF_SELECT_IDS = ['homeStaffSelect', 'pickStaffSelect', 'locStaffSelect', 'transferStaffSelect', 'countStaffSelect'];
 saveJSON(LS.staff, staff);
 let currentStaffId = localStorage.getItem(LS.currentStaff) || '';
 // 用 Object.assign 合併預設值：舊使用者localStorage裡已經存過的settings物件缺少新欄位時
@@ -2705,6 +2731,7 @@ function matchPickFilter(o, f){
 
 // 批次模式：從待揀訂單裡取前 N 張（跳過已經全部揀完的）
 function startNewBatch(){
+  if(operatorGate_(startNewBatch)) return;
   // 「全部」＝這一批就抓完所有符合條件的訂單。用 Infinity 而不是一個很大的數字，
   // 免得哪天訂單數超過那個數字又被默默截斷。
   const rawSize = document.getElementById('pickBatchSize').value;
@@ -3245,6 +3272,7 @@ async function locScan(code){
 }
 
 async function locSubmit(){
+  if(operatorGate_(locSubmit)) return;
   const items = locBatch.filter(function(x){ return x.ok; });
   if(!items.length) return;
   const mode = locMode();
@@ -4388,6 +4416,7 @@ function transferApplyResult_(r){
 function transferScan(code){
   const raw = String(code || '').trim();
   if(!raw) return;
+  if(operatorGate_(function(){ transferScan(raw); })) return;
   if(!hasBackend()){ errorBeep(); flash('err', '需要連線', '調撥驗收要連上後端才能用', 1800); return; }
   const staffObj = transferStaff();
   if(!staffObj){ errorBeep(); flash('err', '請先選擇驗收人員', '', 1600); return; }
@@ -5604,6 +5633,7 @@ async function scanOrder(code){
   code = String(code||'').trim();
   inputOrder.value = '';
   if(!code) return;   // 空字串不是一次掃描，計時從這之後才開始
+  if(operatorGate_(function(){ scanOrder(code); })) return;
   perfStart_('掃訂單號');
   if(!currentStaffId || !staff.find(s=>s.id===currentStaffId)){
     errorBeep();
@@ -6575,33 +6605,15 @@ function renderStaffSelects(){
     ? staff.map(s=>`<option value="${s.id}">${s.id} - ${s.name}</option>`).join('')
     : '<option value="">（尚未建立人員，請先新增）</option>';
   if(!staff.find(s=>s.id===currentStaffId)) currentStaffId = staff[0] ? staff[0].id : '';
-  ['homeStaffSelect'].forEach(id=>{
+  // 11/24 起合併成「這台裝置目前的操作人員」一個值：包貨、揀貨、儲位、調撥、盤點五個選單
+  // 都顯示同一個人，改任何一個就五個一起換。以前各頁各自記，換了一頁其他四頁還是上一個人，
+  // 紀錄就掛到別人名下——那正是「大家都沒在換帳號」的一半原因。
+  STAFF_SELECT_IDS.forEach(id=>{
     const sel = document.getElementById(id);
+    if(!sel) return;
     sel.innerHTML = optionsHtml;
     sel.value = currentStaffId;
   });
-  // 揀貨人員獨立選單：揀貨跟包貨常常不是同一個人，不要跟首頁的「目前包貨人員」綁在一起
-  const pickSel = document.getElementById('pickStaffSelect');
-  if(pickSel){
-    const keep = pickSel.value;
-    pickSel.innerHTML = optionsHtml;
-    pickSel.value = (keep && staff.find(s=>s.id===keep)) ? keep : currentStaffId;
-  }
-  // 儲位異動人員：預設跟著揀貨人員走（最常是同一個人邊揀邊改），但可以自己選
-  const locSel = document.getElementById('locStaffSelect');
-  if(locSel){
-    const keep = locSel.value;
-    locSel.innerHTML = optionsHtml;
-    locSel.value = (keep && staff.find(s=>s.id===keep)) ? keep
-      : ((pickSel && pickSel.value) || currentStaffId);
-  }
-  const transferSel = document.getElementById('transferStaffSelect');
-  if(transferSel){
-    const keep = transferSel.value;
-    transferSel.innerHTML = optionsHtml;
-    transferSel.value = (keep && staff.find(s=>s.id===keep)) ? keep
-      : ((locSel && locSel.value) || currentStaffId);
-  }
   const staffObj = staff.find(s=>s.id===currentStaffId);
   document.getElementById('headerStaffName').textContent = staffObj ? staffObj.name : '未選擇';
 }
@@ -6609,8 +6621,130 @@ function setCurrentStaff(id){
   currentStaffId = id;
   localStorage.setItem(LS.currentStaff, currentStaffId);
   renderStaffSelects();
+  if(typeof renderCountStaffSelect === 'function') renderCountStaffSelect();
 }
-document.getElementById('homeStaffSelect').addEventListener('change', e=>setCurrentStaff(e.target.value));
+// 自己從選單選人＝本人確認過了，不用再跳確認框
+STAFF_SELECT_IDS.forEach(function(id){
+  const sel = document.getElementById(id);
+  if(sel) sel.addEventListener('change', function(e){ setCurrentStaff(e.target.value); opMarkConfirmed_(); });
+});
+
+// ============================================================
+// 操作人員確認
+// ============================================================
+// 問題：大家都不換帳號，紀錄全掛在上一個人名下。
+// 做法：只在「開始一件新工作」的那一下確認（掃新訂單、揀新訂單／開新批次、調撥掃描、
+// 開始／接續盤點、送出儲位異動），而且只在兩種情況才問：
+//   1. 今天這台還沒確認過（或確認的不是現在這個人）
+//   2. 已經 15 分鐘沒人碰這台（很可能換人了）
+// 掃到一半、包到一半不會跳。問的時候「是我」一下就過，不是本人就直接點自己的名字。
+const OP_IDLE_MS = 15 * 60 * 1000;
+let opLastActivity = Number(localStorage.getItem(LS.lastActivity)) || 0;
+let opLastSaved = 0;
+let opIdleFlag = false;      // 中間發生過一次「閒置超過 15 分鐘」，下次開始新工作時要確認
+let opIdleMinutes = 0;
+let opPendingRetry = null;   // 確認完要接著做的那件事（觸發確認的那一下掃描）
+
+function opTodayKey_(){
+  const d = new Date();
+  return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+}
+function opNoteActivity_(){
+  if(opMaskShown_()) return;
+  const now = Date.now();
+  if(opLastActivity && now - opLastActivity >= OP_IDLE_MS){
+    opIdleFlag = true;
+    opIdleMinutes = Math.round((now - opLastActivity) / 60000);
+  }
+  opLastActivity = now;
+  if(now - opLastSaved > 30000){
+    opLastSaved = now;
+    try{ localStorage.setItem(LS.lastActivity, String(now)); }catch(e){}
+  }
+}
+document.addEventListener('pointerdown', opNoteActivity_, true);
+document.addEventListener('keydown', opNoteActivity_, true);
+// 有些手持機的掃描是直接把字塞進輸入框、不送按鍵事件，所以輸入也算有人在用
+document.addEventListener('input', opNoteActivity_, true);
+// 確認框開著的時候，鍵盤（含掃描槍）一律吞掉：不能讓下一次掃描的 Enter 幫人按下「是我」，
+// 掃到的字也不能偷偷打進後面的輸入框。
+document.addEventListener('keydown', function(e){
+  if(!opMaskShown_()) return;
+  e.preventDefault(); e.stopPropagation();
+}, true);
+
+function opMaskShown_(){
+  const m = document.getElementById('opMask');
+  return !!(m && m.classList.contains('show'));
+}
+function opWhyText_(){
+  const c = loadJSON(LS.opConfirm, null);
+  if(!currentStaffId || !staff.find(s=>s.id===currentStaffId)) return '這台還沒選操作人員。';
+  if(!c || c.date !== opTodayKey_()) return '今天第一次使用這台，確認一下是誰在操作。';
+  if(c.staffId !== currentStaffId) return '操作人員換過了，確認一下。';
+  if(opIdleFlag) return '這台已經 ' + opIdleMinutes + ' 分鐘沒有操作，確認一下是不是換人了。';
+  return '';
+}
+function opNeedsConfirm_(){
+  if(!staff.length) return false;   // 還沒建人員：讓原本的「請先選人員」提示處理
+  if(!currentStaffId || !staff.find(s=>s.id===currentStaffId)) return true;
+  const c = loadJSON(LS.opConfirm, null);
+  if(!c || c.date !== opTodayKey_() || c.staffId !== currentStaffId) return true;
+  return opIdleFlag;
+}
+function opMarkConfirmed_(){
+  opIdleFlag = false;
+  opLastActivity = Date.now();
+  saveJSON(LS.opConfirm, {date: opTodayKey_(), staffId: currentStaffId, at: new Date().toISOString()});
+  try{ localStorage.setItem(LS.lastActivity, String(opLastActivity)); }catch(e){}
+  if(currentStaffId){
+    const recent = loadJSON(LS.recentStaff, []).filter(function(id){ return id !== currentStaffId; });
+    recent.unshift(currentStaffId);
+    saveJSON(LS.recentStaff, recent.slice(0, 8));
+  }
+}
+// 開始新工作的入口呼叫這個。需要確認就跳框、回傳 true（呼叫端直接 return），
+// 確認完自動接著做 retry；不需要就回傳 false，照常往下做。
+function operatorGate_(retry){
+  if(!opNeedsConfirm_()) return false;
+  if(!opPendingRetry) opPendingRetry = retry || null;   // 框開著時又觸發：保留第一件
+  if(!opMaskShown_()) opShowMask_();
+  return true;
+}
+function opShowMask_(){
+  const who = staff.find(s=>s.id===currentStaffId);
+  document.getElementById('opWhy').textContent = opWhyText_();
+  document.getElementById('opWhoWrap').style.display = who ? '' : 'none';
+  if(who) document.getElementById('opWho').textContent = who.name;
+  const recent = loadJSON(LS.recentStaff, []);
+  const ordered = staff.slice().sort(function(a, b){
+    const ra = recent.indexOf(a.id), rb = recent.indexOf(b.id);
+    return (ra < 0 ? 999 : ra) - (rb < 0 ? 999 : rb);
+  }).filter(function(s){ return s.id !== currentStaffId; });
+  document.getElementById('opGrid').innerHTML = ordered.map(function(s){
+    return '<button type="button" class="btn gray' + (recent.indexOf(s.id) >= 0 ? ' recent' : '')
+      + '" data-op-id="' + escapeHtml(s.id) + '">' + escapeHtml(s.name) + '</button>';
+  }).join('');
+  const mask = document.getElementById('opMask');
+  mask.classList.add('show');
+  try{ if(document.activeElement) document.activeElement.blur(); }catch(e){}
+  try{ mask.focus(); }catch(e){}
+  okBeep();   // 不是錯誤，是「請確認一下」
+}
+function opFinish_(staffId){
+  if(staffId && staffId !== currentStaffId) setCurrentStaff(staffId);
+  opMarkConfirmed_();
+  document.getElementById('opMask').classList.remove('show');
+  const retry = opPendingRetry; opPendingRetry = null;
+  const who = staff.find(s=>s.id===currentStaffId);
+  if(who) flash('ok', '操作人員：' + who.name, '', 900);
+  if(retry) setTimeout(retry, 0);
+}
+document.getElementById('opYes').addEventListener('click', function(){ opFinish_(currentStaffId); });
+document.getElementById('opGrid').addEventListener('click', function(e){
+  const b = e.target.closest('button[data-op-id]');
+  if(b) opFinish_(b.getAttribute('data-op-id'));
+});
 
 function renderStaffList(){
   const ul = document.getElementById('staffUl');
@@ -6996,7 +7130,7 @@ function renderCountStaffSelect(){
   sel.innerHTML = staff.length
     ? staff.map(s=>`<option value="${s.id}">${s.id} - ${s.name}</option>`).join('')
     : '<option value="">（尚未建立人員，請先新增）</option>';
-  sel.value = (keep && staff.find(s=>s.id===keep)) ? keep : currentStaffId;
+  sel.value = currentStaffId;   // 跟其他頁同一個「目前操作人員」
 }
 
 // 門市清單從後端來，不在前端寫第二份。欄位對照只有一個地方說了算，
@@ -7071,6 +7205,7 @@ function renderCountSessionList(sessions){
 // 接續一個還沒結束的場次。不從清單那一列的字串拼，直接跟後端要權威資料：
 // 那一列可能是幾分鐘前載的，期間別台機器可能已經又掃了東西。
 function resumeCountSession(sessionId){
+  if(operatorGate_(function(){ resumeCountSession(sessionId); })) return;
   if(!hasBackend()){ errorBeep(); flash('err','需要連線才能接續','要跟後端拿這場已經掃的紀錄', 2200); return; }
   if(countSession && countSession.sessionId === sessionId){ resyncCountSession(); return; }
   if(countSession && !confirm('目前正在盤「' + countSession.store + '」。\n要離開它、改接續這一場嗎？\n（未送出的掃描會先送完）')) return;
@@ -7168,6 +7303,7 @@ function renderCount(){
 }
 
 function startCount(){
+  if(operatorGate_(startCount)) return;
   const store = (document.getElementById('countStoreSelect')||{}).value || '';
   const staffId = (document.getElementById('countStaffSelect')||{}).value || '';
   const who = staff.find(s=>s.id===staffId);
@@ -7623,6 +7759,7 @@ async function scanPickOrder(code){
   code = String(code||'').trim();
   el.value = '';
   if(!code) return;
+  if(operatorGate_(function(){ scanPickOrder(code); })) return;
   const o = orders[code];
   if(!o || o.status !== 'pending' || isManuallyClosed(o)){
     errorBeep();

@@ -60,7 +60,7 @@ const PAGE_URL = () => 'http://127.0.0.1:' + _srv.address().port + '/index.html'
     gotoView('transfer');
   });
   await pg.waitForFunction(() => transferConfirmedAt > 0);
-  await pg.evaluate(() => { renderStaffSelects(); document.getElementById('transferStaffSelect').value = 'S05'; });
+  await pg.evaluate(() => { setCurrentStaff('S05'); opMarkConfirmed_(); });
   const last = () => pg.evaluate(() => ({ beeps: window.__beeps.slice(), flash: document.getElementById('flashBig').textContent + '｜' + document.getElementById('flashSub').textContent }));
   const scanned = (sku) => pg.evaluate((s) => { const it = transferPending.concat(transferDone).find(x => x.sku === s); return it ? it.scannedQty : -1; }, sku);
 
