@@ -119,9 +119,11 @@
   /* 出貨紀錄欄位多，手機上放不下就讓表格左右捲，不要把中文欄位擠成一個字寬的直排。
      會很長的兩欄（差異明細、運單編號）限定寬度、太長就換行：運單號誤掃成網址之類的一長串
      沒有空白的字，以前會把整欄撐開，其他列在那一欄就變成一大片空白。 */
-  #view-log th, #view-log td{white-space:nowrap;}
-  #view-log .cell-wrap{white-space:normal;width:220px;word-break:break-word;}
-  #view-log .cell-wb{white-space:normal;min-width:135px;max-width:180px;word-break:break-all;}
+  #view-log th, #view-log td{white-space:nowrap;padding:6px 8px;font-size:12px;line-height:1.35;}
+  #view-log th{font-size:11px;}
+  #view-log td .tag{padding:1px 6px;font-size:11px;}
+  #view-log .cell-wrap{white-space:normal;min-width:120px;max-width:200px;word-break:break-word;}
+  #view-log .cell-wb{white-space:normal;min-width:118px;max-width:160px;word-break:break-all;}
   tbody tr:last-child td{border-bottom:none;}
   tbody tr:hover{background:var(--panel2);}
   tr.ok td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
