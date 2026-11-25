@@ -11423,8 +11423,9 @@ const SHEET_PRICE_LOG = '價格異動紀錄';
 const PRICE_LOG_COLS = ['日期','貨號','品名','規格','變動項目','原始定價','原始特惠價','現行定價','現行特惠價'];
 const PRICE_LOG_TOP_NOTE = '價格異動紀錄｜最新的一天在最上面｜每天一個區塊，整塊選起來複製就有日期與欄位名稱'
   + '｜🟥 紅底＝定價有變　🟨 黃底＝只改特惠價';
-const PRICE_COLOR = {title:'#1c4587', titleFont:'#ffffff', header:'#d9d9d9',
-  listRow:'#f4cccc', listCell:'#ea9999', listFont:'#990000', specialRow:'#fff2cc', specialCell:'#ffe599'};
+// 淡色：整列只是一層底色，真正要人注意的格子再深一階、字用紅色粗體
+const PRICE_COLOR = {title:'#dbe7f5', titleFont:'#1c4587', header:'#f3f3f3',
+  listRow:'#fdeeee', listCell:'#f8d7d7', listFont:'#c0392b', specialRow:'#fffaeb', specialCell:'#fff0c2'};
 const SHEET_PRICE_SNAP = '價格快照';
 const PRICE_SNAP_HEADER = ['priceSku','listPrice','specialPrice'];
 const PRICE_WATCH_PROP_HEADER = 'priceWatchSrcHeader';
