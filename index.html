@@ -116,6 +116,12 @@
   table{width:100%;border-collapse:collapse;font-size:13px;min-width:480px;}
   th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);}
   th{color:var(--muted);font-weight:600;background:var(--panel2);font-size:12px;text-transform:uppercase;letter-spacing:.03em;}
+  /* 出貨紀錄欄位多，手機上放不下就讓表格左右捲，不要把中文欄位擠成一個字寬的直排。
+     會很長的兩欄（差異明細、運單編號）限定寬度、太長就換行：運單號誤掃成網址之類的一長串
+     沒有空白的字，以前會把整欄撐開，其他列在那一欄就變成一大片空白。 */
+  #view-log th, #view-log td{white-space:nowrap;}
+  #view-log .cell-wrap{white-space:normal;width:220px;word-break:break-word;}
+  #view-log .cell-wb{white-space:normal;min-width:135px;max-width:180px;word-break:break-all;}
   tbody tr:last-child td{border-bottom:none;}
   tbody tr:hover{background:var(--panel2);}
   tr.ok td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
@@ -6572,8 +6578,8 @@ function renderLog(){
   tbody.innerHTML = log.map(l=>`<tr>
     <td>${l.orderNo}</td><td>${l.orderDate||'-'}</td><td>${l.store||'-'}</td><td>${l.shipMethod||'-'}</td>
     <td>${l.routingStatus||'-'}</td><td>${l.requiredCount||'-'}</td><td>${l.scannedCount||'-'}</td><td>${l.checkResult||'-'}</td>
-    <td style="max-width:260px;white-space:normal;">${l.differenceDetails||'-'}</td>
-    <td>${l.waybill}</td>
+    <td><div class="cell-wrap">${escapeHtml(l.differenceDetails||'-')}</div></td>
+    <td><div class="cell-wb">${escapeHtml(l.waybill||'')}</div></td>
     <td>${l.staffId?`${l.staffId} `:''}${l.staffName||''}</td><td>${l.time}</td>
     <td>${l.hadIssue?'<span class="tag danger">有</span>':'<span class="tag">無</span>'}</td>
     <td>${l.hadManualEdit?'<span class="tag warn">有</span>':'<span class="tag">無</span>'}</td>
