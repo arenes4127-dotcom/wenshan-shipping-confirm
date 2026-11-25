@@ -11413,10 +11413,18 @@ function diagnoseStoreStock(){
 // 所以每小時排程只讀 A2 一格（幾乎零成本），跟上次比對成功時記下的不一樣才整張比，
 // 等於一天整張比一次。上一次比到一半被擋下（來源還在載入）不會記下 A2，下一小時會再試。
 const SHEET_PRICE_LOG = '價格異動紀錄';
-// 以天為單位：同一個貨號同一天只有一列。原始＝當天第一次變動前的價格，
-// 現行＝當天最後一次看到的價格；當天又改回原價，那一列就拿掉（那天等於沒變）。
-const PRICE_LOG_HEADER = ['priceDate','priceSku','baseName','spec',
-  'oldListPrice','oldSpecialPrice','newListPrice','newSpecialPrice','srcVersion','lastSeenAt'];
+// 這張是給人複製貼上、轉交同事去改網站價格用的，不是給程式讀的資料表，所以版面照人看的方式排：
+//   第 1 列：固定說明（凍結）
+//   第 2 列起：一天一個區塊，**最新的一天在最上面**。每個區塊＝
+//     日期標題列（日期、筆數、來源版本）＋欄位名稱列＋資料列＋一列空白
+//   整個區塊選起來複製，貼過去就有日期也有欄位名稱。
+// 以天為單位：同一個貨號同一天只有一列。原始＝當天第一次變動前的價格，現行＝當天最後看到的價格；
+// 當天又改回原價就拿掉那一列。定價有變的排前面、整列紅底；只改特惠價的黃底。
+const PRICE_LOG_COLS = ['日期','貨號','品名','規格','變動項目','原始定價','原始特惠價','現行定價','現行特惠價'];
+const PRICE_LOG_TOP_NOTE = '價格異動紀錄｜最新的一天在最上面｜每天一個區塊，整塊選起來複製就有日期與欄位名稱'
+  + '｜🟥 紅底＝定價有變　🟨 黃底＝只改特惠價';
+const PRICE_COLOR = {title:'#1c4587', titleFont:'#ffffff', header:'#d9d9d9',
+  listRow:'#f4cccc', listCell:'#ea9999', listFont:'#990000', specialRow:'#fff2cc', specialCell:'#ffe599'};
 const SHEET_PRICE_SNAP = '價格快照';
 const PRICE_SNAP_HEADER = ['priceSku','listPrice','specialPrice'];
 const PRICE_WATCH_PROP_HEADER = 'priceWatchSrcHeader';
@@ -11516,56 +11524,8 @@ function checkPriceChanges_(opts){
   const now = nowStamp_();
   let dayAdded = 0, dayUpdated = 0, dayReverted = 0;
   if(changes.length){
-    const today = Utilities.formatDate(new Date(), SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy/MM/dd');
-    const W = PRICE_LOG_HEADER.length;
-    const P = {}; PRICE_LOG_HEADER.forEach(function(h, i){ P[h] = i; });
-    const logSh = getSheet(SHEET_PRICE_LOG, PRICE_LOG_HEADER);
-    // 今天已經記過的列：紀錄是照時間往下長的，從最後一列往上讀到不是今天為止就好，不用整張讀
-    const lastRow = logSh.getLastRow();
-    const todayRows = {};   // 貨號 → {row, vals}
-    if(lastRow >= 2){
-      const CHUNK = 500;
-      for(let end = lastRow; end >= 2; end -= CHUNK){
-        const startR = Math.max(2, end - CHUNK + 1);
-        const block = logSh.getRange(startR, 1, end - startR + 1, W).getValues();
-        let hitOther = false;
-        for(let i = block.length - 1; i >= 0; i--){
-          if(String(block[i][P.priceDate]||'').trim() !== today){ hitOther = true; break; }
-          const sku = String(block[i][P.priceSku]||'').trim();
-          if(sku && !todayRows[sku]) todayRows[sku] = {row: startR + i, vals: block[i]};
-        }
-        if(hitOther) break;
-      }
-    }
-    const appendRows = [], removeRows = [];
-    changes.forEach(function(x){
-      const sku = x[0], c = x[1], p = x[2];
-      const ex = todayRows[sku];
-      if(!ex){
-        appendRows.push([today, sku, c.name, c.spec, p.list, p.special, c.list, c.special, version, now]);
-        return;
-      }
-      // 今天已經變過一次：原始價格留著（那才是今天開始時的價格），只更新現行價格
-      const oldList = String(ex.vals[P.oldListPrice]), oldSpecial = String(ex.vals[P.oldSpecialPrice]);
-      if(oldList === c.list && oldSpecial === c.special){ removeRows.push(ex.row); return; }
-      const v = ex.vals.slice();
-      v[P.newListPrice] = c.list; v[P.newSpecialPrice] = c.special;
-      v[P.baseName] = c.name; v[P.spec] = c.spec;
-      v[P.srcVersion] = version; v[P.lastSeenAt] = now;
-      logSh.getRange(ex.row, 1, 1, W).setNumberFormat('@');
-      logSh.getRange(ex.row, 1, 1, W).setValues([v]);
-      dayUpdated++;
-    });
-    if(appendRows.length){
-      const start = logSh.getLastRow() + 1;
-      // 貨號、價格都用純文字存：貨號開頭的 0 不能被吃掉；價格存成文字才看得出「原本是空白」
-      logSh.getRange(start, 1, appendRows.length, W).setNumberFormat('@');
-      logSh.getRange(start, 1, appendRows.length, W).setValues(appendRows);
-      dayAdded = appendRows.length;
-    }
-    // 從下往上刪，前面的列號才不會跟著位移
-    removeRows.sort(function(a, b){ return b - a; }).forEach(function(r){ logSh.deleteRow(r); });
-    dayReverted = removeRows.length;
+    const r = writePriceLogDay_(changes, version, now);
+    dayAdded = r.added; dayUpdated = r.updated; dayReverted = r.reverted;
   }
 
   // 快照換成這次的（第一次執行就是建立基準）。看不懂的列沿用舊值，不要因為一次讀不到就把它弄丟。
@@ -11596,4 +11556,107 @@ function checkPriceChangesNow(){
     + (r.建立基準 ? '\n\n第一次執行：已建立價格基準，從下一次來源更新開始記錄異動。' : '');
   Logger.log(text);
   return text;
+}
+
+
+// 把這一輪的價格變動併進「今天」的區塊（今天的區塊一定在最上面），整塊重寫。
+// changes：[[貨號, 現在{list,special,name,spec}, 上次快照{list,special}], ...]
+function writePriceLogDay_(changes, version, now){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_PRICE_LOG);
+  if(!sh){
+    sh = ss.insertSheet(SHEET_PRICE_LOG);
+    sh.getRange(1, 1).setValue(PRICE_LOG_TOP_NOTE);
+    try{ sh.getRange(1, 1).setNote(SYSTEM_SHEET_WARNING); }catch(err){}
+    try{ sh.setFrozenRows(1); }catch(err){}
+  }
+  const W = PRICE_LOG_COLS.length;
+  const today = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), 'yyyy/MM/dd');
+
+  // 讀出今天已經有的區塊（第 2 列的標題是今天才算）
+  const existing = {}, existingOrder = [];
+  let oldBlockRows = 0;
+  const last = sh.getLastRow();
+  if(last >= 2 && String(sh.getRange(2, 1).getValue() || '').indexOf(today) === 0){
+    const n = Math.min(last - 1, 5000);
+    const vals = sh.getRange(2, 1, n, W).getValues();
+    let i = 2;   // vals[0] 標題、vals[1] 欄位名稱，資料從 vals[2] 起，空白列結束
+    for(; i < vals.length; i++){
+      const sku = String(vals[i][1] || '').trim();
+      if(!sku) break;
+      existing[sku] = vals[i].map(function(v){ return String(v); });
+      existingOrder.push(sku);
+    }
+    oldBlockRows = Math.min(i + 1, vals.length);   // 含結尾那一列空白
+  }
+
+  let added = 0, updated = 0, reverted = 0;
+  changes.forEach(function(x){
+    const sku = x[0], c = x[1], p = x[2];
+    const ex = existing[sku];
+    if(!ex){
+      existing[sku] = [today, sku, c.name, c.spec, '', p.list, p.special, c.list, c.special];
+      existingOrder.push(sku); added++;
+      return;
+    }
+    // 今天已經變過：原始價格留著（那才是今天開始時的價格），只更新現行價格
+    if(ex[5] === c.list && ex[6] === c.special){ delete existing[sku]; reverted++; return; }
+    ex[2] = c.name; ex[3] = c.spec; ex[7] = c.list; ex[8] = c.special; updated++;
+  });
+
+  const rows = existingOrder.filter(function(sku){ return existing[sku]; }).map(function(sku){
+    const r = existing[sku];
+    const listChanged = r[5] !== r[7], specialChanged = r[6] !== r[8];
+    r[4] = listChanged && specialChanged ? '定價＋特惠價' : (listChanged ? '定價' : '特惠價');
+    return r;
+  });
+  // 定價有變的排前面（最要緊、最常要改網站的），同一類照貨號排
+  rows.sort(function(a, b){
+    const ka = a[4] === '特惠價' ? 1 : 0, kb = b[4] === '特惠價' ? 1 : 0;
+    return ka - kb || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0);
+  });
+
+  if(oldBlockRows) sh.deleteRows(2, oldBlockRows);
+  if(!rows.length) return {added: added, updated: updated, reverted: reverted};
+
+  const nList = rows.filter(function(r){ return r[4] !== '特惠價'; }).length;
+  const title = today + '　價格異動 ' + rows.length + ' 筆（定價有變 ' + nList + '、只改特惠價 ' + (rows.length - nList) + '）'
+    + '　來源：' + version + '　最後更新：' + now;
+  const block = [[title].concat(new Array(W - 1).fill(''))].concat([PRICE_LOG_COLS.slice()], rows,
+    [new Array(W).fill('')]);
+  const H = block.length;
+  sh.insertRowsBefore(2, H);
+  const rng = sh.getRange(2, 1, H, W);
+  rng.clearFormat();
+  rng.setNumberFormat('@');           // 貨號開頭的 0 不能被吃掉；空白價格也要看得出是空白
+  rng.setValues(block);
+
+  // 顏色：整塊一次設，不要一格一格打
+  const bg = [], fc = [], fw = [];
+  block.forEach(function(r, i){
+    const rowBg = [], rowFc = [], rowFw = [];
+    for(let j = 0; j < W; j++){
+      let b = null, f = '#000000', w = 'normal';
+      if(i === 0){ b = PRICE_COLOR.title; f = PRICE_COLOR.titleFont; w = 'bold'; }
+      else if(i === 1){ b = PRICE_COLOR.header; w = 'bold'; }
+      else if(i < H - 1){
+        const kind = r[4];
+        if(kind === '特惠價'){
+          b = PRICE_COLOR.specialRow;
+          if(j === 6 || j === 8){ b = PRICE_COLOR.specialCell; w = 'bold'; }
+        }else{
+          b = PRICE_COLOR.listRow;
+          if(j === 4 || j === 5 || j === 7){ b = PRICE_COLOR.listCell; f = PRICE_COLOR.listFont; w = 'bold'; }
+          if(kind === '定價＋特惠價' && (j === 6 || j === 8)){ b = PRICE_COLOR.specialCell; w = 'bold'; }
+        }
+      }
+      rowBg.push(b); rowFc.push(f); rowFw.push(w);
+    }
+    bg.push(rowBg); fc.push(rowFc); fw.push(rowFw);
+  });
+  rng.setBackgrounds(bg);
+  rng.setFontColors(fc);
+  rng.setFontWeights(fw);
+  try{ sh.getRange(2, 1, 1, W).merge(); }catch(err){}
+  return {added: added, updated: updated, reverted: reverted};
 }

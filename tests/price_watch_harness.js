@@ -23,11 +23,21 @@ function makeSheet(name, rows){
             const row = sh._rows[r-1+i]; for(let j=0;j<v[i].length;j++) row[c-1+j]=v[i][j]; } return api; },
         clearContent(){ sh._writes++; for(let i=0;i<nr;i++){ const row=sh._rows[r-1+i]; if(row) for(let j=0;j<nc;j++) row[c-1+j]=''; } return api; },
         setNumberFormat(){ return api; }, setNote(){ return api; },
+        getValue(){ return api.getValues()[0][0]; },
+        setValue(v){ return api.setValues([[v]]); },
+        clearFormat(){ return api; }, merge(){ return api; },
+        // 顏色、粗體記在列上（列被插入／刪除時跟著搬）
+        setBackgrounds(v){ v.forEach((row, i) => { const R = sh._rows[r-1+i]; R._bg = row.slice(); }); return api; },
+        setFontColors(v){ v.forEach((row, i) => { sh._rows[r-1+i]._fc = row.slice(); }); return api; },
+        setFontWeights(v){ v.forEach((row, i) => { sh._rows[r-1+i]._fw = row.slice(); }); return api; },
       };
       return api;
     },
     appendRow(v){ this._rows.push(v.slice()); },
     deleteRow(r){ this._writes++; this._rows.splice(r - 1, 1); },
+    deleteRows(r, n){ this._writes++; this._rows.splice(r - 1, n); },
+    insertRowsBefore(r, n){ const add = []; for(let i = 0; i < n; i++) add.push([]); this._rows.splice(r - 1, 0, ...add); },
+    setFrozenRows(n){ this._frozen = n; },
     isSheetHidden(){ return this._hidden; }, hideSheet(){ this._hidden = true; },
   };
   return sh;
@@ -57,7 +67,7 @@ const sandbox = {
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 const src = fs.readFileSync(process.argv[2],'utf8')
-  + "\n;globalThis.__x = {checkPriceChanges_, normPrice_, SHEET_PRICE_LOG, SHEET_PRICE_SNAP, PRICE_LOG_HEADER, HEADER_LABELS,"
+  + "\n;globalThis.__x = {checkPriceChanges_, normPrice_, SHEET_PRICE_LOG, SHEET_PRICE_SNAP, PRICE_LOG_COLS, PRICE_COLOR, HEADER_LABELS,"
   + " PRICE_WATCH_PROP_FULLAT};\n";
 vm.runInContext(src, sandbox, { filename:'Code.gs' });
 const X = sandbox.__x;
@@ -76,7 +86,21 @@ function baseRows(){
   for(let i = 0; i < 1200; i++) rows.push(srcRow('0' + (100000 + i), 1000 + i, i % 3 === 0 ? '' : 900 + i));
   return rows;
 }
-function logRows(){ const sh = SHEETS[X.SHEET_PRICE_LOG]; return sh ? sh._rows.slice(1).filter(r=>r.some(v=>v!=='')) : []; }
+// 價格異動紀錄是給人看的版面：第 1 列說明，之後一天一塊（標題列、欄位名稱列、資料列、空白列）
+const TITLE_RE = /^\d{4}\/\d\d\/\d\d　價格異動/;
+function blocks(){
+  const sh = SHEETS[X.SHEET_PRICE_LOG]; if(!sh) return [];
+  const out = []; let cur = null, stage = 0;
+  sh._rows.slice(1).forEach(R => {
+    const t = String(R[0] || '');
+    if(TITLE_RE.test(t)){ cur = {title: t, header: null, rows: []}; out.push(cur); stage = 1; return; }
+    if(!cur) return;
+    if(stage === 1){ cur.header = R.slice(0, 9); stage = 2; return; }
+    if(stage === 2){ if(!R.some(v => v !== '' && v !== undefined)){ stage = 0; return; } cur.rows.push(R); }
+  });
+  return out;
+}
+function logRows(){ return [].concat.apply([], blocks().map(b => b.rows)); }
 
 console.log('\n【價格正規化】');
 ck('數字與千分位字串視為同一個', X.normPrice_(1280) === '1280' && X.normPrice_('1,280') === '1280' && X.normPrice_(1280.0) === '1280');
@@ -107,19 +131,26 @@ buildSource('1125更', rows2);
 r = X.checkPriceChanges_({});
 ck('偵測到 3 筆異動、1 個新貨號', r.ok && r.價格異動 === 3 && r.新貨號 === 1, r);
 const L = logRows();
-const H = X.PRICE_LOG_HEADER;
+const H = ['priceDate','priceSku','baseName','spec','kind','oldListPrice','oldSpecialPrice','newListPrice','newSpecialPrice'];
 const row = sku => L.find(x => x[H.indexOf('priceSku')] === sku);
 const r5 = row('0100005');
 ck('定價改了：原始 1005 → 現行 1999，特惠價兩邊都是 905', r5 && r5[H.indexOf('oldListPrice')] === '1005' && r5[H.indexOf('newListPrice')] === '1999'
    && r5[H.indexOf('oldSpecialPrice')] === '905' && r5[H.indexOf('newSpecialPrice')] === '905', r5);
-ck('有日期、品名、規格、來源版本', r5 && r5[H.indexOf('priceDate')] === '2026/11/24' && r5[H.indexOf('baseName')] === '商品0100005' && r5[H.indexOf('spec')] === '規格0100005' && r5[H.indexOf('srcVersion')] === '1125更', r5);
+ck('有日期、品名、規格', r5 && r5[H.indexOf('priceDate')] === '2026/11/24' && r5[H.indexOf('baseName')] === '商品0100005' && r5[H.indexOf('spec')] === '規格0100005', r5);
+let B = blocks();
+ck('一個區塊：標題列有日期、筆數、來源版本', B.length === 1 && B[0].title.indexOf('2026/11/24　價格異動 3 筆（定價有變 1、只改特惠價 2）') === 0 && B[0].title.indexOf('來源：1125更') > 0, B[0] && B[0].title);
+ck('區塊第二列是欄位名稱', B[0].header.join(',') === '日期,貨號,品名,規格,變動項目,原始定價,原始特惠價,現行定價,現行特惠價', B[0].header);
+ck('定價有變的排最前面', B[0].rows[0][1] === '0100005' && B[0].rows[0][4] === '定價', B[0].rows.map(x => x[1] + x[4]));
+ck('定價有變：整列紅底，原始／現行定價格子深紅粗體', r5._bg[0] === X.PRICE_COLOR.listRow && r5._bg[5] === X.PRICE_COLOR.listCell && r5._bg[7] === X.PRICE_COLOR.listCell
+   && r5._fc[7] === X.PRICE_COLOR.listFont && r5._fw[7] === 'bold', {bg: r5._bg, fc: r5._fc});
+ck('只改特惠價：整列黃底，特惠價格子較深', row('0100003')._bg[0] === X.PRICE_COLOR.specialRow && row('0100003')._bg[8] === X.PRICE_COLOR.specialCell, row('0100003')._bg);
+ck('第 1 列是固定說明、凍結', SHEETS[X.SHEET_PRICE_LOG]._rows[0][0].indexOf('最新的一天在最上面') >= 0 && SHEETS[X.SHEET_PRICE_LOG]._frozen === 1);
 const r6 = row('0100007');
 ck('取消特惠：原始特惠 907 → 現行空白', r6 && r6[H.indexOf('oldSpecialPrice')] === '907' && r6[H.indexOf('newSpecialPrice')] === '', r6);
 const r3 = row('0100003');
 ck('新增特惠：原始空白 → 555', r3 && r3[H.indexOf('oldSpecialPrice')] === '' && r3[H.indexOf('newSpecialPrice')] === '555', r3);
 ck('千分位寫法不同不算異動', !row('0100009'));
 ck('新貨號不算異動', !row('NEW001'));
-ck('分頁標題是中文', SHEETS[X.SHEET_PRICE_LOG]._rows[0].join(',') === '日期,貨號,品名,規格,原始定價,原始特惠價,現行定價,現行特惠價,來源版本,最後更新時間', SHEETS[X.SHEET_PRICE_LOG]._rows[0]);
 
 console.log('\n【同樣的資料再比一次】不能重複記');
 r = X.checkPriceChanges_({force:true});
@@ -178,6 +209,9 @@ r = X.checkPriceChanges_({});
 L2 = logRows();
 const nextDay = L2.filter(x => x[H.indexOf('priceSku')] === '0100005');
 ck('隔天再改：新的一天新的一列', nextDay.length === 1 && nextDay[0][H.indexOf('priceDate')] === '2026/11/25' && r.今天新增 === 1, {nextDay, r});
+B = blocks();
+ck('最新的一天在最上面', B.length === 2 && B[0].title.indexOf('2026/11/25') === 0 && B[1].title.indexOf('2026/11/24') === 0, B.map(b => b.title.slice(0, 10)));
+ck('前一天的區塊原封不動（顏色也還在）', B[1].rows.length === before - 1 && B[1].rows.every(x => x._bg && x._bg.length === 9), B[1].rows.length);
 
 console.log(fail ? '\n有 '+fail+' 項失敗' : '\n全部通過：第一次只建基準、改價才記、寫法不同不算、新貨號不算、沒載入完不亂記、來源不寫');
 process.exit(fail?1:0);
