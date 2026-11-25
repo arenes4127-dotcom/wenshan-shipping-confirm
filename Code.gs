@@ -11409,9 +11409,9 @@ function diagnoseStoreStock(){
 // 做法：後端留一份「上次看到的價格」快照，跟來源比，定價或特惠價不一樣的就記一筆，
 // 然後把快照換成這次的。只讀來源，來源那邊一格都不寫。
 //
-// 什麼時候比：每小時排程先只讀 A2 一格（幾乎零成本），跟上次不一樣才整張比；
-// 一樣的話，距離上次整張比超過 PRICE_WATCH_FULL_EVERY_H 小時也整張比一次——
-// 「1124更」只有月日，同一天更新第二次 A2 不會變，靠這個補。
+// 什麼時候比：山物地圖（價格、庫存）一天只更新一次，更新時 A2 的日期就會變。
+// 所以每小時排程只讀 A2 一格（幾乎零成本），跟上次比對成功時記下的不一樣才整張比，
+// 等於一天整張比一次。上一次比到一半被擋下（來源還在載入）不會記下 A2，下一小時會再試。
 const SHEET_PRICE_LOG = '價格異動紀錄';
 // 以天為單位：同一個貨號同一天只有一列。原始＝當天第一次變動前的價格，
 // 現行＝當天最後一次看到的價格；當天又改回原價，那一列就拿掉（那天等於沒變）。
@@ -11419,7 +11419,6 @@ const PRICE_LOG_HEADER = ['priceDate','priceSku','baseName','spec',
   'oldListPrice','oldSpecialPrice','newListPrice','newSpecialPrice','srcVersion','lastSeenAt'];
 const SHEET_PRICE_SNAP = '價格快照';
 const PRICE_SNAP_HEADER = ['priceSku','listPrice','specialPrice'];
-const PRICE_WATCH_FULL_EVERY_H = 6;
 const PRICE_WATCH_PROP_HEADER = 'priceWatchSrcHeader';
 const PRICE_WATCH_PROP_FULLAT = 'priceWatchFullAt';
 // 預設欄位（找不到表頭字樣時才用）：M 定價、N 特惠價
@@ -11460,9 +11459,7 @@ function checkPriceChanges_(opts){
   const header = src.getRange(LOC_SYNC_FIRST_ROW - 1, 1, 1, lastCol).getValues()[0];
   const version = String(header[0]||'').trim();
   const prevVersion = props.getProperty(PRICE_WATCH_PROP_HEADER) || '';
-  const fullAt = Number(props.getProperty(PRICE_WATCH_PROP_FULLAT) || 0);
-  const due = Date.now() - fullAt >= PRICE_WATCH_FULL_EVERY_H * 3600000;
-  if(!opts.force && version === prevVersion && !due){
+  if(!opts.force && version === prevVersion){
     return {ok:true, skipped:true, reason:'來源沒有更新', 來源版本: version};
   }
 

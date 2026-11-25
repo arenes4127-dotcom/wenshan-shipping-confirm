@@ -126,36 +126,39 @@ r = X.checkPriceChanges_({force:true});
 ck('0 筆異動', r.ok && r.價格異動 === 0, r);
 ck('紀錄還是 3 筆', logRows().length === 3, logRows().length);
 
-console.log('\n【同一天更新第二次】A2 沒變，但超過 6 小時會整張重比');
+console.log('\n【A2 沒變】山物地圖一天只更新一次：A2 沒換日期就不整張比，過再久都一樣');
 const rows3 = rows2.map(x=>x.slice()); rows3[8][12] = 2222;
 buildSource('1125更', rows3);
+PROPS[X.PRICE_WATCH_PROP_FULLAT] = String(Date.now() - 20 * 3600000);
 r = X.checkPriceChanges_({});
-ck('還沒到 6 小時：跳過', r.skipped === true, r);
-PROPS[X.PRICE_WATCH_PROP_FULLAT] = String(Date.now() - 7 * 3600000);
+ck('A2 一樣：跳過', r.skipped === true, r);
+buildSource('1126更', rows3);
 r = X.checkPriceChanges_({});
-ck('超過 6 小時：整張比，抓到 1 筆', r.ok && !r.skipped && r.價格異動 === 1, r);
+ck('A2 換成隔天：整張比，抓到 1 筆', r.ok && !r.skipped && r.價格異動 === 1, r);
 
 console.log('\n【來源還沒載入完】');
-buildSource('1126更', baseRows().slice(0, 10));
+buildSource('1127更', baseRows().slice(0, 10));
 r = X.checkPriceChanges_({});
 ck('只有 10 列：不比、不記', r.ok === false && logRows().length === 4, {r, n: logRows().length});
+r = X.checkPriceChanges_({});
+ck('上一輪被擋下沒記 A2：下一小時同一個 A2 會再試，不會跳過一整天', r.skipped !== true, r);
 const blankRows = baseRows().map(x => { const y = x.slice(); y[12] = ''; y[13] = ''; return y; });
-buildSource('1126更', blankRows);
+buildSource('1127更', blankRows);
 r = X.checkPriceChanges_({});
 ck('一大片價格同時變空白：判斷是讀到一半，不記', r.ok === false && logRows().length === 4, {r, n: logRows().length});
 const loading = baseRows().map(x => { const y = x.slice(); y[12] = 'Loading...'; return y; });
-buildSource('1126更', loading);
+buildSource('1127更', loading);
 r = X.checkPriceChanges_({});
 ck('格子是 Loading...：那些列這輪不判斷', r.ok && r.價格異動 === 0 && r.讀不懂略過 === 1200, r);
 ck('讀不懂的列快照沒被弄丟', SHEETS[X.SHEET_PRICE_SNAP]._rows.filter(x=>x[0]).length >= 1201, SHEETS[X.SHEET_PRICE_SNAP]._rows.length);
 
 console.log('\n【以天為單位】同一天同一個貨號只有一列');
-buildSource('1126更', rows3);            // 先恢復正常來源
+buildSource('1128更', rows3);            // 先恢復正常來源
 PROPS[X.PRICE_WATCH_PROP_FULLAT] = '0';
 X.checkPriceChanges_({});
 const before = logRows().length;
 const rows4 = rows3.map(x=>x.slice()); rows4[5][12] = 2500;      // 0100005 今天第二次改：1999 → 2500
-buildSource('1126更B', rows4);
+buildSource('1128更B', rows4);
 r = X.checkPriceChanges_({});
 let L2 = logRows();
 const same = L2.filter(x => x[H.indexOf('priceSku')] === '0100005');
@@ -163,14 +166,14 @@ ck('同一天第二次改價：還是只有一列', same.length === 1 && L2.leng
 ck('原始定價留著當天開始的 1005、現行更新成 2500', same[0] && same[0][H.indexOf('oldListPrice')] === '1005' && same[0][H.indexOf('newListPrice')] === '2500', same[0]);
 ck('回報「今天再次變動 1」', r.今天再次變動 === 1 && r.今天新增 === 0, r);
 const rows5 = rows4.map(x=>x.slice()); rows5[5][12] = 1005;      // 又改回原價
-buildSource('1126更C', rows5);
+buildSource('1128更C', rows5);
 r = X.checkPriceChanges_({});
 L2 = logRows();
 ck('當天改回原價：那一列拿掉', !L2.some(x => x[H.indexOf('priceSku')] === '0100005') && r.今天改回原價移除 === 1, r);
 ck('其他貨號的列沒被動到', L2.length === before - 1 && L2.some(x => x[H.indexOf('priceSku')] === '0100007'), L2.map(x=>x[H.indexOf('priceSku')]));
 DAY.d = '2026/11/25';
 const rows6 = rows5.map(x=>x.slice()); rows6[5][12] = 1100;
-buildSource('1127更', rows6);
+buildSource('1129更', rows6);
 r = X.checkPriceChanges_({});
 L2 = logRows();
 const nextDay = L2.filter(x => x[H.indexOf('priceSku')] === '0100005');
