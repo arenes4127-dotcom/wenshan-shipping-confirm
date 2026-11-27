@@ -1,0 +1,170 @@
+# 後端 Code.gs → Apps Script，整個部署流程搬到雲端跑。
+#
+# 這支 workflow 做的事跟本機的 deploy.ps1 / deploy.sh 完全一樣，差別只在於執行的機器
+# 是 GitHub 的 runner，不是使用者桌面那台 Windows。桌面資料夾不見、電腦重灌、人在外面
+# 只有手機，都還是能部署。
+#
+# 唯一需要人先設定一次的東西：repo secret `CLASPRC_JSON`
+#   內容 = 本機 clasp 登入後產生的 C:\Users\<你>\.clasprc.json 整個檔案（原封不動貼上）。
+#   設定位置：GitHub repo → Settings → Secrets and variables → Actions → New repository secret。
+#   沒有那個檔案的話，任何一台電腦上跑 `npm i -g @google/clasp@3 && clasp login` 都能重新產生。
+
+name: 部署後端（Apps Script）
+
+on:
+  workflow_dispatch:
+    inputs:
+      description:
+        description: 這次改了什麼（會寫進 Apps Script 的部署說明）
+        required: false
+        default: 手動部署
+  push:
+    branches: [master]
+    paths:
+      - Code.gs
+      - appsscript.json
+      - .clasp.json
+      - .claspignore
+      - .github/workflows/deploy-backend.yml
+
+# 兩次部署同時跑會互相蓋掉版本，排隊一個一個來。這裡刻意不 cancel-in-progress：
+# 部署跑到一半被砍掉，正式環境會停在半新半舊的狀態。
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  # 一定要用「既有的」部署ID。不帶 ID 的 clasp create-deployment 會產生全新的部署、
+  # 拿到不同的 /exec 網址，等於倉庫所有裝置瞬間連不上後端。這個ID就是目前 /exec 網址裡的那段。
+  DEPLOYMENT_ID: AKfycbxdzii_g-Dv59KDLIiWa2B7adWyv_JuLoBQBfP42INKYv7L6kOFtN7vseYFwHsa1RJG
+  CLASP_VERSION: "3.4.0"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 部署前先擋一次語法錯誤，不要把壞掉的程式碼推上正式環境。
+      # Code.gs 不是 .js，node --check 認副檔名，所以先複製一份改名再檢查。
+      - name: 語法檢查 Code.gs
+        run: |
+          cp Code.gs Code_check.js
+          node --check Code_check.js
+          rm Code_check.js
+
+      - name: 讀出 BACKEND_VERSION
+        id: ver
+        run: |
+          VERSION=$(grep -o "BACKEND_VERSION = '[^']*'" Code.gs | head -1 | sed "s/.*'\(.*\)'/\1/")
+          if [ -z "$VERSION" ]; then
+            echo "::error file=Code.gs::找不到 BACKEND_VERSION，無法驗證部署是否生效"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "準備部署版本：$VERSION"
+
+      # 部署完的驗證是「doPost 回報的版本號 == Code.gs 裡的版本號」。如果這次沒改
+      # BACKEND_VERSION，那個條件在推之前就已經成立，驗證會立刻通過但什麼都沒證明。
+      # 先把現況記下來，最後一步再決定驗證還算不算數。
+      - name: 記錄部署前的線上版本
+        id: before
+        run: |
+          BEFORE=$(curl -sL --max-time 30 \
+                     --data-binary '{"action":"__versioncheck__"}' \
+                     -H 'Content-Type: application/json' \
+                     "https://script.google.com/macros/s/$DEPLOYMENT_ID/exec" \
+                   | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{process.stdout.write(String(JSON.parse(d).version||''))}catch(e){process.stdout.write('')}})")
+          echo "version=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "部署前線上版本：${BEFORE:-（取不到）}"
+
+      - name: 組出這次的部署說明
+        id: desc
+        env:
+          # 手動觸發用輸入的文字；push 觸發就用 commit 訊息的第一行。
+          # 一律走環境變數不直接內嵌 ${{ }}，避免 commit 訊息裡的引號把腳本弄壞。
+          INPUT_DESC: ${{ inputs.description }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          DESC="$INPUT_DESC"
+          [ -z "$DESC" ] && DESC=$(printf '%s' "$COMMIT_MSG" | head -1)
+          [ -z "$DESC" ] && DESC="自動部署"
+          DESC=$(printf '%s' "$DESC" | cut -c1-180)
+          echo "text=$DESC" >> "$GITHUB_OUTPUT"
+
+      - name: 寫入 clasp 登入憑證
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          if [ -z "$CLASPRC_JSON" ]; then
+            echo "::error::缺少 repo secret CLASPRC_JSON。"
+            echo "::error::到 Settings → Secrets and variables → Actions 新增，內容是本機 ~/.clasprc.json（Windows 是 C:\\Users\\<你>\\.clasprc.json）的完整內容。"
+            exit 1
+          fi
+          printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          chmod 600 "$HOME/.clasprc.json"
+          node -e "JSON.parse(require('fs').readFileSync(process.env.HOME+'/.clasprc.json','utf8'))" \
+            || { echo "::error::CLASPRC_JSON 不是合法的 JSON，請整個檔案原封不動貼上"; exit 1; }
+
+      - name: 安裝 clasp
+        run: npm install -g "@google/clasp@$CLASP_VERSION"
+
+      # .claspignore 是白名單，只會推 Code.gs 與 appsscript.json；index.html 那些前端檔案
+      # 不會被誤傳進 Apps Script 專案。先印出來留在 log 裡，之後出事好對帳。
+      - name: 確認這次會推哪些檔案
+        run: clasp show-file-status
+
+      - name: clasp push
+        run: clasp push -f
+
+      - name: 更新既有部署（不建新的）
+        env:
+          DESC: ${{ steps.desc.outputs.text }}
+        run: |
+          if ! clasp update-deployment "$DEPLOYMENT_ID" -d "$DESC"; then
+            echo "::error::clasp update-deployment 失敗。"
+            echo "::error::最常見原因：Apps Script 專案版本數已達 200 上限（這個專案踩過）。"
+            echo "::error::處理方式：開 Apps Script 編輯器 → 部署 → 管理部署作業，手動刪掉幾個舊版本再重跑這支 workflow。"
+            exit 1
+          fi
+
+      # 一定要等到「doPost」也更新才算部署完成，不能只看 doGet 回報的版本號。
+      # 實際踩過好幾次：doGet 已經回報新版本了，doPost（執行函式的入口）還在跑舊程式碼，
+      # 症狀是函式找不到、或寫出上一版的內容，而且完全沒有錯誤訊息，很難察覺。
+      - name: 等待部署傳播並驗證 doPost
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          BEFORE: ${{ steps.before.outputs.version }}
+        run: |
+          EXEC_URL="https://script.google.com/macros/s/$DEPLOYMENT_ID/exec"
+          if [ "$BEFORE" = "$VERSION" ]; then
+            echo "::warning file=Code.gs,line=24::BACKEND_VERSION 還是 $VERSION，跟部署前線上的版本一樣。程式碼已推上去，但無法驗證 doPost 是否真的換成新的了。下次改 Code.gs 記得一起把 BACKEND_VERSION 改掉。"
+            exit 0
+          fi
+          echo "等待部署傳播（要等 doPost 回報 $VERSION）..."
+          for i in $(seq 1 20); do
+            sleep 4
+            GOT=$(curl -sL --max-time 30 \
+                    --data-binary '{"action":"__versioncheck__"}' \
+                    -H 'Content-Type: application/json' "$EXEC_URL" \
+                  | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);process.stdout.write(String(j.version||j.error||''))}catch(e){process.stdout.write('')}})")
+            if [ "$GOT" = "$VERSION" ]; then
+              echo "  doPost 已更新：$VERSION"
+              echo "### 後端部署完成：\`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "  第 $i 次：doPost 目前回報「${GOT:-無回應}」，繼續等"
+          done
+          echo "::error::等了 80 秒 doPost 仍未回報 $VERSION。程式碼可能已經推上去但部署還沒生效，執行一次性函式前請先自己戳一次 __versioncheck__ 確認。"
+          exit 1
+
+      # runner 用完就丟，這步只是保險：不要讓憑證留在任何快取或 artifact 裡。
+      - name: 清掉憑證
+        if: always()
+        run: rm -f "$HOME/.clasprc.json"
