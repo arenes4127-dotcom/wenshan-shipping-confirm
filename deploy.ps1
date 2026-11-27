@@ -64,7 +64,9 @@ clasp update-deployment $DeploymentId -d $Description
 if ($LASTEXITCODE -ne 0) {
   Write-Host "clasp update-deployment 失敗。" -ForegroundColor Red
   Write-Host "  最常見原因：Apps Script 專案版本數已達 200 上限（這個專案踩過）。"
-  Write-Host "  處理方式：開 Apps Script 編輯器 → 部署 → 管理部署作業，手動刪掉幾個舊版本再重跑。"
+  Write-Host "  處理方式：開 Apps Script 編輯器 → 左邊欄的「專案記錄」（時鐘圖示）→"
+  Write-Host "            從最舊的版本開始，滑鼠移到版本上按垃圾桶「刪除這個版本」，刪 20～30 個再重跑。"
+  Write-Host "  （程式碼已經推上去了，但網頁 /exec 還是舊版；排程會先跑新程式碼。）"
   exit 1
 }
 
